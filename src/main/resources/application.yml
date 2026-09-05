@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: distroq
+  datasource:
+    url: jdbc:postgresql://localhost:5433/distroq
+    username: distroq
+    password: distroq
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  data:
+    redis:
+      # the app runs on the host, outside the compose network
+      host: localhost
+      port: 6379
+
+distroq:
+  queue-key: distroq:jobs:pending
+
+logging:
+  level:
+    com.distroq: DEBUG

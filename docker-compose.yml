@@ -1,0 +1,22 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: distroq-redis
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: distroq-postgres
+    environment:
+      POSTGRES_DB: distroq
+      POSTGRES_USER: distroq
+      POSTGRES_PASSWORD: distroq
+    # 5433 on the host so we never collide with a native Postgres install
+    ports:
+      - "5433:5432"
+    volumes:
+      - distroq-pgdata:/var/lib/postgresql/data
+
+volumes:
+  distroq-pgdata:
