@@ -230,13 +230,10 @@ would mean giving up the blocking pop and going back to polling; using a manual 
 the poller would mean writing a timing loop Spring already provides. Different concerns,
 different mechanisms.
 
-**Poller latency is the cost of polling, and it is visible in the numbers.** A job due at T
-is promoted at up to T + `poll-interval-ms`, so measured backoff gaps run consistently
-slightly long. Shortening the interval cuts the latency and raises the constant Redis load
-— at 1s the sweep is one `EVALSHA` per second per instance, at 100ms it is ten, forever,
-almost all of them finding nothing. There is no interval that is right for both. This is the
-same argument as `BRPOP` versus a sleep-poll loop from v0.1, and it lands the same way: it
-is one more reason blocking stream reads beat polling, and one more thing v0.5 improves.
+**Poller latency is the cost of polling.** A job due at T is promoted at up to
+T + `poll-interval-ms`, so measured backoff gaps run consistently long. I measured this
+during the v0.2 acceptance run rather than leaving it as an assertion — see *Measured
+costs* below for the numbers and what they nearly hid.
 
 **Status flips where they are observable: the poller does not touch job status.** The
 promotion is a queue-level move, and the meaningful transition is `RETRYING → RUNNING`,
@@ -256,9 +253,9 @@ backfills. The alternative was to document `docker compose down -v` in the READM
 rejected it: a job queue that loses its history to a schema change is not making a good
 argument for itself, and "3" is a defensible retry budget to impute to rows that predate the
 concept. It is also a preview of the real answer — this is a migration, and it is being
-expressed as an annotation because there is no migration tool yet. Flyway at v0.5. It also
-turned out to be only half the migration — see the `jobs_status_check` entry under Resolved
-issues.
+expressed as an annotation because there is no migration tool yet. It also turned out to be
+only half the migration — see the `jobs_status_check` entry under Resolved issues, which is
+what moved Flyway forward to v0.2.1.
 
 **Postgres is the single source of truth; Redis holds only job ID strings.** The queue is a
 coordination mechanism, not a data store. Serializing the whole job into Redis would have
@@ -302,9 +299,96 @@ done because it got a success code and an ID back.
 **`ddl-auto: update` for schema management.** This is wrong for production and right for now.
 The schema is changing more or less daily — v0.2 adds retry and backoff columns, v0.5 changes
 how in-flight work is tracked — and hand-writing a migration for each churn would be effort
-spent on a shape that is not settled. The plan is to switch to Flyway around v0.5, baselining
-whatever the schema looks like at that point, once it stops moving every few days. Leaving
-`update` in place past that point would be the actual mistake.
+spent on a shape that is not settled. The plan *was* to switch to Flyway around v0.5, once the
+schema stopped moving every few days. v0.2 proved that plan wrong by breaking under it; see
+*What v0.2 changed about the plan*. Flyway now lands at v0.2.1.
+
+## Measured costs
+
+**Poller latency: a job due at T runs somewhere in `[T, T + 1000ms]`.** The retry poller is a
+`@Scheduled` fixed delay of 1000ms. Nothing wakes it when a job becomes due — it just checks,
+periodically, and finds whatever has accumulated. The latency is not a bug in the
+implementation, it is the mechanism working as designed. A job whose backoff expires one
+millisecond after a tick waits nearly a full interval for the next one.
+
+This nearly cost me the interpretation of acceptance check A2. The raw inter-attempt gaps came
+out at **1876ms and 2009ms** — which reads as flat. Two gaps of roughly the same size is
+exactly what "backoff is not being applied at all" looks like, and that was my first reading of
+it. It was wrong. Each gap is *scheduled backoff + poller latency*, and splitting them apart
+gives backoffs of **879ms and 1908ms** — a clean doubling — with poller latency of **997ms and
+101ms** respectively. The 997ms case is the worst case: the job came due just after a tick and
+waited out almost the entire interval. The 101ms case is the lucky one. Averaging two samples
+of a uniformly distributed `[0, 1000ms]` error term and reading the result as signal is how you
+talk yourself out of a feature that works.
+
+A five-attempt run settled it: **839, 2168, 3390, 8865, 17760ms**. Unambiguous.
+
+The lesson is about the ratio, not the absolute number. At ~1s backoffs, a ~1s polling error is
+the *same order of magnitude as the signal*, so the measurement is mostly noise. Once the
+backoff grows past a few seconds the polling error disappears into it — by the 17760ms attempt,
+a full second of jitter from the poller is a rounding error. Short backoffs are precisely where
+this mechanism measures worst, and short backoffs are what the first three attempts of every
+retry sequence use. Any future latency assertion about early attempts has to account for the
+poll interval or it is measuring the poller, not the policy.
+
+**The trade-off has no good setting.** Shortening the interval cuts latency and raises constant
+Redis load in direct proportion — at 1s the sweep is one `EVALSHA` per second per instance, at
+100ms it is ten, forever, and the overwhelming majority find nothing and return zero.
+Lengthening it is cheaper and makes short backoffs meaningless: a 1s backoff behind a 5s poll
+interval is not a 1s backoff. There is no interval that is good for both, because the two
+requirements are in direct opposition.
+
+**The fix is not a better interval, it is not polling.** A blocking read that returns the
+instant work becomes available has neither the latency nor the idle-load problem — there is
+nothing to tune because there is no timing loop. This is the same argument that chose `BRPOP`
+over a sleep-poll loop in v0.1, arriving a second time from a different direction, and it is
+now backed by numbers I measured on this system rather than by assertion. It is the concrete
+case for the Redis Streams work at v0.5.
+
+## What v0.2 changed about the plan
+
+Two things came out of this version that I did not plan for and that moved the roadmap. Both
+were found by running the system, not by thinking about it, which is the point of writing them
+down together.
+
+**1. `ddl-auto: update` fails silently and misleadingly, so Flyway moves from v0.5 to v0.2.1.**
+
+Hibernate generated a `CHECK` constraint from v0.1's four-value `JobStatus` enum. `ddl-auto:
+update` adds columns — it verifiably added `max_attempts` and `next_attempt_at` in the same
+boot — but it never alters an existing constraint. Every `RETRYING` write was therefore
+rejected at commit time. Fixed with a manual `ALTER TABLE jobs DROP CONSTRAINT`; the full
+write-up is under *Resolved issues*.
+
+What matters for planning is not the bug, it is the shape of the failure. It presented
+*deceptively*. The `job_attempts` FAILURE row commits before the status update, in its own
+transaction, so the evidence that the retry path had executed correctly was sitting in the API
+response while the job itself sat frozen at `RUNNING`. The symptom looked like "the retry
+branch never ran" when the truth was "the branch ran perfectly and its write was rejected."
+I also tried `@Column(columnDefinition = ...)` to suppress constraint generation, verified
+empirically that it does not work, and reverted it.
+
+So `ddl-auto: update` is not merely *incomplete*, which I already knew and had accepted. It
+performs part of a migration, declines the rest, reports nothing at startup, and defers the
+failure to a runtime write path that only executes when something has already gone wrong. That
+is a worse property than refusing outright. And it is not a one-off: v0.3 adds `DEAD_LETTERED`
+to the same enum and would hit the identical wall, with the identical misleading symptom.
+Waiting until v0.5 means walking into it again with the fix already written down. **Flyway
+moves to v0.2.1** — before the next enum change, not after.
+
+**2. Measured poller latency is a real argument for Streams at v0.5, not a stylistic one.**
+
+Covered in full under *Measured costs*. The short version: the polling error is the same order
+of magnitude as the thing being measured at short backoffs, and no choice of interval fixes
+both latency and idle load. Previously "blocking reads beat polling" was a preference carried
+over from the v0.1 `BRPOP` decision. It is now a number I measured on this system. v0.5 keeps
+its slot, but for a better reason than it had.
+
+Neither of these changed what v0.2 does. Both changed what I think v0.2.1 and v0.5 are *for*.
+Note that the dual write under *Known limitations* did **not** move — it got worse (it now
+exists in two places, submit and retry scheduling) and still did not earn a fix, because it
+remains a narrow window on a single-process deployment. The difference is that the constraint
+bug actually fired and the dual write still has not. Roadmaps should move on evidence, and
+"this broke" is evidence in a way that "this could break" is not.
 
 ## Resolved issues
 
@@ -419,5 +503,6 @@ silently declined the rest. A partial migration with no startup error is worse t
 one, because the application boots clean and then fails at runtime, on a write path that only
 executes when something has already gone wrong. Every enum I add from here carries the same
 trap: v0.3's DLQ status and v0.6's scheduled status will each need this same manual drop.
-That is a migration file, and pretending otherwise has now cost a debugging session.
+That is a migration file, and pretending otherwise has now cost a debugging session. Flyway
+is therefore pulled forward to v0.2.1 — see *What v0.2 changed about the plan*.
 
