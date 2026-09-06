@@ -327,11 +327,13 @@ noticing. The version history that matters is in git, where it is accurate. V1 i
 statement of "this is the schema as it actually exists", taken from `pg_dump` rather than
 written from memory.
 
-**Anything that must reach existing databases has to live above the baseline.** This is the
-non-obvious consequence of `baseline-on-migrate` and it changed how I split the work.
-Baselining records V1 as applied *without running it*, so a change placed only in V1 reaches
-new databases and never reaches the existing one — which is precisely the divergence
-migrations exist to prevent, reintroduced by the mechanism meant to fix it. The three query
+**A baseline migration is descriptive, not prescriptive — new work must sit above the baseline
+version or it reaches only new databases.** This is the non-obvious consequence of
+`baseline-on-migrate` and it changed how I split the work. V1 does not *create* anything on a
+database that predates Flyway; it only asserts "this is what is already here", and Flyway
+records it as applied without running a line of it. So a change placed only in V1 reaches new
+databases and never reaches the existing one — which is precisely the divergence migrations
+exist to prevent, reintroduced by the mechanism meant to fix it. The three query
 indexes and the drop of the leftover `job_attempts_outcome_check` therefore went into V2, not
 V1. V1 reproduces the dump exactly; V2 does the new work and runs on both paths. Verified by
 diffing `\d jobs` and `\d job_attempts` between the baselined database and a from-scratch one
