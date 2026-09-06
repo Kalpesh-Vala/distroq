@@ -8,7 +8,8 @@ public record DistroqProperties(
         @DefaultValue("distroq:jobs:pending") String queueKey,
         @DefaultValue("distroq:jobs:delayed") String delayedKey,
         @DefaultValue Retry retry,
-        @DefaultValue Dlq dlq) {
+        @DefaultValue Dlq dlq,
+        @DefaultValue PriorityTuning priority) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -22,5 +23,14 @@ public record DistroqProperties(
     /** {@code replayAttempts} is added to attemptCount on replay, not assigned to maxAttempts. */
     public record Dlq(
             @DefaultValue("3") int replayAttempts) {
+    }
+
+    /**
+     * {@code starvationThreshold} is a count of dequeues, not a duration. It bounds how many
+     * consecutive higher-tier jobs may be served before the lowest tier gets one — it does not
+     * bound wall-clock waiting time. See NOTES.md.
+     */
+    public record PriorityTuning(
+            @DefaultValue("10") int starvationThreshold) {
     }
 }

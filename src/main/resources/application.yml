@@ -43,6 +43,9 @@ distroq:
     promote-batch-size: 100
   dlq:
     replay-attempts: 3
+  priority:
+    # a count of dequeues, not a duration - see NOTES.md for what this does and does not bound
+    starvation-threshold: 10
 
 logging:
   level:
