@@ -101,6 +101,31 @@ public class Job {
         this.nextAttemptAt = null;
     }
 
+    /** Terminal. Replaces {@code markFailed} on the exhaustion path from v0.3 onward. */
+    public void markDeadLettered(String finalError) {
+        Instant now = Instant.now();
+        this.status = JobStatus.DEAD_LETTERED;
+        this.errorMessage = finalError;
+        this.finishedAt = now;
+        this.updatedAt = now;
+        this.nextAttemptAt = null;
+    }
+
+    /**
+     * Deliberately does not touch {@code attemptCount}: a job that failed 3 times runs as attempt
+     * 4, so {@code job_attempts} still reads as one coherent history. {@code maxAttempts} is
+     * extended rather than reset, otherwise the replay would be out of budget before it started.
+     */
+    public void prepareForReplay(int additionalAttempts) {
+        Instant now = Instant.now();
+        this.status = JobStatus.QUEUED;
+        this.maxAttempts = this.attemptCount + additionalAttempts;
+        this.errorMessage = null;
+        this.finishedAt = null;
+        this.nextAttemptAt = null;
+        this.updatedAt = now;
+    }
+
     public UUID getId() {
         return id;
     }
