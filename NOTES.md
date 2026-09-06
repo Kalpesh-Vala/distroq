@@ -59,6 +59,29 @@ Two standard fixes:
 project is a single process on one machine. I would rather have it documented and visible
 than papered over with an annotation that only looks like a fix.
 
+**Update (v0.2): the same dual write now exists in a second place.** `Worker.handleFailure`
+schedules a retry with exactly the same shape:
+
+```java
+job.markRetrying(error, dueAt);
+jobRepository.save(job);          // Postgres
+jobQueue.scheduleAt(job.getId(), dueAt);   // Redis
+```
+
+A crash between those two lines leaves a job sitting in Postgres as `RETRYING` with a
+`nextAttemptAt` that has passed, and no member in the sorted set that will ever cause it to
+run. Same invisibility problem as the submit path, with an extra twist: this one *looks*
+even more convincingly healthy, because `nextAttemptAt` is populated, so the row reads as
+"scheduled" rather than merely "queued". Nothing sweeps for `RETRYING` rows whose due time
+is in the past and whose ID is absent from Redis.
+
+Also left unfixed, on purpose. The point of noting it is that the flaw is no longer a
+one-off in a single controller method — it is a pattern that reappears every time a state
+change has to be reflected in both stores, and it will reappear again at v0.3 (DLQ) and v0.6
+(scheduled jobs). One occurrence is a shortcut; three is an argument for the transactional
+outbox, and the reconciliation-sweep alternative gets correspondingly less attractive
+because it now needs to handle two distinct stuck-state shapes rather than one.
+
 ### 2. Orphaned RUNNING jobs after a lost worker connection
 
 This one showed up on its own during the v0.1 acceptance run, which is the only reason I
@@ -129,6 +152,113 @@ come from making execution repeatable, not from trying to guarantee a job is nev
 twice.
 
 ## Design decisions
+
+**Why the retry delay lives in a Redis sorted set, not in the process.** Three options,
+two of which are wrong for reasons worth writing down.
+
+*`Thread.sleep` in the worker.* Trivially correct-looking and immediately fatal. There is
+one worker thread. Sleeping it for the backoff window does not delay one job, it stops the
+entire queue — a single job backing off for 60 seconds blocks every other job behind it,
+including ones that would have succeeded instantly. The delay is also lost on restart. The
+tell is that the worker is not the thing that needs to wait; the *job* is. Sleeping the
+consumer to delay one item conflates the two.
+
+*`ScheduledExecutorService`.* Fixes the head-of-line blocking, since the sleep moves off
+the worker thread onto a timer. It does not fix durability: the scheduled task lives in a
+JVM heap, so a restart, a crash, or a container eviction silently discards every pending
+retry. Those jobs sit in Postgres as `RETRYING` with a `nextAttemptAt` in the past and
+nothing anywhere that will ever act on it. That is worse than losing them outright, because
+the database confidently describes a future that no longer has a mechanism behind it. It
+also does not survive to the multi-instance case: an in-heap timer is per-process, so
+whichever instance happened to catch the failure owns the retry, and if that instance is
+the one that dies, the retry dies with it.
+
+*Redis sorted set, scored by due-timestamp.* The pending work is a row in a datastore that
+already outlives the process, not an object on a heap. The pending set is queryable
+(`ZCARD` gives `delayedDepth` for free, `ZRANGEBYSCORE` answers "what is due in the next
+minute"), shared across future instances, and recoverable by anything that can reach Redis.
+A restart loses nothing: the next sweep after boot picks up everything that came due while
+the process was down. This is the entire justification for the design, and acceptance check
+A4 exists specifically to prove it.
+
+**The atomicity trade-off in `promoteDueJobs`: Lua, with the duplicate-promotion window
+closed.** The naive sequence — `ZRANGEBYSCORE`, then `LPUSH`, then `ZREM` — is three round
+trips with two gaps, and both gaps lose:
+
+- crash between range and push: the ID is still in the sorted set and still due, so the
+  next sweep re-promotes it. Safe, just delayed.
+- crash between push and remove: the ID is on the pending list *and* still in the sorted
+  set. The next sweep promotes it again and the job executes twice.
+
+I used a Lua script, so range + `ZREM` + `LPUSH` all execute in one atomic server-side
+operation. Redis runs scripts single-threaded to completion, so there is no window for
+another poller — or another instance later — to observe the intermediate state. The script
+also checks the return of `ZREM` and only pushes when it removed the member itself, so two
+concurrent sweeps racing over the same ID cannot both push it.
+
+The remaining failure mode is the honest one: the script removes before it pushes within
+the same atomic unit, so if Redis itself dies mid-script the whole script is rolled forward
+or not at all — but if Redis dies *between* the script completing and the worker consuming
+the ID, the job is on the pending list and Redis persistence settings decide whether it
+survives. That is the same exposure the ordinary `enqueue` path has always had, not a new
+one introduced here.
+
+The `ZPOPMIN`-based alternative was the fallback: pop first, push second, so a crash loses
+the job rather than duplicating it. It needs no scripting, but it trades a recoverable
+failure for an unrecoverable one, and `ZPOPMIN` pops the lowest-scored member regardless of
+whether it is actually due yet, so it needs a score check and a push-back for the
+not-yet-due case — which reintroduces exactly the non-atomic sequence it was meant to
+avoid. Lua is less code and a better failure mode.
+
+**Jitter exists because of the thundering herd.** The pathological case is not one job
+retrying, it is a hundred. If a downstream dependency goes down, every job that touches it
+fails at roughly the same moment, and pure exponential backoff gives every one of them the
+same delay. They all retry at T+1s together, all fail together, all retry at T+2s together.
+The dependency gets hit by synchronised waves at exactly the moments it is trying to
+recover, and the backoff — the mechanism meant to relieve pressure — is what keeps the
+spikes aligned. Multiplying by a random factor in `[1-j, 1+j]` spreads the same load over a
+window instead of concentrating it in an instant. Applied *after* the cap, so that jobs
+sitting at the ceiling are still spread rather than all firing at exactly `max-delay-ms`.
+
+**The poller uses `@Scheduled`; the worker still uses a hand-rolled thread.** These look
+like the same problem and are not. The worker needs a *blocking* read — `BRPOP` parks until
+work arrives, which gives near-zero dispatch latency and no idle CPU. That requires a thread
+it can own and block indefinitely, which is precisely what a shared scheduling pool must not
+have. The poller needs *periodic* execution — wake, sweep, sleep — which is the textbook
+`@Scheduled` case and would be pure ceremony to hand-roll. Using `@Scheduled` for the worker
+would mean giving up the blocking pop and going back to polling; using a manual thread for
+the poller would mean writing a timing loop Spring already provides. Different concerns,
+different mechanisms.
+
+**Poller latency is the cost of polling, and it is visible in the numbers.** A job due at T
+is promoted at up to T + `poll-interval-ms`, so measured backoff gaps run consistently
+slightly long. Shortening the interval cuts the latency and raises the constant Redis load
+— at 1s the sweep is one `EVALSHA` per second per instance, at 100ms it is ten, forever,
+almost all of them finding nothing. There is no interval that is right for both. This is the
+same argument as `BRPOP` versus a sleep-poll loop from v0.1, and it lands the same way: it
+is one more reason blocking stream reads beat polling, and one more thing v0.5 improves.
+
+**Status flips where they are observable: the poller does not touch job status.** The
+promotion is a queue-level move, and the meaningful transition is `RETRYING → RUNNING`,
+which the worker already performs. The alternative — have the poller write `RETRYING →
+QUEUED` after a successful promotion — would add a third dual write (Redis move, then
+Postgres update) for a state that would exist for a few milliseconds before the worker
+overwrote it, and would introduce a genuinely confusing failure mode where a crash between
+the two leaves a job `RETRYING` on the pending list. `RETRYING` is treated as equivalent to
+`QUEUED` for dispatch purposes and distinct from it for reporting, which is exactly what the
+two statuses are for. `nextAttemptAt` already tells anyone looking when the job becomes
+eligible, so nothing is hidden by not writing the intermediate state.
+
+**`maxAttempts` gets a DB-level default rather than a documented data wipe.** `ddl-auto:
+update` cannot add a `NOT NULL` column to a populated table without one. `@ColumnDefault("3")`
+makes Hibernate emit `add column max_attempts integer default 3 not null`, which Postgres
+backfills. The alternative was to document `docker compose down -v` in the README, and I
+rejected it: a job queue that loses its history to a schema change is not making a good
+argument for itself, and "3" is a defensible retry budget to impute to rows that predate the
+concept. It is also a preview of the real answer — this is a migration, and it is being
+expressed as an annotation because there is no migration tool yet. Flyway at v0.5. It also
+turned out to be only half the migration — see the `jobs_status_check` entry under Resolved
+issues.
 
 **Postgres is the single source of truth; Redis holds only job ID strings.** The queue is a
 coordination mechanism, not a data store. Serializing the whole job into Redis would have
@@ -225,4 +355,69 @@ racy. The same distinction comes back at v0.7 in a nastier form: a worker shutti
 executing a job must requeue that job rather than mark it `FAILED`, because "the process was
 asked to stop" is not a property of the job and should not be recorded as one. Getting the
 shutdown signal to arrive *before* the code that has to interpret it is the general shape of
-the fix.
+the fix. `RetryScheduler` was given the same `ContextClosedEvent` guard from the start for
+exactly this reason.
+
+**Adding a status broke every retry: `jobs_status_check` (v0.2 acceptance run A1).**
+
+*Symptom.* The first acceptance check failed in a way that looked like the retry logic was
+simply absent. The job went `RUNNING`, a `FAILURE` row appeared in `job_attempts` with the
+right error message, and then nothing — the job sat at `RUNNING`, `attemptCount 1`,
+`errorMessage null`, `nextAttemptAt null`, for all fifteen polling ticks. `delayedDepth`
+stayed 0 and the poller logged "No due jobs to promote" once a second, forever.
+
+*Evidence.* The worker log had the answer, under a Hibernate stack trace:
+
+```
+Caused by: org.postgresql.util.PSQLException: ERROR: new row for relation "jobs"
+violates check constraint "jobs_status_check"
+  Detail: Failing row contains (6e26ebe4-..., 1, ..., RETRYING, fail_n_times, ..., 5, ...).
+```
+
+and `\d jobs` confirmed it:
+
+```
+"jobs_status_check" CHECK (status::text = ANY (ARRAY['QUEUED','RUNNING','SUCCEEDED','FAILED']))
+```
+
+*Root cause.* Hibernate generates a `CHECK` constraint for `@Enumerated(EnumType.STRING)`
+columns, enumerating the values that exist when the table is created. v0.1 created that
+constraint with four statuses. `ddl-auto: update` adds missing columns — it verifiably added
+`max_attempts` and `next_attempt_at` in the same boot — but it does not widen an existing
+check constraint. The schema was frozen at v0.1's idea of what a status could be, and every
+`RETRYING` write was rejected at commit.
+
+What made this slower to spot than it should have been: the ordering of writes made a
+rejected write look like missing logic. The `job_attempts` insert happens before the status
+update and commits in its own transaction, so the evidence that the failure path *had* run
+correctly was sitting right there in the API response. That made "the retry branch never
+executed" the obvious first theory, and it was wrong — the branch executed perfectly and its
+result was discarded at commit.
+
+*Fix.* Drop the stale constraint once, documented in the README as the v0.1 → v0.2 upgrade
+step:
+
+```sql
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
+```
+
+`update` mode does not recreate check constraints on an existing table, so it stays dropped.
+A fresh database is unaffected — Hibernate creates the constraint with all five statuses.
+
+*What I tried that did not work.* I first assumed `@Column(columnDefinition = "varchar(32)")`
+would suppress the generated constraint, on the theory that an explicit column definition
+overrides Hibernate's inferred DDL. It does not. I checked empirically rather than trusting
+it: dropped `job_attempts` entirely, restarted so Hibernate would recreate it from scratch
+under the new mapping, and queried `pg_constraint` — `job_attempts_outcome_check` was still
+there. The annotation bought nothing, so I reverted it rather than leave a change that
+implies a guarantee it does not provide.
+
+*Why this moves Flyway up the roadmap.* `ddl-auto: update` is not a migration tool, and this
+is the sharpest demonstration of it so far: it silently did *part* of the v0.2 migration —
+both new columns, including the `NOT NULL` backfill I had specifically designed for — and
+silently declined the rest. A partial migration with no startup error is worse than a refused
+one, because the application boots clean and then fails at runtime, on a write path that only
+executes when something has already gone wrong. Every enum I add from here carries the same
+trap: v0.3's DLQ status and v0.6's scheduled status will each need this same manual drop.
+That is a migration file, and pretending otherwise has now cost a debugging session.
+
