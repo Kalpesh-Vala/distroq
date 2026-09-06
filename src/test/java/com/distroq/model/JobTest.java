@@ -2,29 +2,33 @@ package com.distroq.model;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class JobTest {
 
     @Test
     void createStartsQueuedWithNoAttempts() {
-        Job job = Job.create("sleep", "1000");
+        Job job = Job.create("sleep", "1000", 3);
 
         assertThat(job.getId()).isNotNull();
         assertThat(job.getType()).isEqualTo("sleep");
         assertThat(job.getPayload()).isEqualTo("1000");
         assertThat(job.getStatus()).isEqualTo(JobStatus.QUEUED);
         assertThat(job.getAttemptCount()).isZero();
+        assertThat(job.getMaxAttempts()).isEqualTo(3);
         assertThat(job.getCreatedAt()).isNotNull();
         assertThat(job.getUpdatedAt()).isNotNull();
         assertThat(job.getStartedAt()).isNull();
         assertThat(job.getFinishedAt()).isNull();
+        assertThat(job.getNextAttemptAt()).isNull();
         assertThat(job.getErrorMessage()).isNull();
     }
 
     @Test
     void markRunningIncrementsAttemptsAndSetsStartedAt() {
-        Job job = Job.create("sleep", "1000");
+        Job job = Job.create("sleep", "1000", 3);
 
         job.markRunning();
 
@@ -36,7 +40,7 @@ class JobTest {
 
     @Test
     void markSucceededSetsTerminalStateAndFinishedAt() {
-        Job job = Job.create("sleep", "1000");
+        Job job = Job.create("sleep", "1000", 3);
         job.markRunning();
 
         job.markSucceeded();
@@ -49,7 +53,7 @@ class JobTest {
 
     @Test
     void markFailedRecordsErrorAndFinishedAt() {
-        Job job = Job.create("always_fail", "");
+        Job job = Job.create("always_fail", "", 3);
         job.markRunning();
 
         job.markFailed("boom");
@@ -57,6 +61,70 @@ class JobTest {
         assertThat(job.getStatus()).isEqualTo(JobStatus.FAILED);
         assertThat(job.getErrorMessage()).isEqualTo("boom");
         assertThat(job.getFinishedAt()).isNotNull();
+        assertThat(job.getNextAttemptAt()).isNull();
         assertThat(job.getAttemptCount()).isEqualTo(1);
+    }
+
+    @Test
+    void hasAttemptsRemainingUntilAttemptCountReachesMaxAttempts() {
+        Job job = Job.create("always_fail", "", 3);
+
+        assertThat(job.hasAttemptsRemaining()).isTrue();
+        job.markRunning();
+        assertThat(job.hasAttemptsRemaining()).isTrue();
+        job.markRunning();
+        assertThat(job.hasAttemptsRemaining()).isTrue();
+        job.markRunning();
+        assertThat(job.getAttemptCount()).isEqualTo(3);
+        assertThat(job.hasAttemptsRemaining()).isFalse();
+    }
+
+    @Test
+    void singleAttemptJobHasNothingRemainingAfterItsFirstRun() {
+        Job job = Job.create("always_fail", "", 1);
+        job.markRunning();
+
+        assertThat(job.hasAttemptsRemaining()).isFalse();
+    }
+
+    @Test
+    void markRetryingIsNotTerminal() {
+        Job job = Job.create("always_fail", "", 3);
+        job.markRunning();
+        Instant dueAt = Instant.now().plusSeconds(1);
+
+        job.markRetrying("boom", dueAt);
+
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RETRYING);
+        assertThat(job.getErrorMessage()).isEqualTo("boom");
+        assertThat(job.getNextAttemptAt()).isEqualTo(dueAt);
+        assertThat(job.getFinishedAt()).isNull();
+    }
+
+    @Test
+    void markRunningClearsTheScheduledNextAttempt() {
+        Job job = Job.create("always_fail", "", 3);
+        job.markRunning();
+        job.markRetrying("boom", Instant.now().plusSeconds(1));
+
+        job.markRunning();
+
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(job.getNextAttemptAt()).isNull();
+        assertThat(job.getAttemptCount()).isEqualTo(2);
+    }
+
+    @Test
+    void markFailedAfterRetryingClearsNextAttemptAndStaysTerminal() {
+        Job job = Job.create("always_fail", "", 2);
+        job.markRunning();
+        job.markRetrying("boom", Instant.now().plusSeconds(1));
+        job.markRunning();
+
+        job.markFailed("boom again");
+
+        assertThat(job.getStatus()).isEqualTo(JobStatus.FAILED);
+        assertThat(job.getNextAttemptAt()).isNull();
+        assertThat(job.getFinishedAt()).isNotNull();
     }
 }

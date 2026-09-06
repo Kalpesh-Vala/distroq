@@ -6,6 +6,7 @@ import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import org.hibernate.annotations.ColumnDefault;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -29,6 +30,11 @@ public class Job {
 
     private int attemptCount;
 
+    // DB-level default so ddl-auto: update can add this NOT NULL column to existing v0.1 rows
+    @ColumnDefault("3")
+    @Column(nullable = false)
+    private int maxAttempts;
+
     @Column(columnDefinition = "text")
     private String errorMessage;
 
@@ -36,12 +42,13 @@ public class Job {
     private Instant updatedAt;
     private Instant startedAt;
     private Instant finishedAt;
+    private Instant nextAttemptAt;
 
     protected Job() {
         // for JPA
     }
 
-    public static Job create(String type, String payload) {
+    public static Job create(String type, String payload, int maxAttempts) {
         Instant now = Instant.now();
         Job job = new Job();
         job.id = UUID.randomUUID();
@@ -49,9 +56,14 @@ public class Job {
         job.payload = payload;
         job.status = JobStatus.QUEUED;
         job.attemptCount = 0;
+        job.maxAttempts = maxAttempts;
         job.createdAt = now;
         job.updatedAt = now;
         return job;
+    }
+
+    public boolean hasAttemptsRemaining() {
+        return attemptCount < maxAttempts;
     }
 
     public void markRunning() {
@@ -60,12 +72,23 @@ public class Job {
         this.attemptCount++;
         this.startedAt = now;
         this.updatedAt = now;
+        this.nextAttemptAt = null;
     }
 
     public void markSucceeded() {
         Instant now = Instant.now();
         this.status = JobStatus.SUCCEEDED;
         this.finishedAt = now;
+        this.updatedAt = now;
+        this.nextAttemptAt = null;
+    }
+
+    /** Non-terminal: finishedAt stays unset because the job has not finished, only this attempt has. */
+    public void markRetrying(String error, Instant nextAttemptAt) {
+        Instant now = Instant.now();
+        this.status = JobStatus.RETRYING;
+        this.errorMessage = error;
+        this.nextAttemptAt = nextAttemptAt;
         this.updatedAt = now;
     }
 
@@ -75,6 +98,7 @@ public class Job {
         this.errorMessage = error;
         this.finishedAt = now;
         this.updatedAt = now;
+        this.nextAttemptAt = null;
     }
 
     public UUID getId() {
@@ -97,6 +121,10 @@ public class Job {
         return attemptCount;
     }
 
+    public int getMaxAttempts() {
+        return maxAttempts;
+    }
+
     public String getErrorMessage() {
         return errorMessage;
     }
@@ -115,5 +143,9 @@ public class Job {
 
     public Instant getFinishedAt() {
         return finishedAt;
+    }
+
+    public Instant getNextAttemptAt() {
+        return nextAttemptAt;
     }
 }
