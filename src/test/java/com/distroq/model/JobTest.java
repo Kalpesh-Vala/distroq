@@ -127,4 +127,55 @@ class JobTest {
         assertThat(job.getNextAttemptAt()).isNull();
         assertThat(job.getFinishedAt()).isNotNull();
     }
+
+    @Test
+    void markDeadLetteredIsTerminalAndRetainsTheError() {
+        Job job = Job.create("always_fail", "", 2);
+        job.markRunning();
+        job.markRetrying("boom", Instant.now().plusSeconds(1));
+        job.markRunning();
+
+        job.markDeadLettered("boom again");
+
+        assertThat(job.getStatus()).isEqualTo(JobStatus.DEAD_LETTERED);
+        assertThat(job.getErrorMessage()).isEqualTo("boom again");
+        assertThat(job.getFinishedAt()).isNotNull();
+        assertThat(job.getNextAttemptAt()).isNull();
+        assertThat(job.getAttemptCount()).isEqualTo(2);
+        assertThat(job.hasAttemptsRemaining()).isFalse();
+    }
+
+    @Test
+    void prepareForReplayContinuesHistoryRatherThanResettingIt() {
+        Job job = Job.create("always_fail", "", 3);
+        job.markRunning();
+        job.markRunning();
+        job.markRunning();
+        job.markDeadLettered("exhausted");
+
+        job.prepareForReplay(3);
+
+        assertThat(job.getAttemptCount()).isEqualTo(3);
+        assertThat(job.getMaxAttempts()).isEqualTo(6);
+        assertThat(job.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(job.getErrorMessage()).isNull();
+        assertThat(job.getFinishedAt()).isNull();
+        assertThat(job.getNextAttemptAt()).isNull();
+        // if this is false the replayed job is out of budget before it runs a single attempt
+        assertThat(job.hasAttemptsRemaining()).isTrue();
+    }
+
+    @Test
+    void replayedJobRunsAsTheNextAttemptNumber() {
+        Job job = Job.create("fail_until_flagged", "", 2);
+        job.markRunning();
+        job.markRunning();
+        job.markDeadLettered("exhausted");
+        job.prepareForReplay(3);
+
+        job.markRunning();
+
+        assertThat(job.getAttemptCount()).isEqualTo(3);
+        assertThat(job.getMaxAttempts()).isEqualTo(5);
+    }
 }

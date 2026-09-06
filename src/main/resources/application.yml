@@ -25,6 +25,12 @@ spring:
       host: localhost
       port: 6379
 
+server:
+  error:
+    # without this the `reason` on a ResponseStatusException is dropped from the body, so a 409
+    # from the replay endpoint would not say which status the job is actually in
+    include-message: always
+
 distroq:
   queue-key: distroq:jobs:pending
   delayed-key: distroq:jobs:delayed
@@ -35,6 +41,8 @@ distroq:
     jitter-factor: 0.2
     poll-interval-ms: 1000
     promote-batch-size: 100
+  dlq:
+    replay-attempts: 3
 
 logging:
   level:

@@ -7,7 +7,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 public record DistroqProperties(
         @DefaultValue("distroq:jobs:pending") String queueKey,
         @DefaultValue("distroq:jobs:delayed") String delayedKey,
-        @DefaultValue Retry retry) {
+        @DefaultValue Retry retry,
+        @DefaultValue Dlq dlq) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -16,5 +17,10 @@ public record DistroqProperties(
             @DefaultValue("0.2") double jitterFactor,
             @DefaultValue("1000") long pollIntervalMs,
             @DefaultValue("100") int promoteBatchSize) {
+    }
+
+    /** {@code replayAttempts} is added to attemptCount on replay, not assigned to maxAttempts. */
+    public record Dlq(
+            @DefaultValue("3") int replayAttempts) {
     }
 }

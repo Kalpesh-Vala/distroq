@@ -82,7 +82,71 @@ change has to be reflected in both stores, and it will reappear again at v0.3 (D
 outbox, and the reconciliation-sweep alternative gets correspondingly less attractive
 because it now needs to handle two distinct stuck-state shapes rather than one.
 
-### 2. Orphaned RUNNING jobs after a lost worker connection
+**Update (v0.3): the predicted third site arrived, exactly as predicted.** `JobController.replay`:
+
+```java
+job.prepareForReplay(replayAttempts);
+jobRepository.save(job);                  // Postgres
+deadLetter.markReplayed(); ...save(...);  // Postgres
+jobQueue.enqueue(job.getId());            // Redis
+```
+
+A crash before the `enqueue` leaves the job `QUEUED` in Postgres with its DLQ row already
+marked `replayed = true`, and no ID in Redis. This is the **worst-presenting** variant of the
+three so far. The submit case at least leaves a job that has never run; the retry case leaves
+one that reads as scheduled. This one leaves a job that reads as *successfully replayed* —
+the operator got their `202`, `replayCount` incremented, `replayedAt` is populated, and the
+job is no longer listed under `/api/dlq?replayed=false`. It has fallen out of the DLQ view
+without ever re-entering the queue, so neither of the two places anyone would look shows a
+problem. The DLQ, which exists to make failures visible, has been used to make one invisible.
+
+Still unfixed, and this is the version where that stops being a comfortable call. The
+prediction in the v0.2 note was that a third occurrence would be the argument for the outbox.
+It is. What has changed is not the probability — the window is the same handful of
+milliseconds — but the *detectability*, which has got monotonically worse each time.
+
+**And note what the new `@Transactional` does not do.** `DeadLetterWriter.deadLetter` is
+`@Transactional` so that the job update and the `dead_letters` upsert commit or roll back
+together. That is a genuine guarantee about two writes *to Postgres*. It says nothing about
+Redis, which is not a transaction participant and has no prepare phase. It is deliberately
+placed on the exhaustion path, where both writes are to the database and an annotation is
+therefore the correct tool — precisely the opposite of the submit path, where the same
+annotation would have been theatre. The distinction matters because the two look identical in
+a diff: one is a real fix for a real atomicity problem, the other would be a fake fix for a
+different one. `DeadLetterWriter` is a separate bean rather than a method on `Worker` for the
+mundane reason that Spring's transaction advice is proxy-based, so a self-call from
+`handleFailure` would have run with no transaction at all and looked fine.
+
+### 2. The `dead_letters` / `jobs` invariant is enforced by application code, not the database
+
+The rule is: a row in `dead_letters` with `replayed = false` must correspond to a job with
+status `DEAD_LETTERED`. Nothing in Postgres enforces it. There is no trigger, no CHECK, no
+generated column — and there could not easily be one, because the invariant spans two tables
+and one direction of it is conditional.
+
+What holds it up is that exactly two code paths write it, both of which set the pair
+together: `DeadLetterWriter.deadLetter` (status `DEAD_LETTERED`, row `replayed = false`) and
+`JobController.replay` (status `QUEUED`, row `replayed = true`). What could break it:
+
+- a crash between the two writes in `replay`, which are not in one transaction (see above) —
+  leaving `QUEUED` + `replayed = true`, which is *consistent*, then the missing enqueue makes
+  it permanently stuck rather than inconsistent. The genuinely inconsistent variant is the
+  reverse ordering, which the current code does not have.
+- any second writer. A `psql` session setting a status by hand, a future service, a data fix.
+  This is the same exposure accepted when the `status` CHECK constraint was dropped in v0.2.1,
+  and it is the second thing that decision has now cost.
+- a future bulk-replay or purge feature that updates `jobs` and `dead_letters` in separate
+  statements. Noted here so it is not rediscovered.
+
+Detecting a violation is a single query, and there is deliberately no reconciliation job
+running it:
+
+```sql
+SELECT d.job_id, j.status FROM dead_letters d JOIN jobs j ON j.id = d.job_id
+WHERE d.replayed = false AND j.status <> 'DEAD_LETTERED';
+```
+
+### 3. Orphaned RUNNING jobs after a lost worker connection
 
 This one showed up on its own during the v0.1 acceptance run, which is the only reason I
 know about it this early.
@@ -152,6 +216,125 @@ come from making execution repeatable, not from trying to guarantee a job is nev
 twice.
 
 ## Design decisions
+
+**Why the DLQ is a table plus a status, and not a status alone.** The status alone would have
+been strictly less code: add `DEAD_LETTERED`, change one line in `Worker`, filter
+`/api/jobs?status=DEAD_LETTERED` for the listing, done. No migration beyond the enum, no
+second entity, no second write. I did not do that, and the reason has to be better than
+"tables feel more real".
+
+Two things earn the table. First, replay needs state that is *about the dead-lettering event*,
+not about the job: when it was moved (`moved_at`, distinct from the job's `finished_at`),
+whether it has been replayed, when, and how many times. Hanging `replayed_at` and
+`replay_count` off `jobs` would put DLQ bookkeeping on every row in the system, including the
+overwhelming majority that will never be dead-lettered, and would make `jobs` the place you go
+to understand a subsystem it is not part of. Second, "what is in the DLQ right now" becomes a
+scan of a table that stays small — it holds one row per job that has ever failed terminally —
+rather than a status-filtered scan of `jobs`, which grows without bound. Today, with an index
+on `status`, those perform identically. They stop being identical at the point where anyone
+would care, and the migration to fix it later is more expensive than doing it now.
+
+**What it costs, stated plainly rather than glossed:** a second write on the exhaustion path,
+and therefore a third instance of the dual write. That is written up under *Known limitations*
+and it is a real cost, not a rounding error. It also adds an invariant that spans two tables
+and is held together by application code alone — also written up there. Choosing the table
+means choosing both of those.
+
+**Why replay continues history instead of resetting it.** The obvious implementation of replay
+is "put it back like it was new": `attemptCount = 0`, fresh `maxAttempts`, clear the attempt
+rows. Every part of that is wrong for this system.
+
+The test is what `GET /api/jobs/{id}` says afterwards. With history preserved it says: failed
+twice with these two errors, was dead-lettered, was replayed at this time, succeeded on
+attempt 3. That is a complete account of an incident. With history reset it says: succeeded on
+attempt 1. The job that caused someone to be paged is now indistinguishable from one that
+worked first time. A dead-letter queue exists to make failure legible, so an operation inside
+it that destroys the evidence of failure is working against the point of the feature.
+
+`attemptCount` therefore carries over — a job that failed 3 times runs next as attempt 4, and
+`job_attempts` rows append with increasing `attempt_number` rather than restarting. The
+`dead_letters` row is retained rather than deleted for the same reason: "has this job ever
+been dead-lettered" and "how often" stay answerable, and `replay_count` names repeat
+offenders, which a delete-on-replay design cannot do at all.
+
+**`maxAttempts` is extended, not reset, and this is load-bearing.** If `attemptCount` carries
+over then `maxAttempts` must move too, or the replayed job is at 3/3 the moment it is
+requeued, fails `hasAttemptsRemaining()` on its first failure, and is dead-lettered again
+immediately — a replay that cannot possibly succeed more than once. So on replay
+`maxAttempts = attemptCount + distroq.dlq.replay-attempts` (default 3): the replay gets its
+own budget, expressed relative to where the job actually is. This is the single most
+load-bearing line in the version and it has the one unit test I would keep if I could only
+keep one: `hasAttemptsRemaining()` must be true immediately after `prepareForReplay`.
+
+Resetting `maxAttempts` to its original value would work by accident when the original budget
+happened to exceed `attemptCount`, and fail silently when it did not. Relative is correct;
+absolute is a coin flip.
+
+**Replay goes on the pending list, not the delayed set.** The retry path parks a job in
+`distroq:jobs:delayed` with a backoff. Replay does not, and enqueues directly. Backoff exists
+to protect a downstream dependency from a machine retrying in a tight loop. A replay is a
+human deciding, once, that the thing is fixed — there is no herd to spread and no automatic
+loop to slow down. Making an operator who just typed `redis-cli DEL` wait out a backoff
+window they did not ask for is surprising behaviour in exchange for nothing. This also keeps
+the two paths honestly distinct: the delayed set means "the system decided to wait", the
+pending list means "run this now".
+
+**v0.2 `FAILED` rows are not backfilled into `dead_letters`.** `FAILED` is kept in the enum
+and redefined: it is a transient per-attempt outcome, and nothing writes it as a terminal job
+state any more. The tempting tidy-up is a one-line `INSERT ... SELECT` in V3 giving every
+existing `FAILED` job a dead-letter row so the DLQ is "complete".
+
+That would be fabricating history. Those jobs never went through the exhaustion path that
+writes a `dead_letters` row; there is no `moved_at` for them because no move happened, and any
+value chosen — `finished_at`, `now()` — is an invention presented as a record. It would also
+make them replayable, which retroactively grants a capability that did not exist when they
+failed, against code paths that may since have changed. A DLQ whose contents are partly real
+events and partly reconstructed ones is worth less than one that is smaller and entirely true.
+The visible cost is a handful of legacy rows that are terminal and not replayable, which is an
+accurate description of what they are.
+
+**Adding `DEAD_LETTERED` required zero DDL, which is the whole v0.2.1 argument settled.** This
+is the same change that broke v0.2: a new value in `JobStatus`. Then, Hibernate's generated
+`jobs_status_check` enumerated the four v0.1 statuses, `ddl-auto: update` would not widen it,
+and every write of the new status was rejected at commit with a symptom that pointed at the
+application. Now, V3 does not mention `jobs` at all. The status change is a one-line enum edit
+with no migration, because there is no constraint left to widen.
+
+The contrast is worth keeping precise, because it is the only real evidence either way. v0.2:
+one enum value cost a debugging session, a hand-run `ALTER TABLE`, and left the live database
+and a fresh one provably different. v0.3: the identical change cost nothing and both databases
+came out byte-identical (verified — see *Verified in v0.3*). The trade-off accepted in v0.2.1
+was that the database no longer defends `status` against a writer that is not this
+application. That cost is still real, and it showed up again this version in the
+`dead_letters`/`jobs` invariant, which is likewise unenforced. Two unenforced invariants is a
+different position from one, and it is the direction that eventually argues for putting
+integrity back into the schema — but it has still not cost anything measurable, and the enum
+has now changed twice more without incident.
+
+**The `job_attempts` foreign key was added now, deliberately, while the table is small.** It
+was never generated because `JobAttempt` stores a raw `UUID jobId` rather than a `@ManyToOne`,
+so Hibernate had no association to infer one from. V1 reproduced that absence faithfully,
+because a baseline describes what exists rather than improving it. V3 is the first migration
+since where adding it is in scope.
+
+The reason for doing it in the same version as an unrelated feature is that the cost only
+goes up. Adding a FK validates it against every existing row, which is fast on 7 rows and a
+table-lock-shaped problem on seven million. And if orphans ever do appear, the choice becomes
+"delete production rows" or "never add the constraint", both of which are worse than acting
+now. Zero orphans were confirmed before applying it, and the migration would have failed
+rather than silently accepted bad data had there been any.
+
+The raw-UUID mapping stays. The FK is a *database* integrity guarantee; adding `@ManyToOne`
+would be an *ORM* change with its own consequences — a lazy proxy that can escape into DTO
+mapping outside a session, which is the exact thing the raw UUID was chosen to avoid. Those
+two are routinely conflated and they are not the same decision.
+
+**Why the transaction is on the exhaustion path and not on submit.** Covered under *Known
+limitations*, but the short version belongs here too: `@Transactional` is the right tool when
+every write it covers is to the same transactional resource, and theatre when one of them is
+not. Exhaustion writes `jobs` and `dead_letters` — both Postgres, both genuinely made atomic.
+Submit and replay write Postgres and then Redis — no annotation can make those atomic, and
+adding one would advertise a guarantee that does not exist.
 
 **Why the retry delay lives in a Redis sorted set, not in the process.** Three options,
 two of which are wrong for reasons worth writing down.
@@ -471,6 +654,43 @@ exists in two places, submit and retry scheduling) and still did not earn a fix,
 remains a narrow window on a single-process deployment. The difference is that the constraint
 bug actually fired and the dual write still has not. Roadmaps should move on evidence, and
 "this broke" is evidence in a way that "this could break" is not.
+
+## Verified in v0.3
+
+**Both database paths converge, checked rather than assumed.** The failure mode v0.2.1 was
+built to prevent is a migration that works on the developer's database and produces a
+different schema on a fresh one. V3 was applied to the pre-existing database (3 jobs, 7
+attempts, unchanged afterwards; V3 recorded `success = t`), then the volume was destroyed and
+the app started against an empty database, where V1, V2 and V3 all executed in order. The
+`\d` output for `jobs`, `job_attempts` and `dead_letters` from the two databases diffs to
+**zero lines**, index names and column order included.
+
+**`GET /api/dlq` issues 2 SQL statements regardless of page size.** Measured with
+`logging.level.org.hibernate.SQL=DEBUG` against a 6-entry DLQ: one `select ... from
+dead_letters order by moved_at desc fetch first ? rows only`, then one `select ... from jobs
+where id in (?,?,?,?,?,?)`. The naive version — calling `jobRepository.findById` inside the
+mapping loop — would have been 7, growing with the page. The fix is `findAllById` plus a
+`Map<UUID, Job>` built once, which is the whole of it; the point of measuring was that N+1 is
+invisible in code review precisely because the per-item lookup reads perfectly naturally.
+
+**Re-dead-lettering does not violate the primary key.** `dead_letters` is keyed by `job_id`,
+so the second exhaustion of a replayed job has to update rather than insert. Verified end to
+end: a job dead-lettered, replayed, and dead-lettered again came back with `replayCount: 1`
+preserved, `replayed` back to `false`, a refreshed `movedAt`, and all six attempt rows intact.
+No constraint-violation line anywhere in the log — the only ERROR was the intentional
+`DEAD_LETTERED after 6 attempt(s)` one. This is the case that a status-only DLQ would never
+have had, and it is the one that would have shipped broken if only the happy path had been
+exercised.
+
+**`server.error.include-message: always` was needed and is not free.** The 409 on replaying a
+non-dead-lettered job is required to name the status the job is actually in. It did not:
+Spring Boot omits `message` from error bodies by default, so the `reason` on every
+`ResponseStatusException` in this application — including the v0.2 `maxAttempts must be at
+least 1` 400, which has apparently been invisible the entire time — was being discarded. The
+setting fixes all of them at once. It also exposes messages from *unhandled* exceptions, which
+is a genuine information leak on anything internet-facing. Accepted for a local
+unauthenticated development service and flagged in the README, rather than reached for
+silently.
 
 ## Resolved issues
 

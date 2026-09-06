@@ -33,6 +33,7 @@ public class Worker {
     private final JobAttemptRepository jobAttemptRepository;
     private final JobExecutor jobExecutor;
     private final BackoffPolicy backoffPolicy;
+    private final DeadLetterWriter deadLetterWriter;
 
     private final String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -43,12 +44,14 @@ public class Worker {
                   JobRepository jobRepository,
                   JobAttemptRepository jobAttemptRepository,
                   JobExecutor jobExecutor,
-                  BackoffPolicy backoffPolicy) {
+                  BackoffPolicy backoffPolicy,
+                  DeadLetterWriter deadLetterWriter) {
         this.jobQueue = jobQueue;
         this.jobRepository = jobRepository;
         this.jobAttemptRepository = jobAttemptRepository;
         this.jobExecutor = jobExecutor;
         this.backoffPolicy = backoffPolicy;
+        this.deadLetterWriter = deadLetterWriter;
     }
 
     @PostConstruct
@@ -116,9 +119,8 @@ public class Worker {
 
     private void handleFailure(Job job, int attemptNumber, String error) {
         if (!job.hasAttemptsRemaining()) {
-            job.markFailed(error);
-            jobRepository.save(job);
-            log.error("Job {} permanently FAILED after {} attempt(s): {}",
+            deadLetterWriter.deadLetter(job, error);
+            log.error("Job {} DEAD_LETTERED after {} attempt(s): {}",
                     job.getId(), attemptNumber, error);
             return;
         }
