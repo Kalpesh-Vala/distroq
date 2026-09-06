@@ -2,6 +2,8 @@ package com.distroq.worker;
 
 import com.distroq.model.Job;
 import com.distroq.model.JobAttempt;
+import com.distroq.model.Priority;
+import com.distroq.queue.Dequeued;
 import com.distroq.queue.JobQueue;
 import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
@@ -15,6 +17,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -34,6 +37,7 @@ public class Worker {
     private final JobExecutor jobExecutor;
     private final BackoffPolicy backoffPolicy;
     private final DeadLetterWriter deadLetterWriter;
+    private final PriorityStrategy priorityStrategy;
 
     private final String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -45,13 +49,15 @@ public class Worker {
                   JobAttemptRepository jobAttemptRepository,
                   JobExecutor jobExecutor,
                   BackoffPolicy backoffPolicy,
-                  DeadLetterWriter deadLetterWriter) {
+                  DeadLetterWriter deadLetterWriter,
+                  PriorityStrategy priorityStrategy) {
         this.jobQueue = jobQueue;
         this.jobRepository = jobRepository;
         this.jobAttemptRepository = jobAttemptRepository;
         this.jobExecutor = jobExecutor;
         this.backoffPolicy = backoffPolicy;
         this.deadLetterWriter = deadLetterWriter;
+        this.priorityStrategy = priorityStrategy;
     }
 
     @PostConstruct
@@ -68,9 +74,19 @@ public class Worker {
     private void runLoop() {
         while (running.get()) {
             try {
-                UUID jobId = jobQueue.dequeue(POP_TIMEOUT);
-                if (jobId != null) {
-                    process(jobId);
+                boolean guardDue = priorityStrategy.guardDue();
+                List<Priority> order = priorityStrategy.nextPollOrder();
+                Dequeued dequeued = jobQueue.dequeue(order, POP_TIMEOUT);
+                if (dequeued != null) {
+                    if (guardDue) {
+                        log.info("Starvation guard fired after {} dequeue(s) above {}: polled {}, "
+                                        + "served job {} from {}",
+                                priorityStrategy.starvationThreshold(), Priority.LOWEST, order,
+                                dequeued.jobId(), dequeued.tier());
+                    }
+                    // a timed-out poll served nothing, so it is not a bypass and must not count
+                    priorityStrategy.recordServed(dequeued.tier());
+                    process(dequeued.jobId(), dequeued.tier());
                 }
             } catch (Exception e) {
                 if (!running.get()) {
@@ -87,7 +103,7 @@ public class Worker {
         }
     }
 
-    private void process(UUID jobId) {
+    private void process(UUID jobId, Priority servedFrom) {
         Optional<Job> found = jobRepository.findById(jobId);
         if (found.isEmpty()) {
             log.warn("Job {} was queued but is not in the database, skipping", jobId);
@@ -99,8 +115,8 @@ public class Worker {
         jobRepository.save(job);
         int attemptNumber = job.getAttemptCount();
         Instant startedAt = job.getStartedAt();
-        log.info("Job {} ({}) RUNNING on {}, attempt {} of {}",
-                job.getId(), job.getType(), workerId, attemptNumber, job.getMaxAttempts());
+        log.info("Job {} ({}, served from {}) RUNNING on {}, attempt {} of {}",
+                job.getId(), job.getType(), servedFrom, workerId, attemptNumber, job.getMaxAttempts());
 
         try {
             jobExecutor.execute(job);
@@ -130,9 +146,12 @@ public class Worker {
         job.markRetrying(error, dueAt);
         // second instance of the dual write from JobController.submit - see NOTES.md
         jobRepository.save(job);
-        jobQueue.scheduleAt(job.getId(), dueAt);
-        log.warn("Job {} failed attempt {} of {} ({}), RETRYING in {}ms",
-                job.getId(), attemptNumber, job.getMaxAttempts(), error, delay.toMillis());
+        // the tier travels with the job into the delayed set, so the promotion does not have to
+        // read it back out of Postgres to know which list to push to
+        jobQueue.scheduleAt(job.getId(), job.getPriority(), dueAt);
+        log.warn("Job {} ({}) failed attempt {} of {} ({}), RETRYING in {}ms",
+                job.getId(), job.getPriority(), attemptNumber, job.getMaxAttempts(), error,
+                delay.toMillis());
     }
 
     // fires before bean destruction closes the Redis connection, so a BRPOP

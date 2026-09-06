@@ -178,4 +178,44 @@ class JobTest {
         assertThat(job.getAttemptCount()).isEqualTo(3);
         assertThat(job.getMaxAttempts()).isEqualTo(5);
     }
+
+    @Test
+    void createStoresEachTierAsGiven() {
+        for (Priority priority : Priority.values()) {
+            Job job = Job.create("sleep", "100", 3, priority);
+
+            assertThat(job.getPriority()).as(priority.name()).isEqualTo(priority);
+        }
+    }
+
+    @Test
+    void createResolvesANullPriorityToNormalRatherThanThrowing() {
+        Job job = Job.create("sleep", "100", 3, null);
+
+        assertThat(job.getPriority()).isEqualTo(Priority.NORMAL);
+    }
+
+    @Test
+    void theThreeArgumentCreateStillMeansNormal() {
+        // the v0.3 call shape must keep behaving exactly as it did, which is what every other
+        // test in this class is quietly asserting
+        assertThat(Job.create("sleep", "100", 3).getPriority()).isEqualTo(Priority.NORMAL);
+    }
+
+    @Test
+    void priorityIsUnchangedByEveryStateTransitionIncludingReplay() {
+        Job job = Job.create("always_fail", "", 2, Priority.HIGH);
+
+        job.markRunning();
+        job.markRetrying("boom", Instant.now().plusSeconds(1));
+        job.markRunning();
+        job.markDeadLettered("exhausted");
+        job.prepareForReplay(3);
+        job.markRunning();
+        job.markSucceeded();
+
+        // a job that comes back from a retry or a replay at a different tier is a silent
+        // correctness bug that no status assertion would ever catch
+        assertThat(job.getPriority()).isEqualTo(Priority.HIGH);
+    }
 }

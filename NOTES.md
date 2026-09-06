@@ -117,7 +117,69 @@ different one. `DeadLetterWriter` is a separate bean rather than a method on `Wo
 mundane reason that Spring's transaction advice is proxy-based, so a self-call from
 `handleFailure` would have run with no transaction at all and looked fine.
 
-### 2. The `dead_letters` / `jobs` invariant is enforced by application code, not the database
+**Update (v0.4): still three sites, still unfixed, and all three now carry a tier.** No fourth
+occurrence appeared — `JobController.submit`, `Worker.handleFailure` and `JobController.replay`
+are the same three, each now passing a `Priority` alongside the ID. What changed is only that the
+Redis half of each write got one field wider. That is worth stating plainly rather than letting
+the diff imply progress: routing a stranded write to the correct list does not make it less
+stranded. A HIGH job lost between `save` and `enqueue` is lost from the HIGH list specifically,
+which if anything is the one you would most want to notice, and there is still nothing that does.
+
+### 2. Priority is immutable after submission, and no version on the roadmap fixes that
+
+There is no endpoint to re-prioritise a queued job, and `Job` has no setter for `priority`. This
+is not an omission for want of time; it is a consequence of the design that would have to be
+undone deliberately.
+
+The routing decision is committed at enqueue time. The instant `submit` returns, the job's ID is
+sitting in one specific list, and Redis lists have no "move this member to another list" that is
+also atomic with removing it from the first. Re-prioritising would mean `LREM` from the old tier
+then `LPUSH` to the new one, and a crash between those two loses the job outright — a strictly
+worse failure than the dual write, because here both writes are to Redis and there is no database
+row to reconcile against. `LMOVE`/`RPOPLPUSH` is atomic but moves the *tail* element, not a
+nominated one, so it cannot be aimed at a particular job.
+
+**Streams do not fix this either**, which is the part worth being precise about, because it is
+tempting to file it under "v0.5 will sort it out." A consumer group reads from one stream. Tiers
+under Streams are still separate streams, so the entry is still committed to a specific one at
+`XADD` time, and moving it is still a non-atomic delete-and-re-add — worse, because `XDEL` leaves
+a tombstone and the re-added entry gets a new ID, so its position in the stream and any
+consumer's PEL reference to it both change. The property that makes re-prioritisation hard is not
+the list; it is that routing happens at write time in every log- or list-shaped queue.
+
+What would actually fix it is not committing the routing at enqueue time at all: keep one queue
+and let the *consumer* choose, which means a structure the consumer can order by priority — a
+sorted set scored by `(tier, submitted_at)`. That is the design rejected in Decision 1, and it
+costs the blocking read. So "priority is mutable" and "dispatch is a blocking pop" are close to
+mutually exclusive, and this version picked the pop.
+
+The mitigation available today is cancel-and-resubmit at the application level, which is a
+different job with a different ID and a different position in the queue. That is honest about
+what is happening rather than pretending an update occurred.
+
+### 3. The starvation counter is per-worker, and will not hold globally at v0.7
+
+`PriorityStrategy` holds an `AtomicInteger`. Atomic makes the class safe to *share between
+threads*; it does not make the guarantee global. With one worker those are the same thing, which
+is exactly why this is easy to get wrong later.
+
+At v0.7 there are N workers. If each holds its own `PriorityStrategy`, each counts only its own
+dequeues, so the guard fires at most once per `threshold` dequeues *per worker* — with N workers
+and a threshold of 10, the lowest tier is served roughly N times per 10N dequeues, which happens
+to come out the same in aggregate. The failure is not the rate, it is the correlation: all N
+workers can trip their guards at once and all poll in reversed order simultaneously, so a burst
+of LOW jobs is served while HIGH work waits, then none for a long stretch. The intended "one in
+ten" becomes "N in a row, then 10N of nothing," which is a worse latency distribution for both
+tiers than either strict priority or a genuine global counter.
+
+Sharing one bean across workers is not the fix on its own either, because then N threads race on
+one counter and the guard order is handed to whichever thread happens to call `nextPollOrder`
+next — the poll that trips the guard and the poll that consumes it need not be the same thread.
+A real fix needs the counter in Redis (`INCR` on a shared key, checked and reset atomically), at
+the cost of a round trip per dequeue on the hot path. Noted here so v0.7 does not discover it by
+watching latency graphs.
+
+### 4. The `dead_letters` / `jobs` invariant is enforced by application code, not the database
 
 The rule is: a row in `dead_letters` with `replayed = false` must correspond to a job with
 status `DEAD_LETTERED`. Nothing in Postgres enforces it. There is no trigger, no CHECK, no
@@ -146,7 +208,7 @@ SELECT d.job_id, j.status FROM dead_letters d JOIN jobs j ON j.id = d.job_id
 WHERE d.replayed = false AND j.status <> 'DEAD_LETTERED';
 ```
 
-### 3. Orphaned RUNNING jobs after a lost worker connection
+### 5. Orphaned RUNNING jobs after a lost worker connection
 
 This one showed up on its own during the v0.1 acceptance run, which is the only reason I
 know about it this early.
@@ -216,6 +278,213 @@ come from making execution repeatable, not from trying to guarantee a job is nev
 twice.
 
 ## Design decisions
+
+**Why v0.4 was built on a mechanism v0.5 will delete, on purpose.** v0.5 replaces the Redis list
+with Streams. That rewrites how dequeue works, which means most of the code in this version —
+`JobQueue.dequeue`, the per-tier keys, the promotion script's destination logic — is being
+written in the knowledge that it will be thrown away in one version's time. That deserves an
+argument rather than a shrug.
+
+The argument is that the *policy* and the *mechanism* have very different lifespans, and only one
+of them is being discarded. The questions v0.4 actually settles are: how many tiers are there and
+why that number; what does the API accept and reject; what is the default; is priority mutable;
+what happens to the lowest tier under sustained load, and what is the guarantee called. Every one
+of those answers is unchanged by Streams. `PriorityStrategy` contains all of the scheduling
+policy, touches no Redis, and compiles against nothing that v0.5 replaces — it and its twelve
+tests survive the rewrite untouched. The API contract survives. The schema survives. What dies is
+the plumbing between them, and the plumbing is the cheapest part.
+
+The alternative was to reorder the roadmap: do Streams first, then priority on top. I rejected it
+for two reasons. The first is that it would have meant designing priority *while* also designing
+consumer groups, PEL handling and reclaim, and the policy questions above would have been settled
+as a side effect of the mechanism work rather than on their own merits — which is precisely how
+you end up with three tiers because three streams were convenient. The second is that Streams is
+motivated by the orphaned-`RUNNING` problem, which is a *reliability* change; bundling a
+*scheduling* feature into it makes one version that changes both what runs and whether it is
+recoverable, and if the acceptance run goes wrong there is no way to tell which half broke it.
+
+The honest cost is real: some of the diff in this version is dead code walking, and it will be
+deleted having run in production for exactly one version. The trade is that the decisions it
+encodes get made once, in isolation, with a test suite that outlives them.
+
+**Discrete tiers, not an integer priority score.** `Priority` is a three-value enum. The obvious
+alternative — `int priority`, higher wins — was rejected because a Redis list cannot honour it.
+
+A list has exactly one ordering primitive: insertion position. There is no "insert this member
+ahead of everything with a lower score," and `LINSERT` needs a pivot value you would have to find
+by scanning. So an arbitrary integer needs one of two things. A **sorted set** scored by priority
+gives real ordering, and costs the blocking pop: `BZPOPMIN` exists, but it pops the *lowest score*
+across one key, so with a score encoding priority you lose the ability to also order by arrival
+time within a tier without packing both into one float and hoping the precision holds. Or
+**client-side scanning** — read a window, pick the best, remove it — which is a check-then-act
+race and a lost job every time two consumers pick the same member.
+
+Discrete tiers dodge both because "one list per tier" turns priority into key *selection* rather
+than in-list ordering, and `BRPOP` already takes multiple keys. Atomicity and blocking both
+survive intact, which is the entire reason for the shape of this version.
+
+**What it cannot express, stated plainly:** there is no "priority 47." There is no way to say
+this job is slightly more urgent than that one within a tier — inside a tier it is strictly FIFO,
+and that is not configurable. There is no dynamic priority ageing, where a job's rank rises with
+time waited, because rank is a key name and key names do not change. If any of those were
+genuine requirements the design would have to change to the sorted set and give up the blocking
+read, and I would want to see the requirement before paying that.
+
+Three tiers specifically, rather than two or five, because two cannot demonstrate the interesting
+case — starvation only exists when something can be squeezed from both sides, and with two tiers
+"the lowest tier" and "not the highest tier" are the same set, so the guard's definition would be
+degenerate and would not generalise. Five would be five key names and no additional idea.
+
+**Strict priority plus a starvation guard, not weighted round-robin.** The naive implementation
+drains HIGH before touching NORMAL and NORMAL before LOW. Under a steady stream of HIGH that is
+starvation in the literal sense: a LOW job that has waited an hour is no closer to running than
+one submitted this second, and nothing in the system will ever change that.
+
+The rejected alternative was **weighted round-robin** — serve HIGH:NORMAL:LOW in a fixed 5:3:1
+rotation. It gives smoother throughput sharing and a much easier guarantee to state. What it
+costs is the thing priorities are for: in a 5:3:1 rotation a HIGH job submitted at the wrong
+point in the cycle waits behind a LOW job even when the queue is otherwise nearly empty, because
+the rotation does not care that the system has capacity. Making HIGH sometimes slower than
+NORMAL, on a system whose entire purpose is to make HIGH fast, is a bad trade for a fairness
+property nobody asked for.
+
+So: strict order every time, except that after `distroq.priority.starvation-threshold`
+consecutive dequeues served above the lowest tier, exactly one poll goes out in reversed order.
+
+**What the guard guarantees, and what it does not.** It bounds starvation **in dequeues, not in
+time**. With a threshold of 10, a LOW job cannot have more than roughly 10 higher-tier jobs
+served ahead of it per cycle. It says nothing at all about how long that takes: ten HIGH jobs that
+each run for a minute means the LOW job waits ten minutes, and the guard is working perfectly the
+whole time. There is no deadline, no maximum age, no promotion by waiting.
+
+**It is therefore not fairness, and calling it fair would be wrong twice over** — once because
+the shares are deliberately unequal, and once because the bound is in the wrong unit to be a
+latency guarantee. It is a *weighted* strategy with a floor on how badly the lowest tier can be
+squeezed. A real time-based bound would need a deadline scheduler: track each job's age and
+promote anything past a threshold, which means reading ages, which means the sorted set again.
+
+**The counter counts bypasses, and over-counts on purpose.** The definition that would be exactly
+right is "consecutive dequeues that skipped a lower tier *that had work waiting*." Serving HIGH
+a hundred times with LOW empty is not starving anybody, and tripping the guard for it is noise.
+Getting that right requires knowing tier depths at the moment of each dequeue, which means either
+`LLEN` before every pop — an extra round trip on the hot path, and a stale answer by the time the
+pop happens — or letting `PriorityStrategy` read Redis, which destroys the one property that
+makes it survive v0.5.
+
+The trade taken instead is to count every dequeue served above the lowest tier and make a
+spurious guard **self-cancelling**: when the guard fires and the lowest tier is empty, the same
+`BRPOP` falls through to the next non-empty tier in the reversed list, and `recordServed` resets
+the counter regardless of which tier answered. So an unnecessary guard costs exactly one poll in
+a non-preferred order, once every `threshold` dequeues, and cannot latch. Latching is the failure
+that would matter: a guard stuck on would mean NORMAL permanently outranks HIGH, which is worse
+than the starvation it was added to prevent. There is a unit test named after precisely that.
+
+Observed in the acceptance run, both branches fired: once during A3 where LOW was empty and the
+guard fell through to NORMAL and reset, and once during A4 where it served LOW.
+
+**Multi-key `BRPOP` is the whole trick.** `BRPOP key1 key2 key3 timeout` blocks until any of the
+keys has an element and returns from the first non-empty key *in the order given*. That single
+primitive supplies strict priority, blocking semantics, and atomicity together:
+
+- Priority ordering is the argument order — no comparison, no scoring, no sorting.
+- It blocks, so dispatch latency stays near zero and there is no interval to tune. This is the
+  v0.1 `BRPOP`-over-polling argument surviving intact through a feature that looked like it would
+  need polling.
+- There is **no check-then-pop race**. The obvious implementation is "`LLEN` each tier, find the
+  best non-empty one, pop from it" — three round trips and a window in which another consumer (or
+  the same consumer next iteration) drains the tier that was non-empty a microsecond ago, so the
+  pop either blocks on an empty key or has to be retried. Redis evaluates all the keys itself,
+  atomically. The race does not need handling because it does not exist.
+
+The guard uses the same call with the key list reversed, which is why "serve the lowest
+**non-empty** tier" needs no depth query: `BRPOP low normal high` *is* that query, fused with the
+pop.
+
+**The exact binding, because the obvious one does not exist.** The brief suggested
+`redis.opsForList().rightPop(List.of(k1, k2, k3), timeout)`. That overload is not in Spring Data
+Redis 3.5.13 — `ListOperations` has `rightPop(K)`, `rightPop(K, long)`,
+`rightPop(K, long, TimeUnit)` and `rightPop(K, Duration)`, all single-key. Verified with `javap`
+against the resolved jar rather than assumed.
+
+The multi-key form lives one layer down, on the connection API:
+
+```java
+List<byte[]> popped = redis.execute((RedisCallback<List<byte[]>>) connection ->
+        connection.listCommands().bRPop(timeoutSeconds, keys));
+```
+
+`RedisListCommands.bRPop(int timeout, byte[]... keys)`. This is not a workaround or a degraded
+fallback — it is the same method `DefaultListOperations.rightPop(K, Duration)` delegates to, with
+more than one key. `ListOperations` is a serializer-aware convenience layer, and the only thing
+given up is that convenience: keys and the result are handled as raw UTF-8 bytes here. Nothing
+about blocking, atomicity or connection handling changes, and Lettuce still routes the blocking
+command to a dedicated connection exactly as it did in v0.3.
+
+Two details that matter. `BRPOP`'s timeout is **whole seconds**, and `0` means block forever —
+which would never release the loop to notice a shutdown — so the 2-second pop timeout is floored
+at 1 rather than allowed to round to 0. And `BRPOP` replies with a two-element array of `[key,
+value]`, not a bare value, which is what makes the tier knowable at all; `dequeue` returns a
+`Dequeued(UUID, Priority)` record rather than a `UUID` for that reason, because the guard cannot
+count what it cannot see.
+
+**The delayed set carries the tier in the member, not in a second lookup.** This was the most
+interesting problem in the version. The retry path parks a job in `distroq:jobs:delayed`, one
+sorted set with no tier of its own, and when the poller promotes it, it must know which of three
+lists to push to. Three options:
+
+*A database read per promoted job.* Correct and obvious, and it breaks the property v0.2 was
+built around. `promoteDueJobs` is a Lua script doing range + `ZREM` + `LPUSH` atomically, so no ID
+can be promoted twice. A DB lookup cannot happen inside a Lua script, so this means: range in
+Redis, read N rows from Postgres, then push — and the atomic unit is gone, replaced by exactly
+the three-round-trip sequence with two crash windows that the Lua script was written to
+eliminate. It also puts a Postgres query on a path that runs every second forever, at batch size
+up to 100.
+
+*A sorted set per tier.* Keeps atomicity, since each key would have its own fixed destination.
+Costs three `EVALSHA` calls per poll tick instead of one, forever, mostly finding nothing —
+tripling the idle cost already measured as this design's weakest point. And it splits "what is
+due next" across three keys, so any future question about the delayed set has to merge them
+client-side.
+
+*Encode the tier in the member.* Chosen. The member becomes `HIGH:<uuid>` instead of `<uuid>`,
+and the script parses the prefix and picks its destination from the key list it was handed. Range
++ `ZREM` + `LPUSH` stays in one atomic server-side operation, there is no extra read anywhere,
+and the tier keys are still passed in as `KEYS` rather than built inside Lua.
+
+**What it costs: denormalisation.** The tier now exists in two places — `jobs.priority` in
+Postgres and the member prefix in Redis — and nothing enforces that they agree. That is normally
+a bad trade, and the reason it is acceptable here is specific and load-bearing: **priority is
+immutable after submission**. A value that never changes after it is written cannot drift. Those
+two decisions hold each other up, and if a future version adds re-prioritisation it must revisit
+this one in the same change, because at that moment the Redis copy becomes capable of being
+stale. That is written down here precisely because the connection between them is not visible
+from either piece of code.
+
+A v0.3 leftover — a bare UUID with no prefix, from a job parked in the delayed set before the
+upgrade — is handled rather than dropped: no separator means no tier, which routes to the default
+tier. The same reading as everywhere else, that a job submitted before priority existed is a
+NORMAL job.
+
+**Job IDs left in the v0.3 pending key are drained on startup, not documented away.** The
+alternative offered was to require the queue be empty before upgrading. I rejected it: a job in
+that list is a committed row in Postgres reading `QUEUED`, and after the upgrade no worker would
+ever look at that key again, so it would sit there permanently — the exact invisible-forever
+shape described under *Known limitations*, except caused by the release process rather than a
+crash. Making that a line in the README puts the cost on whoever skips the line.
+
+`JobQueue.drainLegacyPendingKey` runs `RPOPLPUSH` from the old key onto the NORMAL tier until it
+returns nil. Each move is atomic, and FIFO order survives: `RPOPLPUSH` takes the *oldest* entry
+(the tail, which is where `BRPOP` reads) and pushes it to the head of the target, so draining N
+entries leaves the oldest nearest the tail. It runs in `@PostConstruct` rather than on
+`ApplicationReadyEvent` because `Worker` depends on this bean, so its own `@PostConstruct` cannot
+start the first `BRPOP` until the drain has returned — no interleaving to reason about. Failures
+are logged rather than thrown, because an unreachable Redis has never prevented this application
+from starting and quietly changing that would be a surprise unrelated to priority.
+
+Verified rather than assumed: v0.3 was run against the database, seven job IDs were left in
+`distroq:jobs:pending` by stopping the app mid-backlog, and v0.4 logged
+`Drained 7 job ID(s) left in the v0.3 key distroq:jobs:pending onto distroq:jobs:pending:normal`
+and then executed all seven.
 
 **Why the DLQ is a table plus a status, and not a status alone.** The status alone would have
 been strictly less code: add `DEAD_LETTERED`, change one line in `Worker`, filter
@@ -691,6 +960,73 @@ setting fixes all of them at once. It also exposes messages from *unhandled* exc
 is a genuine information leak on anything internet-facing. Accepted for a local
 unauthenticated development service and flagged in the README, rather than reached for
 silently.
+
+## Verified in v0.4
+
+**Both database paths converge again, V4 included.** V4 was applied to a database built by
+running v0.3 (21 jobs, schema at V3), then the volume was destroyed and v0.4 started against an
+empty one where V1–V4 all executed in order. `\d jobs` from the two databases diffs to **zero
+lines**, column order, the `'NORMAL'::character varying` default and index names included. Row
+count was 21 before the migration and 21 after, with all 21 rows reading `NORMAL` — the DB-level
+default backfilled them in one statement without a rewrite.
+
+**Adding a third enum-backed column cost zero constraint DDL, for the third time.** V4 is one
+`ALTER TABLE ... ADD COLUMN` and one `CREATE INDEX`. There is no CHECK on `priority`, which means
+adding a fourth tier later is a one-line enum edit and no migration at all. This is now the third
+consecutive version where the v0.2.1 decision has paid rather than cost, and the exposure it
+bought — nothing at the database level stops a bad value being written by something that is not
+this application — is unchanged and still accepted.
+
+**Strict priority was measured, not asserted.** With twelve `sleep`/800ms NORMAL jobs already
+queued, a HIGH job submitted 500ms *later* started 235ms after submission and finished while six
+NORMAL jobs were still `QUEUED`. Its `started_at` (`17:16:18.943`) precedes the `started_at` of
+eleven of the twelve NORMAL jobs created before it. The twelfth is the interesting one: it
+started at `17:16:18.109`, before the HIGH job was submitted at all. **There is no preemption** —
+priority decides what runs next, never what stops running — and that is visible in the data
+rather than only in the code.
+
+**The guard fires, and both of its branches were observed.** In A3 it tripped after ten NORMAL
+dequeues, polled `[LOW, NORMAL, HIGH]`, found LOW empty, was served by NORMAL and reset — the
+self-cancelling path. In A4 it tripped and served LOW. Under sustained load (25 HIGH, 3 LOW, LOW
+enqueued first) the LOW jobs ran at positions 11, 22 and 28 of 28: two of the three ran *before*
+the HIGH backlog was exhausted, at exactly the threshold spacing, and the third ran last only
+because HIGH had run out by then.
+
+**The tier survives retry and replay, proved at the Redis level rather than the DB level.** A
+`priority` field that still reads HIGH after a retry proves the database column was not
+overwritten; it does not prove the job was routed correctly, because a job pushed to `:normal`
+would execute and finish with `priority` still reading HIGH. `redis-cli MONITOR` was run across
+the retry window instead:
+
+```
+[0 172.18.0.1] "ZADD" "distroq:jobs:delayed" "1.788715215167E12" "HIGH:f3f86de1-..."
+[0 lua]       "ZREM"  "distroq:jobs:delayed" "HIGH:f3f86de1-..."
+[0 lua]       "LPUSH" "distroq:jobs:pending:high" "f3f86de1-..."
+```
+
+The `[0 lua]` marker is the promotion script's own calls, so this is the `ZREM`+`LPUSH` pair
+inside the atomic unit, landing on `:high`. The replay path was checked the same way and shows
+`LPUSH distroq:jobs:pending:low` for a dead-lettered LOW job. All three enqueue sites were
+confirmed against Redis, not against the API response.
+
+**The shutdown WARN is pre-existing, not a v0.4 regression.** A clean Ctrl+C on v0.4 produces one
+`WARN io.lettuce.core.RedisChannelHandler : Connection is already closed` from the worker thread
+— the blocked `BRPOP` being aborted — followed by `Worker ... shutting down` and a clean teardown.
+No ERROR, no stack frame, no `loop error, backing off`, so the v0.1 `ContextClosedEvent` fix is
+intact. Since v0.4 changed how the worker acquires its connection (connection-callback rather
+than `ListOperations`), the possibility that the WARN was newly introduced was worth eliminating
+rather than reasoning about: the v0.3 jar was built and given the identical treatment, and it
+emits the same line at the same point in the sequence. Pre-existing, third-party, harmless — but
+now known to be so.
+
+**Ctrl+C had to be sent as a real console event to test this at all.** `Stop-Process` and
+`taskkill` without `/F` do not produce a `CTRL_C_EVENT`, so neither exercises the shutdown hook —
+the first is a hard kill and the second is refused. Both produce a "clean" log by virtue of the
+process never getting to log anything, which is the kind of test that passes for the wrong
+reason. The shutdown evidence above came from `GenerateConsoleCtrlEvent` against the app's
+console from a helper process, and from letting Logback own the log file: with output piped
+through the shell, the shell dies on the same Ctrl+C and truncates the buffer before the
+interesting lines are flushed. Two ways to accidentally not test the thing being tested.
 
 ## Resolved issues
 

@@ -1,22 +1,82 @@
-# DistroQ v0.3
+# DistroQ v0.4
 
-A minimal, end-to-end distributed task queue with automatic retries, exponential backoff and a
-dead-letter queue with explicit replay.
+A minimal, end-to-end distributed task queue with priority scheduling, automatic retries,
+exponential backoff and a dead-letter queue with explicit replay.
 
-A job submitted over HTTP is persisted to PostgreSQL, its ID pushed onto a Redis list,
-picked up by an in-process background worker, executed, and its terminal status written
-back to PostgreSQL — observable via a GET endpoint. A job that fails is retried
-automatically, with an exponentially increasing delay. A job that exhausts its retries is
-**moved to a dead-letter queue** rather than merely marked failed, and can be replayed on
-demand with its failure history intact.
+A job submitted over HTTP is persisted to PostgreSQL, its ID pushed onto **the Redis list for its
+priority tier**, picked up by an in-process background worker, executed, and its terminal status
+written back to PostgreSQL — observable via a GET endpoint. A job that fails is retried
+automatically, with an exponentially increasing delay, **at its original priority**. A job that
+exhausts its retries is **moved to a dead-letter queue** rather than merely marked failed, and
+can be replayed on demand with its failure history and its priority intact.
 
 **PostgreSQL is the single source of truth.** Redis carries job ID strings only; the job
 itself is never serialized into Redis. The API and the worker run in the same Spring Boot
-process for v0.3 but are decoupled — the worker talks only to `JobQueue` and
+process for v0.4 but are decoupled — the worker talks only to `JobQueue` and
 `JobRepository`, and neither side references the other's package.
 
-The worker uses a blocking `BRPOP` (`rightPop` with a 2-second timeout) rather than a
-sleep-poll loop. Enqueue is `leftPush`, dequeue is `rightPop`, so ordering is FIFO.
+The worker uses a blocking multi-key `BRPOP` rather than a sleep-poll loop. Enqueue is
+`leftPush`, dequeue is `bRPop` across the tier lists, so ordering is FIFO within a tier.
+
+## Priority
+
+Every job has one of three tiers. `NORMAL` is the default, and a request that omits `priority`
+behaves exactly as it did in v0.3.
+
+| Tier | Meaning |
+| ---- | ------- |
+| `HIGH` | Runs ahead of everything else waiting. |
+| `NORMAL` | The default. |
+| `LOW` | Runs last, but is guaranteed not to wait forever — see the guard below. |
+
+Tiers are discrete rather than an integer score because a Redis list has no ordering primitive
+beyond insertion position: an arbitrary integer would need a sorted set (losing the blocking pop)
+or client-side scanning (losing atomicity). One list per tier keeps both. The consequence is that
+there is no "priority 47" and no ordering *within* a tier beyond arrival order. See `NOTES.md`.
+
+### Submitting with a priority
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' `
+  -Body '{"type":"sleep","payload":"800","priority":"HIGH"}'
+```
+
+Accepted case-insensitively (`high`, `HIGH`, `High`). Omitted, `null` or blank → `NORMAL`. Any
+other value is a **400** whose body names the valid options; no job is created.
+
+### Scheduling policy
+
+The worker issues one `BRPOP` across all three tier lists in strict order — `high`, `normal`,
+`low` — so Redis returns from the highest-priority non-empty list atomically, blocking until any
+of them has work. To stop a steady stream of higher-priority jobs starving the lowest tier, after
+`distroq.priority.starvation-threshold` consecutive dequeues served above `LOW` (default 10) one
+poll goes out with the key order **reversed**, which serves the lowest non-empty tier instead and
+resets the counter.
+
+This bounds starvation **in dequeue count, not in wall-clock time** — ten slow HIGH jobs still
+mean a long wait for a LOW one — and it is deliberately **not** a fairness guarantee. Priority is
+also **not preemptive**: it decides what runs next, never what stops running, so a job already
+executing always finishes first.
+
+Priority is **immutable after submission**. There is no re-prioritise endpoint, because the ID is
+already committed to a tier-specific list and moving it would be a non-atomic remove-then-push.
+Cancel and resubmit instead. `NOTES.md` explains why Redis Streams will not change this.
+
+### Redis keys
+
+Derived from the single `distroq.queue-key` base, not configured separately:
+
+```
+distroq:jobs:pending:high
+distroq:jobs:pending:normal
+distroq:jobs:pending:low
+distroq:jobs:delayed          # one sorted set for all tiers; members are "<TIER>:<uuid>"
+```
+
+**Upgrading from v0.3:** any job IDs still sitting in the old single `distroq:jobs:pending` key
+are drained onto `distroq:jobs:pending:normal` on startup, in FIFO order, and the count is logged
+at WARN. Nothing needs to be drained by hand and no queued work is stranded.
 
 ## How retries work
 
@@ -32,8 +92,11 @@ When `JobExecutor.execute` throws, the worker checks `job.hasAttemptsRemaining()
 
 `RetryScheduler` runs on a Spring `@Scheduled` fixed delay (1s by default). Each tick it
 calls `JobQueue.promoteDueJobs`, a Lua script that atomically ranges the sorted set for
-members due at or before now, removes them, and pushes them onto the pending list. The
-worker then picks them up through the same `BRPOP` path as any other job.
+members due at or before now, removes them, and pushes them onto **the pending list for the
+job's own tier**. The delayed set is a single key with no tier of its own, so each member carries
+its tier as a `HIGH:<uuid>` prefix — that keeps range + `ZREM` + `LPUSH` inside one atomic script
+where a per-job database lookup would not. The worker then picks them up through the same
+`BRPOP` path as any other job.
 
 Because the delay lives in Redis rather than in a `Thread.sleep` or a
 `ScheduledExecutorService`, a retry scheduled for 8 seconds from now still fires if the
@@ -64,6 +127,7 @@ repeat offenders.
 | --- | --- |
 | `attemptCount` | **Not reset.** A job that failed 3 times runs next as attempt 4. |
 | `maxAttempts` | **Extended**, not reset: `attemptCount + distroq.dlq.replay-attempts`. A job at 3/3 replayed with a budget of 3 becomes 3/6. |
+| `priority` | **Preserved.** A dead-lettered LOW job is re-enqueued to the low tier, not the default one. |
 | `job_attempts` rows | **Preserved.** New attempts append with increasing `attempt_number`. |
 | the `dead_letters` row | **Retained**, marked `replayed = true` with `replay_count` incremented. Never deleted. |
 
@@ -126,6 +190,7 @@ writes DDL.
 | `V1__initial_schema.sql` | `jobs` and `job_attempts` as `ddl-auto: update` left them at the end of v0.2. A single honest baseline, not a reconstruction — the per-version history is in git. |
 | `V2__add_query_indexes_and_drop_enum_check.sql` | Indexes for the three existing queries, and dropping the last Hibernate-generated enum CHECK. |
 | `V3__dead_letters.sql` | The `dead_letters` table with its two indexes, plus the foreign key `job_attempts` never had. Contains **no** DDL for `DEAD_LETTERED` — see below. |
+| `V4__job_priority.sql` | `jobs.priority` as `varchar(255) NOT NULL DEFAULT 'NORMAL'`, plus `idx_jobs_priority`. The DB-level default backfills every pre-v0.4 row, which is the correct reading of a job submitted before priority existed. |
 
 **Naming:** `V<n>__<snake_case_description>.sql`, two underscores before the description.
 Flyway applies them in version order and records each in `flyway_schema_history`.
@@ -165,6 +230,10 @@ v0.3 is where that pays off. Adding `DEAD_LETTERED` — byte-for-byte the change
 v0.2 — required **zero DDL**. V3 creates a table and adds a foreign key; it does not touch
 `jobs` at all.
 
+V4 adds a third enum-backed column, `priority`, and likewise gives it no CHECK constraint. Adding
+a fourth tier later is therefore a one-line change to the `Priority` enum with **no migration at
+all** — no `ALTER`, no coordinated deploy.
+
 ### The `job_attempts` foreign key
 
 `job_attempts` had no FK to `jobs`, because `JobAttempt` stores a raw `UUID jobId` rather than
@@ -195,7 +264,13 @@ distroq:
     promote-batch-size: 100      # max jobs promoted per sweep
   dlq:
     replay-attempts: 3           # replay budget: maxAttempts becomes attemptCount + this
+  priority:
+    starvation-threshold: 10     # dequeues served above LOW before one poll is reversed
 ```
+
+`starvation-threshold` is a **count of dequeues, not a duration**. See *Scheduling policy* above.
+The three tier keys are derived from `queue-key` rather than configured separately, so they
+cannot drift out of sync with the `Priority` enum.
 
 Also set, outside the `distroq` namespace:
 
@@ -278,16 +353,30 @@ since that is an ordinary failure, it is retried before it becomes terminally
 
 | Method | Path                     | Notes                                                          |
 | ------ | ------------------------ | -------------------------------------------------------------- |
-| POST   | `/api/jobs`              | Returns **202 Accepted** — the work is accepted, not completed. |
+| POST   | `/api/jobs`              | Returns **202 Accepted** — the work is accepted, not completed. `400` on an unknown `priority`. |
 | GET    | `/api/jobs/{id}`         | Includes the full `attempts` history. `404` if unknown.         |
-| GET    | `/api/jobs?status=`      | Optional `JobStatus` filter; 50 most recent, newest first. No attempts (avoids N+1). |
-| POST   | `/api/jobs/{id}/retry`   | Replay a dead-lettered job. **202**; `409` if not `DEAD_LETTERED`, `404` if unknown. |
-| GET    | `/api/dlq`               | 50 most recent dead-letters, newest `moved_at` first. Optional `?replayed=true\|false`. |
-| GET    | `/api/dlq/{jobId}`       | Single entry with the full attempt history. `404` if not dead-lettered. |
-| GET    | `/api/metrics`           | `queueDepth`, `delayedDepth`, `totalJobs`, `deadLetterCount`, `replayedCount`. |
+| GET    | `/api/jobs?status=&priority=` | Optional `JobStatus` and `Priority` filters, combinable; 50 most recent, newest first. Both are pushed into SQL, never filtered in memory. No attempts (avoids N+1). |
+| POST   | `/api/jobs/{id}/retry`   | Replay a dead-lettered job at its original priority. **202**; `409` if not `DEAD_LETTERED`, `404` if unknown. |
+| GET    | `/api/dlq`               | 50 most recent dead-letters, newest `moved_at` first. Optional `?replayed=true\|false`. Includes `priority`. |
+| GET    | `/api/dlq/{jobId}`       | Single entry with the full attempt history and `priority`. `404` if not dead-lettered. |
+| GET    | `/api/metrics`           | `queueDepth`, `queueDepthByPriority`, `delayedDepth`, `totalJobs`, `deadLetterCount`, `replayedCount`. |
 
 `deadLetterCount` counts rows with `replayed = false` (currently sitting in the DLQ);
 `replayedCount` counts rows with `replayed = true` (replayed and not since re-failed).
+
+`queueDepthByPriority` reports every tier, including empty ones. The flat `queueDepth` is retained
+and is now their **sum**, so anything already watching it keeps working:
+
+```json
+{
+  "queueDepth": 8,
+  "queueDepthByPriority": { "HIGH": 2, "NORMAL": 3, "LOW": 3 },
+  "delayedDepth": 0,
+  "totalJobs": 95,
+  "deadLetterCount": 2,
+  "replayedCount": 0
+}
+```
 
 `GET /api/dlq` joins to `jobs` for each entry's `type`, `status`, `attemptCount` and
 `maxAttempts` — a listing of bare IDs would tell an operator nothing. The join is one
@@ -296,19 +385,30 @@ since that is an ordinary failure, it is retried before it becomes terminally
 ### Submit body
 
 ```json
-{ "type": "fail_n_times", "payload": "2", "maxAttempts": 5 }
+{ "type": "fail_n_times", "payload": "2", "maxAttempts": 5, "priority": "HIGH" }
 ```
 
 `maxAttempts` is optional. Omitted or `null` → the configured default (3). Any value below
 1 is rejected with **400** and no job is created.
 
+`priority` is optional and case-insensitive. Omitted, `null` or blank → `NORMAL`. Anything that is
+not a tier name is rejected with **400** naming the valid values, and no job is created:
+
+```json
+{ "status": 400, "message": "priority must be one of HIGH, NORMAL, LOW (case-insensitive), got 'urgent'" }
+```
+
+It is bound as a `String` rather than the enum precisely so that this message is the one the
+caller sees, instead of Jackson's deserialization error about a type they have never heard of.
+
 ### Job detail response
 
-Adds `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`) and `attempts`:
+Adds `priority`, `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`) and `attempts`:
 
 ```json
 {
   "status": "SUCCEEDED",
+  "priority": "HIGH",
   "attemptCount": 3,
   "maxAttempts": 5,
   "nextAttemptAt": null,
@@ -387,6 +487,33 @@ $d = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
 Invoke-RestMethod -Uri http://localhost:8080/api/metrics
 
 # 11. Ctrl+C shuts down cleanly, no stack trace from the worker loop or the scheduler
+
+# 12. HIGH jumps a NORMAL backlog -> the HIGH job SUCCEEDS while NORMALs are still QUEUED
+1..12 | ForEach-Object {
+  Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+    -ContentType 'application/json' `
+    -Body '{"type":"sleep","payload":"800","priority":"NORMAL"}'
+} | Out-Null
+Start-Sleep -Milliseconds 500
+$hi = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' -Body '{"type":"sleep","payload":"100","priority":"HIGH"}'
+Start-Sleep -Seconds 4
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs/$($hi.id)" |
+  Select-Object status, priority, startedAt
+(Invoke-RestMethod -Uri "http://localhost:8080/api/jobs?priority=NORMAL&status=QUEUED").Count
+
+# 13. The guard fires -> a LOW job runs before a long HIGH backlog is exhausted.
+#     Watch for "Starvation guard fired ..." at INFO in the console.
+
+# 14. Priority survives a retry, verified against Redis rather than the API.
+#     While the job is RETRYING the delayed-set member carries its tier:
+docker exec distroq-redis redis-cli ZRANGE distroq:jobs:delayed 0 -1
+
+# 15. Per-tier depth, and the flat metric as their sum
+Invoke-RestMethod -Uri http://localhost:8080/api/metrics | ConvertTo-Json
+
+# 16. Nothing stranded in the pre-v0.4 key
+docker exec distroq-redis redis-cli LLEN distroq:jobs:pending
 ```
 
 `com.distroq` logs at `DEBUG`, so the QUEUED → RUNNING → RETRYING → SUCCEEDED/DEAD_LETTERED
