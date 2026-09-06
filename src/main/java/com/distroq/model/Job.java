@@ -28,6 +28,16 @@ public class Job {
     @Column(nullable = false)
     private JobStatus status;
 
+    /**
+     * Immutable after submission: there is no setter and no re-prioritise endpoint, because the
+     * ID is already committed to a tier-specific Redis list and moving it would be a non-atomic
+     * remove-then-push. See NOTES.md.
+     */
+    @Enumerated(EnumType.STRING)
+    @ColumnDefault("'NORMAL'")
+    @Column(nullable = false)
+    private Priority priority;
+
     private int attemptCount;
 
     // DB-level default so ddl-auto: update can add this NOT NULL column to existing v0.1 rows
@@ -48,13 +58,20 @@ public class Job {
         // for JPA
     }
 
+    /** Pre-v0.4 signature, retained so that submitting without a priority is provably unchanged. */
     public static Job create(String type, String payload, int maxAttempts) {
+        return create(type, payload, maxAttempts, null);
+    }
+
+    /** A null {@code priority} resolves to {@link Priority#DEFAULT}; absence is not an error. */
+    public static Job create(String type, String payload, int maxAttempts, Priority priority) {
         Instant now = Instant.now();
         Job job = new Job();
         job.id = UUID.randomUUID();
         job.type = type;
         job.payload = payload;
         job.status = JobStatus.QUEUED;
+        job.priority = Priority.orDefault(priority);
         job.attemptCount = 0;
         job.maxAttempts = maxAttempts;
         job.createdAt = now;
@@ -140,6 +157,10 @@ public class Job {
 
     public JobStatus getStatus() {
         return status;
+    }
+
+    public Priority getPriority() {
+        return priority;
     }
 
     public int getAttemptCount() {
