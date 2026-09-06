@@ -17,6 +17,14 @@ spring:
 
 distroq:
   queue-key: distroq:jobs:pending
+  delayed-key: distroq:jobs:delayed
+  retry:
+    default-max-attempts: 3
+    base-delay-ms: 1000
+    max-delay-ms: 60000
+    jitter-factor: 0.2
+    poll-interval-ms: 1000
+    promote-batch-size: 100
 
 logging:
   level:

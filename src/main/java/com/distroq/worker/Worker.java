@@ -1,7 +1,9 @@
 package com.distroq.worker;
 
 import com.distroq.model.Job;
+import com.distroq.model.JobAttempt;
 import com.distroq.queue.JobQueue;
+import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -12,6 +14,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -27,18 +30,25 @@ public class Worker {
 
     private final JobQueue jobQueue;
     private final JobRepository jobRepository;
+    private final JobAttemptRepository jobAttemptRepository;
     private final JobExecutor jobExecutor;
+    private final BackoffPolicy backoffPolicy;
 
-    // unused for now; later versions attribute jobs to the worker that ran them
     private final String workerId = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     private ExecutorService pool;
 
-    public Worker(JobQueue jobQueue, JobRepository jobRepository, JobExecutor jobExecutor) {
+    public Worker(JobQueue jobQueue,
+                  JobRepository jobRepository,
+                  JobAttemptRepository jobAttemptRepository,
+                  JobExecutor jobExecutor,
+                  BackoffPolicy backoffPolicy) {
         this.jobQueue = jobQueue;
         this.jobRepository = jobRepository;
+        this.jobAttemptRepository = jobAttemptRepository;
         this.jobExecutor = jobExecutor;
+        this.backoffPolicy = backoffPolicy;
     }
 
     @PostConstruct
@@ -84,17 +94,43 @@ public class Worker {
         Job job = found.get();
         job.markRunning();
         jobRepository.save(job);
-        log.info("Job {} ({}) RUNNING on {}", job.getId(), job.getType(), workerId);
+        int attemptNumber = job.getAttemptCount();
+        Instant startedAt = job.getStartedAt();
+        log.info("Job {} ({}) RUNNING on {}, attempt {} of {}",
+                job.getId(), job.getType(), workerId, attemptNumber, job.getMaxAttempts());
 
         try {
             jobExecutor.execute(job);
             job.markSucceeded();
-            log.info("Job {} SUCCEEDED", job.getId());
+            jobRepository.save(job);
+            jobAttemptRepository.save(JobAttempt.success(
+                    job.getId(), workerId, attemptNumber, startedAt, Instant.now()));
+            log.info("Job {} SUCCEEDED on attempt {}", job.getId(), attemptNumber);
         } catch (Exception e) {
-            job.markFailed(e.getMessage());
-            log.warn("Job {} FAILED: {}", job.getId(), e.getMessage());
+            String error = e.getMessage() == null ? e.toString() : e.getMessage();
+            jobAttemptRepository.save(JobAttempt.failure(
+                    job.getId(), workerId, attemptNumber, startedAt, Instant.now(), error));
+            handleFailure(job, attemptNumber, error);
         }
+    }
+
+    private void handleFailure(Job job, int attemptNumber, String error) {
+        if (!job.hasAttemptsRemaining()) {
+            job.markFailed(error);
+            jobRepository.save(job);
+            log.error("Job {} permanently FAILED after {} attempt(s): {}",
+                    job.getId(), attemptNumber, error);
+            return;
+        }
+
+        Duration delay = backoffPolicy.delayFor(job.getAttemptCount());
+        Instant dueAt = Instant.now().plus(delay);
+        job.markRetrying(error, dueAt);
+        // second instance of the dual write from JobController.submit - see NOTES.md
         jobRepository.save(job);
+        jobQueue.scheduleAt(job.getId(), dueAt);
+        log.warn("Job {} failed attempt {} of {} ({}), RETRYING in {}ms",
+                job.getId(), attemptNumber, job.getMaxAttempts(), error, delay.toMillis());
     }
 
     // fires before bean destruction closes the Redis connection, so a BRPOP

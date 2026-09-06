@@ -1,12 +1,18 @@
 package com.distroq.api.dto;
 
 import com.distroq.model.Job;
+import com.distroq.model.JobAttempt;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
-public record JobResponse(
+/**
+ * Single-job view. The list endpoint deliberately returns {@link JobResponse} instead, so
+ * listing 50 jobs does not fan out into 50 attempt queries.
+ */
+public record JobDetailResponse(
         UUID id,
         String type,
         String payload,
@@ -18,16 +24,17 @@ public record JobResponse(
         Instant startedAt,
         Instant finishedAt,
         Instant nextAttemptAt,
-        Long durationMs) {
+        Long durationMs,
+        List<AttemptResponse> attempts) {
 
-    public static JobResponse from(Job job) {
+    public static JobDetailResponse from(Job job, List<JobAttempt> attempts) {
         Instant startedAt = job.getStartedAt();
         Instant finishedAt = job.getFinishedAt();
         Long durationMs = (startedAt == null || finishedAt == null)
                 ? null
                 : Duration.between(startedAt, finishedAt).toMillis();
 
-        return new JobResponse(
+        return new JobDetailResponse(
                 job.getId(),
                 job.getType(),
                 job.getPayload(),
@@ -39,6 +46,7 @@ public record JobResponse(
                 startedAt,
                 finishedAt,
                 job.getNextAttemptAt(),
-                durationMs);
+                durationMs,
+                attempts.stream().map(AttemptResponse::from).toList());
     }
 }
