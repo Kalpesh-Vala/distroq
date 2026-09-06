@@ -22,7 +22,8 @@ class BackoffPolicyTest {
         return new BackoffPolicy(new DistroqProperties(
                 "distroq:jobs:pending",
                 "distroq:jobs:delayed",
-                new DistroqProperties.Retry(3, BASE_MS, MAX_MS, jitterFactor, 1000L, 100)));
+                new DistroqProperties.Retry(3, BASE_MS, MAX_MS, jitterFactor, 1000L, 100),
+                new DistroqProperties.Dlq(3)));
     }
 
     @Test
@@ -63,7 +64,8 @@ class BackoffPolicyTest {
     @Test
     void neverReturnsZeroOrNegative() {
         BackoffPolicy tiny = new BackoffPolicy(new DistroqProperties(
-                "q", "d", new DistroqProperties.Retry(3, 1L, 5L, 0.99, 1000L, 100)));
+                "q", "d", new DistroqProperties.Retry(3, 1L, 5L, 0.99, 1000L, 100),
+                new DistroqProperties.Dlq(3)));
 
         for (int attempt = 0; attempt < 50; attempt++) {
             assertThat(tiny.delayFor(attempt)).isPositive();
