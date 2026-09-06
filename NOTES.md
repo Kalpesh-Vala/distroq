@@ -296,12 +296,92 @@ is ready. What has actually happened is that the work has been accepted for late
 that, and it sets the right expectation for a client that might otherwise assume the job is
 done because it got a success code and an ID back.
 
-**`ddl-auto: update` for schema management.** This is wrong for production and right for now.
-The schema is changing more or less daily — v0.2 adds retry and backoff columns, v0.5 changes
-how in-flight work is tracked — and hand-writing a migration for each churn would be effort
-spent on a shape that is not settled. The plan *was* to switch to Flyway around v0.5, once the
-schema stopped moving every few days. v0.2 proved that plan wrong by breaking under it; see
-*What v0.2 changed about the plan*. Flyway now lands at v0.2.1.
+**`ddl-auto: update` for schema management — removed in v0.2.1.** It was wrong for production
+and defensible while the schema changed daily, and the plan *was* to switch to Flyway around
+v0.5 once things settled. v0.2 proved that plan wrong by breaking under it; see *What v0.2
+changed about the plan*. The entries below record what replaced it.
+
+**Flyway moved from v0.5 to v0.2.1 because the failure mode was worse than "incomplete".**
+The full write-up of the `jobs_status_check` bug is under *Resolved issues* and I am not
+restating it. What made it a scheduling decision rather than a bug fix is the shape: the
+tool did *part* of a migration, declined the rest, logged nothing at startup, and deferred
+the failure to a runtime write path that only executes when something has already gone
+wrong. "Incomplete" I had accepted knowingly. "Silently and misleadingly incomplete" is a
+different property, and it is not one that gets better by waiting.
+
+The decisive argument was that v0.3 adds `DEAD_LETTERED` to the same enum, which is
+byte-for-byte the same trap: `ddl-auto: update` would decline to widen the constraint, every
+dead-letter write would be rejected at commit, and the symptom would again point at the
+application rather than the schema. Postponing to v0.5 meant walking into a known failure
+twice with the fix already written down in this file. Fixing the mechanism before the next
+enum change is the cheapest ordering available.
+
+**V1 is a single baseline, not reconstructed per-version migrations.** I could have written
+V1 as the v0.1 schema and V2 as the v0.2 additions, and it would have looked like a tidier
+history. It would have been fiction. Those migrations were never executed in that form —
+the real v0.1 → v0.2 transition was Hibernate emitting `alter table` at startup plus a
+hand-run `ALTER TABLE ... DROP CONSTRAINT`, and no reconstruction reproduces that faithfully.
+Worse, fabricated migrations get *tested* on fresh databases only: nobody ever runs V1-then-V2
+against a real v0.1 database, so the reconstruction can be wrong indefinitely without anyone
+noticing. The version history that matters is in git, where it is accurate. V1 is one honest
+statement of "this is the schema as it actually exists", taken from `pg_dump` rather than
+written from memory.
+
+**Anything that must reach existing databases has to live above the baseline.** This is the
+non-obvious consequence of `baseline-on-migrate` and it changed how I split the work.
+Baselining records V1 as applied *without running it*, so a change placed only in V1 reaches
+new databases and never reaches the existing one — which is precisely the divergence
+migrations exist to prevent, reintroduced by the mechanism meant to fix it. The three query
+indexes and the drop of the leftover `job_attempts_outcome_check` therefore went into V2, not
+V1. V1 reproduces the dump exactly; V2 does the new work and runs on both paths. Verified by
+diffing `\d jobs` and `\d job_attempts` between the baselined database and a from-scratch one
+— identical, including index names.
+
+**Why both paths had to be tested separately.** A baseline that works on the developer's
+existing database and produces a broken fresh one is invisible until somebody clones the
+repo, and it is invisible *to the person who wrote it* because their database is the one that
+works. So the fresh path is not a nice-to-have check, it is the one that is actually likely
+to be wrong. Both were run: on the existing database Flyway logged `Successfully baselined
+schema with version: 1` and then applied only V2, with row counts unchanged at 32 jobs and 49
+attempts; on an empty one it logged `All configured schemas are empty; baseline operation
+skipped` and executed V1 and V2 in order.
+
+**No CHECK constraint on `status`, deliberately.** The application enum is the source of
+truth. A DB-level CHECK over an enum that gains a value most versions is a migration burden
+that has already produced one silent failure, and it buys very little here: the only writer
+is the application. What it gives up is real and worth stating plainly — nothing at the
+database level now prevents a bad status being written by a `psql` session, a future second
+service, or a bad manual data fix. I am accepting that in exchange for the enum being
+changeable without a coordinated DDL step. The same reasoning retired
+`job_attempts_outcome_check` in V2 rather than leaving one enum guarded and the other not.
+
+**What `ddl-auto: validate` actually buys, verified rather than assumed.** It converts silent
+schema drift into a startup failure. The v0.2 constraint bug was possible precisely because
+nothing compared the entities to the schema — the mismatch existed from the moment `RETRYING`
+was added and was only discovered by a job failing at runtime, hours later, with a symptom
+that pointed somewhere else entirely.
+
+Configuring a safety net and never testing that it catches anything is its own failure mode,
+so I checked it: adding a `scratchColumn` field to `Job` with no corresponding column makes
+startup fail with
+
+```
+SchemaManagementException: Schema-validation: missing column [scratch_column] in table [jobs]
+```
+
+which names the exact column and never reaches the point of serving traffic. That is the
+property I actually wanted from this version — not "Flyway is installed" but "a schema
+mismatch cannot survive a restart".
+
+Two limits worth knowing. First, `validate` checks tables, columns and types; it does not
+check indexes, defaults, or CHECK constraints, so it would *not* have caught the original
+`jobs_status_check` bug directly — what fixes that is no longer generating the constraint.
+Second, Flyway's checksum enforcement does not cover a baselined migration: on the existing
+database V1 is recorded as `type=BASELINE` with a null checksum, and I confirmed that editing
+V1 there changes nothing and the app starts happily. On a fresh database V1 is a real `SQL`
+row with checksum `1050819957` and the same edit is rejected. So the immutability guarantee
+applies to migrations Flyway actually executed, which is every migration from V2 onward on
+every database, but not to the baseline itself on databases that predate it.
 
 ## Measured costs
 
@@ -478,15 +558,20 @@ correctly was sitting right there in the API response. That made "the retry bran
 executed" the obvious first theory, and it was wrong — the branch executed perfectly and its
 result was discarded at commit.
 
-*Fix.* Drop the stale constraint once, documented in the README as the v0.1 → v0.2 upgrade
-step:
+*Fix.* Drop the stale constraint once. In v0.2 this was a manual step documented in the README
+as the v0.1 → v0.2 upgrade:
 
 ```sql
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ```
 
-`update` mode does not recreate check constraints on an existing table, so it stays dropped.
-A fresh database is unaffected — Hibernate creates the constraint with all five statuses.
+`update` mode does not recreate check constraints on an existing table, so it stayed dropped.
+A fresh v0.2 database was unaffected — Hibernate created the constraint with all five statuses.
+
+v0.2.1 removed the manual step entirely: the constraint is simply not part of the Flyway
+baseline, so no database has it and none regains it. That a schema fix had to be applied by
+hand — leaving the live database and a freshly created one provably different — is what
+motivated moving Flyway forward a version.
 
 *What I tried that did not work.* I first assumed `@Column(columnDefinition = "varchar(32)")`
 would suppress the generated constraint, on the theory that an explicit column definition
