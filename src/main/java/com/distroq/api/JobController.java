@@ -6,6 +6,7 @@ import com.distroq.api.dto.SubmitJobRequest;
 import com.distroq.config.DistroqProperties;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
+import com.distroq.model.Priority;
 import com.distroq.queue.JobQueue;
 import com.distroq.repository.DeadLetterRepository;
 import com.distroq.repository.JobAttemptRepository;
@@ -23,6 +24,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -56,9 +58,12 @@ public class JobController {
     @PostMapping("/jobs")
     public ResponseEntity<JobResponse> submit(@RequestBody SubmitJobRequest request) {
         int maxAttempts = resolveMaxAttempts(request.maxAttempts());
-        Job job = jobRepository.save(Job.create(request.type(), request.payload(), maxAttempts));
-        jobQueue.enqueue(job.getId());
-        log.info("Job {} ({}) QUEUED with maxAttempts {}", job.getId(), job.getType(), maxAttempts);
+        Priority priority = resolvePriority(request.priority());
+        Job job = jobRepository.save(
+                Job.create(request.type(), request.payload(), maxAttempts, priority));
+        jobQueue.enqueue(job.getId(), job.getPriority());
+        log.info("Job {} ({}) QUEUED at {} with maxAttempts {}",
+                job.getId(), job.getType(), job.getPriority(), maxAttempts);
         return ResponseEntity.accepted().body(JobResponse.from(job));
     }
 
@@ -73,6 +78,14 @@ public class JobController {
         return requested;
     }
 
+    /** Absent or blank is not an error and resolves to the default; an unknown value is a 400. */
+    private Priority resolvePriority(String requested) {
+        return Priority.parse(requested)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "priority must be one of " + Priority.validValues()
+                                + " (case-insensitive), got '" + requested + "'"));
+    }
+
     @GetMapping("/jobs/{id}")
     public ResponseEntity<JobDetailResponse> get(@PathVariable UUID id) {
         return jobRepository.findById(id)
@@ -83,10 +96,20 @@ public class JobController {
     }
 
     @GetMapping("/jobs")
-    public List<JobResponse> list(@RequestParam(required = false) JobStatus status) {
-        List<Job> jobs = (status == null)
-                ? jobRepository.findTop50ByOrderByCreatedAtDesc()
-                : jobRepository.findTop50ByStatusOrderByCreatedAtDesc(status);
+    public List<JobResponse> list(@RequestParam(required = false) JobStatus status,
+                                  @RequestParam(required = false) Priority priority) {
+        // every combination is a distinct query rather than a filtered-in-memory page: trimming a
+        // 50-row page after the fact would silently return fewer than the 50 matches that exist
+        List<Job> jobs;
+        if (status == null && priority == null) {
+            jobs = jobRepository.findTop50ByOrderByCreatedAtDesc();
+        } else if (priority == null) {
+            jobs = jobRepository.findTop50ByStatusOrderByCreatedAtDesc(status);
+        } else if (status == null) {
+            jobs = jobRepository.findTop50ByPriorityOrderByCreatedAtDesc(priority);
+        } else {
+            jobs = jobRepository.findTop50ByStatusAndPriorityOrderByCreatedAtDesc(status, priority);
+        }
         return jobs.stream().map(JobResponse::from).toList();
     }
 
@@ -116,20 +139,27 @@ public class JobController {
         });
 
         // straight onto the pending list: replay is an explicit human action, so making the
-        // operator wait out a backoff window they did not ask for would be surprising
-        jobQueue.enqueue(job.getId());
-        log.info("Job {} replayed from the DLQ, attemptCount {} preserved, maxAttempts {} -> {}",
-                job.getId(), job.getAttemptCount(), previousMaxAttempts, job.getMaxAttempts());
+        // operator wait out a backoff window they did not ask for would be surprising.
+        // The job's own tier, not the default - a LOW job replayed as NORMAL would jump ahead of
+        // work it was deliberately ranked behind, and a HIGH one would silently lose its rank.
+        jobQueue.enqueue(job.getId(), job.getPriority());
+        log.info("Job {} ({}) replayed from the DLQ, attemptCount {} preserved, maxAttempts {} -> {}",
+                job.getId(), job.getPriority(), job.getAttemptCount(), previousMaxAttempts,
+                job.getMaxAttempts());
         return ResponseEntity.accepted().body(JobResponse.from(job));
     }
 
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
-        return Map.of(
-                "queueDepth", jobQueue.depth(),
-                "delayedDepth", jobQueue.delayedDepth(),
-                "totalJobs", jobRepository.count(),
-                "deadLetterCount", deadLetterRepository.countByReplayed(false),
-                "replayedCount", deadLetterRepository.countByReplayed(true));
+        // LinkedHashMap rather than Map.of: the key order is stable in the response, and there is
+        // now one entry past Map.of's ten-pair overload set
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("queueDepth", jobQueue.depth());
+        metrics.put("queueDepthByPriority", jobQueue.depthByPriority());
+        metrics.put("delayedDepth", jobQueue.delayedDepth());
+        metrics.put("totalJobs", jobRepository.count());
+        metrics.put("deadLetterCount", deadLetterRepository.countByReplayed(false));
+        metrics.put("replayedCount", deadLetterRepository.countByReplayed(true));
+        return metrics;
     }
 }
