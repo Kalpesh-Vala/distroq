@@ -66,33 +66,55 @@ Data lives in the named volume `distroq-pgdata`, so completed jobs survive resta
 .\mvnw.cmd spring-boot:run
 ```
 
-Hibernate creates the `jobs` and `job_attempts` tables on first boot (`ddl-auto: update`).
+Flyway creates the `jobs` and `job_attempts` tables on first boot. No manual SQL, and no
+`docker compose down -v`, is needed on any path — including upgrading a database that
+predates Flyway.
 
-### Upgrading from v0.1
+## Database migrations
 
-Two schema changes, only one of which `ddl-auto: update` can perform on its own.
+The schema is defined by versioned SQL in `src/main/resources/db/migration`, and Hibernate
+runs with `ddl-auto: validate` — it checks that the entities match the schema at startup and
+**fails fast** if they do not, but it never modifies anything. Flyway is the only thing that
+writes DDL.
 
-**`maxAttempts` — handled automatically.** It is a new `NOT NULL` column on a populated
-table, so it carries `@ColumnDefault("3")`. Hibernate emits
-`alter table jobs add column max_attempts integer default 3 not null` and Postgres
-backfills existing rows with 3. The DB default was chosen over documenting
-`docker compose down -v` because losing job history to a schema change is exactly the kind
-of thing a job queue should not do, and 3 is a defensible retry budget to impute to rows
-submitted before the concept existed.
+| Migration | Contents |
+| --------- | -------- |
+| `V1__initial_schema.sql` | `jobs` and `job_attempts` as `ddl-auto: update` left them at the end of v0.2. A single honest baseline, not a reconstruction — the per-version history is in git. |
+| `V2__add_query_indexes_and_drop_enum_check.sql` | Indexes for the three existing queries, and dropping the last Hibernate-generated enum CHECK. |
 
-**`RETRYING` — needs one manual statement.** v0.1 created a `CHECK` constraint pinning
-`status` to the four statuses that existed at the time. `ddl-auto: update` adds columns; it
-never widens an existing check constraint. Without this step the first retry fails with
-`new row for relation "jobs" violates check constraint "jobs_status_check"`:
+**Naming:** `V<n>__<snake_case_description>.sql`, two underscores before the description.
+Flyway applies them in version order and records each in `flyway_schema_history`.
 
-```powershell
-docker exec distroq-postgres psql -U distroq -d distroq `
-  -c "ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;"
-```
+**Applied migrations are immutable.** Flyway stores a checksum of each file it ran and
+refuses to start if the file changes afterwards. To alter the schema, add a new migration —
+never edit an existing one. This is enforced, not a convention: editing `V2` after it has
+run produces `Migration checksum mismatch for migration version 2` and the app will not boot.
 
-A fresh database is unaffected — Hibernate creates the constraint with all five statuses.
-Wiping the volume (`docker compose down -v`) also works if you do not care about the
-existing rows.
+**Adding one for a future version:**
+
+1. Create `V3__whatever_you_are_doing.sql`.
+2. Change the entities to match.
+3. Start the app. Flyway applies V3, then Hibernate validates the entities against the
+   result. A mismatch either way is a startup failure with the offending column named.
+
+### Existing databases (created before Flyway)
+
+Handled automatically by `baseline-on-migrate`. A database that already has the tables but
+no `flyway_schema_history` is recorded as being at V1 rather than having V1 run against it,
+so `CREATE TABLE` never executes over live data. Migrations above the baseline — V2 onward —
+then apply normally.
+
+This is why anything that must reach *both* new and existing databases has to live above the
+baseline version: V1 is skipped entirely on a pre-existing database, so a change placed only
+in V1 would silently never reach it.
+
+### Why there is no CHECK constraint on `status`
+
+v0.1's Hibernate-generated `jobs_status_check` pinned `status` to the four statuses that
+existed at the time, and `ddl-auto: update` never widened it when `RETRYING` was added, so
+every retry write was rejected at commit time. It is deliberately not recreated: the
+application enum is the source of truth. The trade-off is that nothing at the database level
+stops a bad status being written by something that is not this application. See `NOTES.md`.
 
 ## Build
 
