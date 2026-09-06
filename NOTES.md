@@ -924,6 +924,81 @@ remains a narrow window on a single-process deployment. The difference is that t
 bug actually fired and the dual write still has not. Roadmaps should move on evidence, and
 "this broke" is evidence in a way that "this could break" is not.
 
+## What v0.4 changed about the plan
+
+v0.4 did not move the roadmap. It did sharpen what v0.5 is for, and it added one item to v0.5's
+scope that was not there before. The six things below are the carry-forward list; most are
+written up in full elsewhere in this file and are collected here so the Streams work has one
+place to start from.
+
+**1. `BRPOP` is genuinely good at blocking priority dispatch — the routing is what has to go.**
+This is the finding I did not expect. Multi-key `BRPOP` gives strict priority, blocking
+semantics and atomicity in one call, with no polling and no check-then-pop race. As a *dispatch*
+primitive it is not the weak part of this design and Streams will have to work to match it —
+`XREADGROUP` reads one stream per call, so multi-stream priority means either N calls (losing the
+single atomic decision) or an ordering compromise. What is weak is that priority is committed at
+**enqueue** time: the ID is in one specific list the moment `submit` returns, and every
+consequence below follows from that one property rather than from the list itself. v0.5 should
+be explicit that it is replacing lists for *acknowledgement*, not for *dispatch quality*, and
+should measure whether its priority dispatch regresses rather than assuming Streams strictly
+dominates.
+
+**2. The tier is now denormalised into Redis, and something has to own that.** Delayed-set
+members are `HIGH:<uuid>`, so the promotion script knows the destination without a database read.
+The value is duplicated between `jobs.priority` and the Redis member, and nothing enforces
+agreement. It is safe today only because priority is immutable — a value that never changes
+cannot drift. v0.5 inherits this: if tiers become separate streams, the same encoding decision
+recurs at `XADD`, and if v0.5 introduces any path that rewrites a queued entry, the duplication
+becomes a live consistency problem rather than a dormant one.
+
+**3. Re-prioritisation is unsafe by construction and Streams does not fix it.** `LREM` +
+`LPUSH` is not atomic and a crash between them loses the job outright — worse than the dual
+write, because both writes are to Redis and there is no database row to reconcile against.
+`LMOVE` is atomic but moves the tail, not a nominated member. Under Streams the entry is still
+committed to a specific stream at `XADD`, and moving it is `XDEL` plus re-add, which leaves a
+tombstone, changes the entry ID, and invalidates any PEL reference to it. So this is **not** a
+v0.5 deliverable and should not be written into the v0.5 brief as one. It needs a design where
+routing is not committed at write time at all, which means a consumer-ordered structure, which
+costs the blocking read. Full argument under *Known limitations* §2.
+
+**4. The starvation counter is per-worker and silently stops meaning anything at v0.7.** With
+one worker, "atomic" and "global" are the same thing, which is exactly why this will be easy to
+miss. With N workers the aggregate rate happens to come out right but the *correlation* is
+wrong: all N can trip simultaneously and poll reversed at once, turning "one in ten" into "N in a
+row, then 10N of nothing". A shared bean does not fix it either, because the poll that trips the
+guard and the poll that consumes it need not be the same thread. A real fix puts the counter in
+Redis at the cost of a round trip per dequeue. Full argument under *Known limitations* §3.
+
+**5. Three dual-write sites, still unfixed, and now three versions old.** v0.4 added no fourth
+site — submit, retry scheduling and replay are the same three — and made each one field wider by
+passing a tier. That is not progress and the diff should not be allowed to imply otherwise:
+routing a stranded write to the correct list does not make it less stranded. The prediction in
+the v0.2 note was that the third occurrence would be the argument for the outbox. It was, and it
+still has not been acted on. What has changed since is only detectability, which has got
+monotonically worse each version.
+
+**6. Retry promotion and DLQ replay both hand work off with no acknowledgement — new to this
+list.** The orphaned-`RUNNING` write-up under §5 frames the problem as a *dispatch* one: `BRPOP`
+is a destructive read, so a worker that dies mid-job leaves a row that nothing can detect. What
+v0.4 makes visible is that the same gap exists on the two paths that put work *back* into the
+queue. `promoteDueJobs` does `ZREM` then `LPUSH` atomically and is finished with the job the
+instant the script returns — there is no record that the promotion was ever consumed, so a
+worker that dies between the `LPUSH` and the `markRunning` commit loses the retry with no trace,
+and it looks identical to a retry that simply has not come up yet. Replay is worse in the same
+way it was worse in v0.3: the DLQ row already reads `replayed = true`, so the job has left the
+one view built to make failures visible.
+
+Streams close this properly rather than incidentally, and that is the point worth carrying: the
+PEL is a record of "handed out and not confirmed" that applies to *every* entry regardless of how
+it got into the stream, so promotion and replay stop being special cases that each need their own
+reconciliation story. Three delivery paths converge on one recovery mechanism. That is a better
+argument for v0.5 than the orphaned-`RUNNING` case alone, which is the one the roadmap has been
+carrying since v0.1.
+
+The honest counterweight, unchanged: this buys **at-least-once**, not exactly-once. A reclaimed
+retry may have already partially executed. Idempotency keys at v0.7 are what make that safe, and
+nothing in v0.5 should be described as if redelivery were free.
+
 ## Verified in v0.3
 
 **Both database paths converge, checked rather than assumed.** The failure mode v0.2.1 was
