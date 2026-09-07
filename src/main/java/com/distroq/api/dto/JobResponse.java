@@ -19,6 +19,8 @@ public record JobResponse(
         Instant startedAt,
         Instant finishedAt,
         Instant nextAttemptAt,
+        /** The execution time originally requested, or null. Survives retries, the DLQ and replay. */
+        Instant scheduledAt,
         Long durationMs) {
 
     public static JobResponse from(Job job) {
@@ -41,6 +43,7 @@ public record JobResponse(
                 startedAt,
                 finishedAt,
                 job.getNextAttemptAt(),
+                job.getScheduledAt(),
                 durationMs);
     }
 }

@@ -21,7 +21,9 @@ public record DeadLetterResponse(
         Instant movedAt,
         boolean replayed,
         Instant replayedAt,
-        int replayCount) {
+        int replayCount,
+        /** The execution time originally requested, if this job was scheduled rather than immediate. */
+        Instant scheduledAt) {
 
     public static DeadLetterResponse from(DeadLetter deadLetter, Job job) {
         return new DeadLetterResponse(
@@ -35,6 +37,7 @@ public record DeadLetterResponse(
                 deadLetter.getMovedAt(),
                 deadLetter.isReplayed(),
                 deadLetter.getReplayedAt(),
-                deadLetter.getReplayCount());
+                deadLetter.getReplayCount(),
+                job == null ? null : job.getScheduledAt());
     }
 }
