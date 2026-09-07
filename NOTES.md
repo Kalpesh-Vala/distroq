@@ -1304,6 +1304,125 @@ those. It is the one liveness question that *can* be answered locally, and answe
 set lookup. Across processes the question remains unanswerable, which is what §3 says about idle
 time not being death.
 
+## Planned for v0.5.1 — reliability
+
+Five things v0.5 either left untouched or newly exposed. None is a v0.6 feature; all of them are
+about making what already exists trustworthy, which is why they belong in a point release rather
+than being folded into scheduled jobs. Nothing here has been implemented — this is the shape of
+the work and the decisions that have to be made first.
+
+### 1. Reconciliation for the three dual writes
+
+Unchanged since v0.1, v0.2 and v0.3 respectively: submit, retry scheduling and DLQ replay each
+commit to PostgreSQL and then write to Redis, and a crash between the two strands the job. Streams
+did not touch this — every one of those windows is the gap *before* an entry reaches a stream, and
+the Pending Entries List cannot recover a message that was never written.
+
+What v0.5 did change is that a home for the fix now exists. `PendingEntryRecovery` already runs a
+periodic sweep that reconciles Redis state against PostgreSQL for one class of problem, so a
+second sweep over stale rows is an addition rather than a new subsystem.
+
+The shape: find `QUEUED` rows older than some threshold with no corresponding stream entry, and
+`RETRYING` rows whose `nextAttemptAt` is comfortably past with no delayed-set member, and
+re-enqueue them. Two questions to settle before writing any of it:
+
+- **How is "no corresponding stream entry" answered cheaply?** Scanning three streams per sweep
+  does not scale, and a job ID is not indexed by Redis. The likely answer is that reconciliation
+  does not check Redis at all — it re-enqueues on age alone and accepts producing a duplicate,
+  because a duplicate is something the redelivery rules already handle and a stranded job is not.
+  That is the same trade the legacy migration made, and it should be made explicitly rather than
+  discovered.
+- **Is an outbox the better answer?** A transactional outbox removes the window instead of
+  cleaning up after it, at the cost of a table, a relay, and its own ordering questions.
+  Reconciliation is cheaper to build and leaves the window open. This is the decision, and it has
+  been deferred three versions running.
+
+### 2. Safe stream retention
+
+v0.5 never trims, because a trimmed entry that is still pending cannot be inspected or reclaimed.
+`XLEN` therefore rises forever on a perfectly healthy system, which is a memory leak with a slow
+fuse.
+
+The safe bound is the **minimum pending entry ID across all consumers in the group** — everything
+strictly older than that has been acknowledged by everybody and can go. `XTRIM MINID` takes
+exactly that argument. The work is computing it correctly and conservatively:
+
+- `XPENDING <stream> <group>` gives the group's minimum pending ID, but only for one group. With a
+  single group this is the whole answer; it stops being so the moment a second group is added.
+- A margin behind that ID is worth keeping deliberately, so `XRANGE` during an incident still
+  shows recently completed work rather than a stream that ends at "now".
+- When nothing is pending at all, the minimum is undefined and the naive reading is "trim
+  everything". Getting that case wrong destroys the history on an idle system, which is precisely
+  when nobody is watching.
+
+Open question: should trimming run on a schedule, or on a threshold, or only on an explicit
+operator action? A background trim that is subtly wrong is worse than manual pruning.
+
+### 3. Heartbeats or lease extension
+
+The reclaim rule is time-based and therefore blind: Redis knows when an entry was last delivered,
+not whether the process holding it is alive. §3 and §11 of the v0.5 notes cover the consequences.
+
+Two candidate mechanisms:
+
+- **Lease extension.** A worker executing a long job periodically re-claims its own entry
+  (`XCLAIM` with a zero minimum idle time, or a no-op `XAUTOCLAIM` against itself) to reset the
+  idle clock. Cheap, no new state, and it fails in the right direction — a dead worker stops
+  extending and the entry ages out normally. The catch is that a *hung* worker may keep extending
+  forever, so the lease has to be renewed from the same thread that is doing the work, not from a
+  timer that survives it.
+- **Heartbeats in PostgreSQL.** A `last_seen` column on the in-progress attempt row, written
+  periodically. More expressive — it makes "which workers are alive" a query — but it is another
+  write on the hot path and another thing that can disagree with Redis.
+
+Lease extension looks correct and small; heartbeats look useful for the dashboard. They are not
+mutually exclusive, and the decision is whether the dashboard's need justifies the second one.
+
+### 4. Configuration for legitimately long jobs
+
+Today `claim-min-idle-ms` is one global number that has to exceed the longest job in the system.
+That forces the whole deployment to tolerate the worst case: a fleet where one job type takes ten
+minutes cannot detect a dead worker in under ten minutes.
+
+Options, in increasing order of cost:
+
+- **Per-tier thresholds.** Cheap, since the streams are already separate — but priority is not a
+  proxy for duration, so this solves the wrong axis.
+- **Per-job-type thresholds.** Correct axis, but the reclaim sweep works from stream entries and
+  would need the job type in the entry to apply it. That is a fifth field, and it is the first
+  piece of *job data* to be duplicated into Redis rather than routing metadata. Worth doing
+  deliberately or not at all.
+- **Lease extension (item 3) instead.** If a running worker keeps its own entry fresh, the global
+  threshold only has to exceed the *heartbeat interval*, not the job duration — which removes the
+  need for this configuration almost entirely.
+
+That last point is the important one: item 3 may make item 4 unnecessary, and item 4 should not be
+built first.
+
+### 5. What the dashboard should show (v0.8 input, decided here)
+
+v0.5 produced three counts that are easy to conflate, and a dashboard is exactly where conflating
+them causes a bad decision at 3am. The position taken in the metrics endpoint should carry through
+to the UI:
+
+- **Stream lag** — "work waiting". This is the number that belongs on a queue-depth chart, and the
+  only one of the three that should ever drive an alert on backlog.
+- **Pending entries** — "handed out, not confirmed". A steady small number is healthy. A number
+  that does not fall when the queue drains is the signal that something died, and it deserves its
+  own panel rather than being summed into anything.
+- **Abandoned attempts** — a PostgreSQL count, not a Redis one, and a *rate* rather than a level.
+  It answers "how often is work being reclaimed", which is the closest thing the system has to a
+  worker-mortality metric.
+
+`XLEN` should appear on the dashboard only as diagnostic detail, clearly labelled as total entries
+ever written, or not at all. Presenting it next to lag under a shared heading is how it gets read
+as a backlog.
+
+One thing that does not exist yet and probably should: **duplicate executions**, counted where the
+worker detects a stale or reclaimed delivery. It is the number that says how much at-least-once is
+actually costing, and it is the number that will justify — or fail to justify — the idempotency
+work in v0.7.
+
 ## Verified in v0.3
 
 **Both database paths converge, checked rather than assumed.** The failure mode v0.2.1 was

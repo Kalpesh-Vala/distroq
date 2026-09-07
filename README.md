@@ -1025,11 +1025,11 @@ threads in one.
 
 Deliberately out of scope for v0.5:
 
+- Reconciliation for the three dual writes, stream retention, and worker leases (**v0.5.1** — see
+  *Planned for v0.5.1* in `NOTES.md`)
 - User-scheduled future jobs via `scheduled_at` (v0.6)
 - Idempotency keys, exactly-once side-effect protection, and a separate multi-worker service (v0.7)
 - WebSockets and a live dashboard (v0.8)
-- A transactional outbox or reconciliation sweep for the three dual writes
-- Stream retention or trimming
 - Bulk DLQ replay, automatic replay, and any retention policy for `dead_letters`
 - Re-prioritising a submitted job
 - Job cancellation
