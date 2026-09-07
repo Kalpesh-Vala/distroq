@@ -19,6 +19,9 @@ public final class TestProperties {
     public static final DistroqProperties.Streams STREAMS =
             new DistroqProperties.Streams("distroq-workers", "worker", 10_000L, 100, 1, 1000L, "0");
 
+    public static final DistroqProperties.Scheduling SCHEDULING =
+            new DistroqProperties.Scheduling(1000L, 100);
+
     private TestProperties() {
     }
 
@@ -38,16 +41,31 @@ public final class TestProperties {
         return of(RETRY, PRIORITY, streams);
     }
 
+    public static DistroqProperties of(DistroqProperties.Scheduling scheduling) {
+        return new DistroqProperties(
+                "distroq:jobs:pending",
+                "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
+                "distroq:jobs:stream",
+                RETRY,
+                DLQ,
+                PRIORITY,
+                STREAMS,
+                scheduling);
+    }
+
     public static DistroqProperties of(DistroqProperties.Retry retry,
                                        DistroqProperties.PriorityTuning priority,
                                        DistroqProperties.Streams streams) {
         return new DistroqProperties(
                 "distroq:jobs:pending",
                 "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
                 "distroq:jobs:stream",
                 retry,
                 DLQ,
                 priority,
-                streams);
+                streams,
+                SCHEDULING);
     }
 }
