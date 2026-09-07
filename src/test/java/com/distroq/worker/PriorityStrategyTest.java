@@ -1,5 +1,6 @@
 package com.distroq.worker;
 
+import com.distroq.TestProperties;
 import com.distroq.config.DistroqProperties;
 import com.distroq.model.Priority;
 import org.junit.jupiter.api.Test;
@@ -11,7 +12,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * No Redis, no database, no Spring context. That is the point of the class under test: the
  * scheduling policy is separable from the mechanism that carries it out, so it can be exercised
- * exhaustively here and survive v0.5 replacing the queue underneath it.
+ * exhaustively here. v0.5 replaced the queue underneath it with Streams and every test below
+ * still passes unchanged.
  */
 class PriorityStrategyTest {
 
@@ -19,11 +21,7 @@ class PriorityStrategyTest {
     private static final List<Priority> GUARD = List.of(Priority.LOW, Priority.NORMAL, Priority.HIGH);
 
     private static PriorityStrategy strategyWithThreshold(int threshold) {
-        return new PriorityStrategy(new DistroqProperties(
-                "distroq:jobs:pending",
-                "distroq:jobs:delayed",
-                new DistroqProperties.Retry(3, 1000L, 60_000L, 0.2, 1000L, 100),
-                new DistroqProperties.Dlq(3),
+        return new PriorityStrategy(TestProperties.of(
                 new DistroqProperties.PriorityTuning(threshold)));
     }
 
@@ -38,8 +36,9 @@ class PriorityStrategyTest {
 
     @Test
     void guardOrderIsTheStrictOrderReversed() {
-        // BRPOP returns from the first non-empty key in the order given, so reversing the strict
-        // order is what "serve the lowest NON-EMPTY tier" means without asking Redis for depths
+        // the consumer tries the tiers in the order given and stops at the first that answers, so
+        // reversing the strict order is what "serve the lowest non-empty tier" means without
+        // asking Redis for depths
         PriorityStrategy strategy = strategyWithThreshold(1);
         strategy.recordServed(Priority.HIGH);
 
@@ -88,7 +87,7 @@ class PriorityStrategyTest {
 
     @Test
     void guardIsSingleShotWhenTheLowestTierTurnsOutToBeEmpty() {
-        // the guard poll went out in reversed order, LOW had nothing, and BRPOP served NORMAL.
+        // the guard poll went out in reversed order, LOW had nothing, and NORMAL was served.
         // The counter must still reset, otherwise the guard latches and NORMAL permanently
         // outranks HIGH - a far worse failure than the starvation it was meant to prevent.
         PriorityStrategy strategy = strategyWithThreshold(10);

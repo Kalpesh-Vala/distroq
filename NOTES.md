@@ -277,6 +277,16 @@ keys are on the roadmap for v0.7: redelivery is a feature I am choosing, and saf
 come from making execution repeatable, not from trying to guarantee a job is never delivered
 twice.
 
+**Resolved in v0.5, with two caveats.** Streams and `XAUTOCLAIM` were built and the scenario above
+is now detectable and recoverable — see *Verified in v0.5* for a worker killed mid-job and its
+work picked up by another instance. The caveats:
+
+- Recovery needs *another* live instance. A single-instance deployment recovers only when it is
+  restarted, because the sweep runs inside the same process that died.
+- Redis measures idle time, not liveness, so the same mechanism reclaims work from a healthy
+  worker whose job outlasts `claim-min-idle-ms`. Detection is now possible; distinguishing "slow"
+  from "dead" still is not.
+
 ## Design decisions
 
 **Why v0.4 was built on a mechanism v0.5 will delete, on purpose.** v0.5 replaces the Redis list
@@ -999,6 +1009,301 @@ The honest counterweight, unchanged: this buys **at-least-once**, not exactly-on
 retry may have already partially executed. Idempotency keys at v0.7 are what make that safe, and
 nothing in v0.5 should be described as if redelivery were free.
 
+## What v0.5 changed about the plan
+
+### 1. Why Lists were replaced
+
+A Redis list gives destructive pop and nothing else. `BRPOP` is atomic, ordered and blocking —
+everything v0.4 needed to *dispatch* work, and nothing it needed to *account* for it. The moment
+an ID leaves the list there is no record anywhere in Redis that it was ever handed to anybody:
+no owner, no timestamp, no delivery count, no way to ask "what did I give out that has not come
+back". That is one bit of missing state, and it is the bit every recovery story depends on.
+
+The consequence had been sitting in §5 of *Known limitations* since v0.1 and had grown, by v0.4,
+into three separate versions of the same hole: a worker dying mid-job (nothing to detect), a
+promoted retry lost between `LPUSH` and `markRunning` (indistinguishable from a retry that has
+not come up yet), and a replayed job lost between the DLQ update and the enqueue (invisible from
+both directions, because the DLQ row already reads `replayed = true`).
+
+None of those are fixable on top of a list. Every proposed workaround — a separate "in flight"
+set written after the pop, a lease key with a TTL, a heartbeat table in PostgreSQL — is a second
+write that is not atomic with the pop, which means it has its own crash window and needs its own
+reconciliation. The missing state has to live where the pop happens, or it does not help.
+
+### 2. What Streams provide
+
+Streams supply exactly the missing bit, and a few useful things around it:
+
+- **Entry IDs.** Every entry has a durable, monotonic, server-assigned identity, so a delivery can
+  be referred to after the fact — in a log line, in an acknowledgement, in a reclaim.
+- **Consumer groups.** Redis tracks which consumer was given which entry. Ownership is a property
+  of the data, not of a convention the client is trusted to maintain.
+- **Pending Entries Lists.** One per stream per group: everything delivered and not acknowledged,
+  with its owner, its idle time and its delivery count. This is the state a list cannot hold.
+- **`XACK`.** Completion becomes an explicit act with a place to put it, rather than something
+  implied by the absence of a record.
+- **Inspection.** `XPENDING`, `XINFO GROUPS` and `XINFO CONSUMERS` answer "who is holding what,
+  and for how long" without any application-level bookkeeping.
+- **`XAUTOCLAIM`.** Transferring ownership of stale entries is one atomic command, not a scan and
+  a race.
+
+The important consequence is the one predicted in §6 above: because the PEL applies to every entry
+regardless of how it got into the stream, submit, retry promotion and DLQ replay stop being three
+delivery paths that each need their own reconciliation story. They converge on one recovery
+mechanism, which is a better argument for Streams than the orphaned-`RUNNING` case alone.
+
+### 3. At-least-once semantics
+
+The ordering is the guarantee. Every path writes the outcome to PostgreSQL and calls `XACK`
+afterwards:
+
+```
+execute -> close the attempt row -> set the terminal (or RETRYING) job state -> XACK
+```
+
+Reversing those two would be faster to write and would produce at-most-once delivery with silent
+loss, which is what v0.4 had. In the chosen order the failure window is: the job has run, the
+database says so, and the process dies before the acknowledgement. Redis still holds the entry as
+pending against a consumer that no longer exists, and another instance reclaims it after
+`claim-min-idle-ms`.
+
+That redelivery is not a defect being tolerated — it is the mechanism working. What it costs is
+that the worker now has to answer a question v0.4 never had to: *what does this entry mean, given
+what the database already says about the job?* The decision table in the README is that answer,
+and it exists because at-least-once delivery makes duplicate deliveries a normal event rather than
+an anomaly.
+
+There is a second source of duplicates that is easy to overlook and worth stating plainly: Redis
+measures idle time, not liveness. An entry held by a completely healthy worker running a job for
+longer than `claim-min-idle-ms` is indistinguishable from one held by a corpse, and will be
+reclaimed and executed a second time. The threshold is therefore not just a recovery knob; it is
+an assertion about maximum job duration, and getting it wrong manufactures duplicates on a system
+where nothing has failed. The one case that *can* be distinguished is a process reclaiming from
+itself, and the worker tracks its own in-flight entries to prevent that.
+
+### 4. Exactly-once is not achieved, and cannot be here
+
+`XACK` is a statement about a message. It says: this consumer group has accounted for this entry,
+stop offering it. It says nothing whatsoever about what the consumer *did*.
+
+Consider a job that charges a card. The worker charges the card, commits `SUCCEEDED`, and is
+killed before the `XACK`. The entry is still pending. Another worker reclaims it. It reads the job
+from PostgreSQL, sees `SUCCEEDED`, and acknowledges without re-executing — so in *this* case the
+duplicate is caught, because the database happens to record the outcome.
+
+Now move the crash one line earlier: the worker charges the card and dies before committing
+anything. The database still says `RUNNING`. The reclaiming worker follows the documented rule,
+marks the abandoned attempt, and **charges the card again**. Nothing in Redis could have prevented
+this. The broker cannot know that the side effect happened, because the side effect did not happen
+in the broker.
+
+The general form: exactly-once execution across a broker and an external effect requires the
+effect and the record of the effect to commit atomically. That is a property of the *job*, not of
+the queue — a deduplication key checked and written in the same transaction as the work. Which is
+why v0.7 is idempotency keys and not, say, a cleverer acknowledgement scheme.
+
+So: **at-least-once delivery** (v0.5, provided), **idempotent processing** (v0.7, a property of
+the job), and only their combination approximates **exactly-once execution** as far as it can be
+approximated at all. Three distinct terms, and the repository keeps them distinct on purpose.
+
+### 5. The priority trade-off
+
+v0.4 had one property v0.5 cannot reproduce: `BRPOP key1 key2 key3` chooses the highest-priority
+non-empty key *inside Redis*, atomically, while blocking. One command, no window between deciding
+which tier to read and reading it.
+
+Streams have no equivalent. `XREADGROUP` accepts several streams, but it returns whatever is
+available across all of them — it has no notion that one is preferable — and it wakes on the first
+arrival anywhere. There is no "read these, preferring this one" command, and no `BLPOP`-style
+first-non-empty semantics.
+
+Two designs were available:
+
+**One stream for everything.** Acknowledgements would work; priority would not. A stream is
+append-ordered and a consumer group hands out entries in that order, so a HIGH job submitted after
+a thousand LOW ones is the thousand-and-first entry. Restoring priority would mean a second
+scheduling structure in front of the stream, at which point the stream is not the queue any more.
+
+**One stream per tier**, which is what was built. It preserves the v0.4 policy model exactly — the
+tiers are separate keys, `PriorityStrategy` is untouched, the starvation guard still works — at
+the cost of moving the ordering decision out of Redis and into the worker's read strategy.
+
+The strategy is: non-blocking `XREADGROUP` per tier in the order `PriorityStrategy` asks for,
+stopping at the first that answers; only if all three are empty, one bounded blocking read across
+all three. That costs up to four round trips on an idle queue where v0.4 needed one, and it buys
+back strict order whenever anything is queued, because a tier is skipped only after Redis has said
+it is empty.
+
+**What is genuinely lost.** During the final blocking read — and only then — the first entry to
+arrive wakes the call regardless of tier. If a LOW job and a HIGH job arrive within the same
+millisecond on a completely idle queue, the LOW one may be served first. v0.4's `BRPOP` would have
+preferred HIGH. The window is one delivery, immediately after an idle period, and it closes as
+soon as there is any backlog at all. Measured with eleven NORMAL jobs already queued, a
+subsequently submitted HIGH job ran second overall, delayed only by the NORMAL job that was
+already executing — which is non-preemption, not a queue-ordering failure, and was true in v0.4
+too.
+
+The alternative worth naming and rejecting: a depth check followed by a read. `XLEN` on each
+stream, then read the deepest non-empty one. That reintroduces exactly the race the design brief
+forbids — the depth is stale the instant it is returned — and costs more round trips than the
+sequential reads do. A read either returns an entry or it does not; that is the only reliable
+signal, so it is the only one used.
+
+One more constraint that shaped the code: an entry returned by `XREADGROUP` is already in the
+consumer's PEL. Reading three streams and processing one would strand the other two until the idle
+timeout. So the consumer returns *everything* a read produced, sorted into tier order, and the
+worker processes all of it. "Read one, ignore the rest" is not available once delivery is tracked.
+
+### 6. Reclaiming, and what `ABANDONED` does and does not mean
+
+v0.4 wrote a `job_attempts` row when an attempt *finished*. A worker that vanished mid-execution
+therefore left no attempt row at all — the job sat at `RUNNING` with `attemptCount` incremented
+and nothing recording who had been running it or when. The history was silent about precisely the
+case it would be most useful for.
+
+v0.5 opens the row first, as `IN_PROGRESS`, and closes it as `SUCCESS`, `FAILURE` or `ABANDONED`.
+`ABANDONED` is written by whichever worker reclaims the delivery, and it names both the entry ID
+and the reclaiming consumer:
+
+```
+Delivery 1788795125064-0 reclaimed by worker-two-b1230ceb;
+worker-one-12191346 never reported an outcome
+```
+
+The wording is deliberate. `ABANDONED` means: **the worker did not report a success or a failure
+before the delivery was reclaimed.** It does not mean the job did nothing. It does not mean the
+job did something. Nobody knows, and the row is careful not to imply otherwise — that unknowability
+is the whole reason idempotency keys are a separate version rather than a paragraph in this one.
+
+The reclaim rule itself: whoever holds the entry owns the current attempt. Any open attempt is
+closed as `ABANDONED`, a new attempt is opened, and `attemptCount` **advances**. It would have been
+tempting to leave `attemptCount` alone on the grounds that the abandoned attempt "did not really
+happen" — but it did happen, possibly all the way to a side effect, and pretending otherwise would
+give a job that repeatedly kills its workers an unlimited retry budget. Advancing means the
+attempt sequence in `job_attempts` stays one coherent ordered history, and a job that cannot be
+completed still eventually dead-letters.
+
+No DDL was required for either new outcome value. That is the third time V2's decision to drop the
+Hibernate-generated CHECK constraint has paid for itself — `jobs.status` in v0.3, `jobs.priority`
+in v0.4, `job_attempts.outcome` now — and the reasoning was checked against the live database
+rather than assumed, because "the migration may be unnecessary" is exactly the kind of claim that
+is embarrassing to get wrong.
+
+### 7. Delayed retry promotion
+
+The promotion script kept its shape and changed its verb: `ZRANGEBYSCORE` + `ZREM` + `LPUSH`
+became `ZRANGEBYSCORE` + `ZREM` + `XADD`, with the four standard entry fields and `source=RETRY`.
+The delayed-set member format is unchanged — still `<TIER>:<uuid>` — because it is still the only
+thing that lets the script pick a destination without a PostgreSQL lookup per promoted job.
+
+Two details that had to be checked rather than assumed:
+
+- **`XADD *` inside a Lua script.** Non-deterministic commands were a genuine problem under the
+  old command-replication model. Redis 5 onwards replicates scripts by their *effects*, so the
+  replica receives the ID the primary generated. Safe on Redis 7, which is what this runs on.
+- **Dynamic key names.** A Lua script may not construct key names it was not given. All three
+  stream keys are therefore passed in `KEYS`, with their tier names in `ARGV`, and the script maps
+  tier to key from that — it never builds `distroq:jobs:stream:` + anything.
+
+The atomicity claim, stated precisely: **within Redis**, a due retry moves from the sorted set into
+exactly one stream, exactly once, or not at all. There is no window in which it exists in both or
+neither.
+
+That is not a system-level guarantee. The job's `RETRYING` row was committed to PostgreSQL by a
+different write at a different time, and the two can still disagree — a `RETRYING` row whose
+delayed member never made it, or a stream entry for a job the database never marked. Redis being
+atomic with itself does not make Redis atomic with PostgreSQL, and §10 below is the same point in
+its general form.
+
+One behaviour this forced, and it was found by testing rather than by reading: the promoted entry
+arrives while the job is still `RETRYING`. A naive "a `RETRYING` job's delivery is stale, just
+acknowledge it" rule — which is what the design brief's duplicate-delivery table suggests in
+isolation — acknowledges the retry without running it, and the job never completes. The
+discriminator is the entry itself: `source=RETRY`, stamped at or after `nextAttemptAt`, is the
+scheduled retry and must run; anything else on a `RETRYING` job is a superseded delivery and must
+not. Two different entries, the same job status, opposite correct actions.
+
+### 8. Consumer identity
+
+Ownership in a consumer group is keyed by consumer *name*, and Redis will happily let two
+processes use the same one. If they did, each would find the other's in-flight entries in its own
+PEL, `XPENDING` would attribute work to a consumer that is not doing it, and `XAUTOCLAIM` would
+reclaim live work from a healthy peer while believing it was recovering from a crash. The recovery
+model would not fail loudly; it would produce confident, wrong answers.
+
+So the name is generated per process — `<prefix>-<8 random hex>` — and the prefix is configurable
+only for legibility when running two instances side by side. A fixed `worker-1` is not offered as
+an option anywhere.
+
+The same string is used as the `workerId` in `job_attempts`. One identity, two systems: a pending
+entry in Redis and an attempt row in PostgreSQL can be tied together by string equality, which is
+what makes the crash-recovery evidence readable at all.
+
+### 9. Legacy migration, and its remaining crash window
+
+Nothing reads the v0.4 lists any more, so an ID left on one is a job sitting in PostgreSQL as
+`QUEUED` that no worker will ever pick up. The alternative to migrating was to document "drain the
+queue before upgrading", which converts silently stranded work into a documentation problem — the
+same argument v0.4 made when it drained the v0.3 key, and it holds here too.
+
+The migration is **not transactional and is not claimed to be**. A pop and an `XADD` are two
+commands; the process can die between them. What the implementation does is choose which side of
+that window to fail on:
+
+```
+LMOVE  <legacy list>  <parking list>  RIGHT LEFT
+XADD   <tier stream>  ...  source=LEGACY_MIGRATION
+LREM   <parking list> 1 <id>
+```
+
+The ID is on exactly one list at every instant. A crash after `LMOVE` and before `XADD` leaves it
+parked, and the next startup republishes it. A crash after `XADD` and before `LREM` produces a
+**duplicate stream entry** on the next startup — which the duplicate-delivery rules already handle,
+because handling duplicates is now a normal part of the system rather than a special case. A naive
+`RPOP` then `XADD` would have failed on the other side, losing the job outright. Duplicates are
+recoverable; losses are not.
+
+Parking lists are per tier, so an interrupted migration does not lose the tier of what it was
+carrying.
+
+### 10. The dual write is untouched
+
+All three occurrences are still there, unchanged:
+
+1. `POST /api/jobs` — `jobRepository.save()` then `XADD`.
+2. Retry scheduling — `jobRepository.save()` then `ZADD`.
+3. DLQ replay — job and `dead_letters` rows saved, then `XADD`.
+
+It is worth being explicit about *why* Streams do not help, because "we added acknowledgements" is
+close enough to "we added reliability" to be mistaken for it. Acknowledgements make delivery
+reliable **once an entry is in the stream**. Every one of the three windows above is the gap
+between committing to PostgreSQL and getting the entry into the stream at all. There is no entry
+yet, so there is no pending entry, so there is nothing for `XAUTOCLAIM` to find. The PEL cannot
+recover a message that was never written.
+
+What v0.5 did change is the *shape* of the argument. The v0.4 note predicted the third occurrence
+would be the argument for an outbox; it was, and it still has not been acted on. What has changed
+is that recovery infrastructure now exists — a periodic sweep, running per instance, that already
+reconciles Redis state against PostgreSQL for one class of problem. A reconciliation pass over
+stale `QUEUED` and `RETRYING` rows would sit naturally alongside `PendingEntryRecovery` rather than
+being a new subsystem. That is an argument for doing it, not evidence that it has been done.
+
+Left for v0.7 or a dedicated reliability version: a transactional outbox, or reconciliation, or
+both. Nothing in v0.5 should be read as narrowing these three windows by so much as a millisecond.
+
+### 11. The self-reclaim bug, found by running it
+
+Worth recording because it is not obvious from the design and only appeared under test. The first
+version of `PendingEntryRecovery` reclaimed every entry idle beyond the threshold, including its
+own. A ten-second job on a ten-second threshold therefore had its entry reclaimed by the same
+process that was executing it, which would have re-run the job in place — a duplicate manufactured
+entirely by the recovery mechanism, with no failure anywhere.
+
+The fix is small: the worker tracks the entries it is currently executing, and the sweep skips
+those. It is the one liveness question that *can* be answered locally, and answering it costs a
+set lookup. Across processes the question remains unanswerable, which is what §3 says about idle
+time not being death.
+
 ## Verified in v0.3
 
 **Both database paths converge, checked rather than assumed.** The failure mode v0.2.1 was
@@ -1102,6 +1407,117 @@ reason. The shutdown evidence above came from `GenerateConsoleCtrlEvent` against
 console from a helper process, and from letting Logback own the log file: with output piped
 through the shell, the shell dies on the same Ctrl+C and truncates the buffer before the
 interesting lines are flushed. Two ways to accidentally not test the thing being tested.
+
+## Verified in v0.5
+
+**A worker was killed mid-job and another instance finished the work.** Two instances against the
+same Redis and PostgreSQL, prefixes `worker-one` and `worker-two`. A 30-second HIGH job was
+submitted to instance 1 and confirmed `RUNNING` with entry `1788795125064-0` pending and owned by
+`worker-one-12191346`. Instance 1 was then terminated forcefully — process gone, port 8080
+refusing connections, both checked rather than assumed, because closing a terminal that never
+owned the process is the easy way to fake this test.
+
+`XPENDING` through the sequence, which is the whole story in three lines:
+
+```
+1788795125064-0  worker-one-12191346   3418ms  1     # running normally
+1788795125064-0  worker-one-12191346   9217ms  2     # owner is dead; entry still attributed to it
+1788795125064-0  worker-two-b1230ceb  12564ms  3     # reclaimed
+```
+
+Instance 2 logged the reclaim with both owners and the idle time (10820ms against a 10000ms
+threshold), closed attempt 1 as `ABANDONED`, opened attempt 2 under its own name, ran the job to
+completion and only then acknowledged. Final state `SUCCEEDED`, `attemptCount` 2, pending count 0.
+Nothing was lost — and the job ran twice, which is at-least-once behaving exactly as documented.
+
+**The `RETRYING` reclaim case was reconstructed rather than raced for.** The interesting window —
+a worker that commits `RETRYING`, schedules the delayed member, and dies before `XACK` — is a few
+milliseconds wide and cannot be hit reliably by killing a process. Rather than claim a lucky
+timing, the state a crashed worker *would* have left was built directly: a `RETRYING` row with a
+seeded failed attempt, a delayed-set member due 60 seconds out, and the original `source=SUBMIT`
+entry delivered to a consumer named `worker-ghost` that does not exist. Then the app was started.
+
+The sweep reclaimed the orphan from `worker-ghost` after 20s idle, recognised it as superseded —
+`source=SUBMIT` against a job whose retry is already scheduled — and acknowledged it without
+executing. `ZCARD` on the delayed set stayed at exactly 1 throughout, so no duplicate schedule was
+created. At the due time the promotion produced a `source=RETRY` entry, the job ran as attempt 2
+and succeeded. Pending count 0, delayed set empty.
+
+Constructing the state is worth flagging as what it is: it proves the *handling* is correct, not
+that the window was observed occurring naturally.
+
+**A slow job is not mistaken for a dead one, within a process.** A 10-second job against a
+10-second reclaim threshold. `XAUTOCLAIM` did take the entry back — it is idle by Redis'
+definition — and the worker recognised it as its own in-flight work and declined to treat it as
+abandoned:
+
+```
+XAUTOCLAIM on distroq:jobs:stream:high took 1 idle entr(ies) for worker-f57bbf64
+Entry 1788794367297-0 on distroq:jobs:stream:high is still running here; not treating it as abandoned
+```
+
+The job completed normally as a single attempt. Across processes this remains undecidable — see
+*What v0.5 changed about the plan* §11 for the bug this was found by.
+
+**No V5 migration was needed, checked against the live database.** `pg_constraint` for
+`job_attempts` holds only the primary key and the v0.3 foreign key. `outcome` is `varchar(255)`
+with no CHECK, so `IN_PROGRESS` and `ABANDONED` are writable with zero DDL, and `finished_at` was
+already nullable for the open row. Flyway reports `v4` as current on both the pre-existing and a
+freshly created database, with no checksum change.
+
+**Metrics distinguish the three stream counts, demonstrated on a live backlog.** Six LOW jobs
+queued behind a HIGH job in flight:
+
+```json
+"queueDepth": 5,
+"queueDepthByPriority":     { "HIGH": 0, "NORMAL": 0, "LOW": 5 },
+"streamDepthByPriority":    { "HIGH": 4, "NORMAL": 1, "LOW": 11 },
+"pendingEntriesByPriority": { "HIGH": 1, "NORMAL": 0, "LOW": 0 },
+"activeConsumers": 1
+```
+
+`XLEN` on the LOW stream was 11 and `XINFO GROUPS` reported `lag` 5 — the same numbers, from
+Redis, that the endpoint reports. Eleven entries, five jobs waiting. Reporting `XLEN` as queue
+depth would have been wrong by more than a factor of two on a system that drained cleanly to zero
+sixteen seconds later.
+
+The lag field is why `queueDepth` is exact rather than estimated. It is a Redis 7 addition, it is
+not exposed by Spring Data Redis 3.5.13's `XInfoGroup`, and it goes null once entries are deleted
+or trimmed — which is survivable here only because v0.5 does not trim. A null lag is reported as
+0 and logged, rather than silently substituted.
+
+**The Spring Data Redis surface was checked against the resolved jars, not assumed.**
+`javap` against `spring-data-redis-3.5.13.jar` confirmed `StreamOperations` has `claim(..)` but no
+`autoClaim`, and that `StreamInfo.XInfoGroup` exposes `pendingCount()` and `lastDeliveredId()` but
+not `lag`. Both gaps are filled by binding directly to `lettuce-core-6.6.0.RELEASE`
+(`xautoclaim`, `xinfoGroups`), isolated in one class. `XPENDING` plus `XCLAIM` was available as a
+fallback and was not used: it is two round trips with a race between them, and the client supports
+the atomic command.
+
+Also checked rather than assumed: whether a blocking `XREADGROUP` monopolises the shared
+connection. It does not — `LettuceStreamCommands.xReadGroup` branches on
+`StreamReadOptions.isBlocking()` and takes a dedicated connection, the same way the v0.4 `BRPOP`
+path did. Had it not, a 1-second block would have stalled the retry sweep and every metrics call.
+
+**Graceful shutdown is still clean with Streams, a blocking read and two sweeps running.** Ctrl+C
+sent as a real `CTRL_C_EVENT`, with a 20-second job in flight and a retrying job pending. The
+shutdown hook ran, Tomcat drained, the worker logged its own shutdown, the executor timed out its
+10 seconds and stopped, and Hikari closed. 255 log lines, zero stack frames, zero `ERROR` lines,
+no `loop error, backing off` from the worker and nothing from the retry or recovery sweeps — the
+`ContextClosedEvent` pattern from v0.1 extends to the new component unchanged.
+
+**Legacy list migration, all four keys.** Real `QUEUED` job rows were seeded into
+`distroq:jobs:pending:high`, `:normal` and the unqualified v0.3 key, then the app was started
+against a flushed Redis. Each was logged at WARN, routed to the correct stream (the unqualified
+key to NORMAL), written with `source=LEGACY_MIGRATION`, and executed to `SUCCEEDED`. All four list
+keys were empty afterwards and `KEYS distroq:jobs:*` returned only the three streams. A restart
+immediately after created no groups (`BUSYGROUP` treated as success), migrated nothing, and
+started normally.
+
+**99 tests, one skipped.** The skip is `DistroqApplicationTests.contextLoads`, `@Disabled` since
+v0.1 because it needs live infrastructure. `PriorityStrategyTest` passes unchanged, which is the
+concrete return on having kept the scheduling policy free of any queue mechanism: the entire
+delivery layer underneath it was replaced and its twelve tests did not move.
 
 ## Resolved issues
 
