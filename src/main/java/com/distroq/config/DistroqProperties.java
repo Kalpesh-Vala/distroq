@@ -5,11 +5,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 
 @ConfigurationProperties(prefix = "distroq")
 public record DistroqProperties(
+        /** v0.4 list base. From v0.5 it names only the keys the startup migration drains. */
         @DefaultValue("distroq:jobs:pending") String queueKey,
         @DefaultValue("distroq:jobs:delayed") String delayedKey,
+        @DefaultValue("distroq:jobs:stream") String streamKey,
         @DefaultValue Retry retry,
         @DefaultValue Dlq dlq,
-        @DefaultValue PriorityTuning priority) {
+        @DefaultValue PriorityTuning priority,
+        @DefaultValue Streams streams) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -32,5 +35,29 @@ public record DistroqProperties(
      */
     public record PriorityTuning(
             @DefaultValue("10") int starvationThreshold) {
+    }
+
+    /**
+     * Redis Streams delivery.
+     *
+     * <p>{@code groupName} is shared across all three priority streams; Redis keeps a separate
+     * group and Pending Entries List per stream, so one name is not one queue.
+     *
+     * <p>{@code consumerNamePrefix} is only the prefix — a random suffix is appended per process.
+     * Two instances sharing a consumer name would each believe the other's in-flight entries were
+     * their own, which breaks reclaim.
+     *
+     * <p>{@code claimMinIdleMs} is the reclaim threshold, and it is also an upper bound on how
+     * long a healthy worker may hold an entry before another worker treats it as abandoned. It
+     * must exceed the longest expected job duration.
+     */
+    public record Streams(
+            @DefaultValue("distroq-workers") String groupName,
+            @DefaultValue("worker") String consumerNamePrefix,
+            @DefaultValue("10000") long claimMinIdleMs,
+            @DefaultValue("100") int claimBatchSize,
+            @DefaultValue("1") int readCount,
+            @DefaultValue("1000") long blockTimeoutMs,
+            @DefaultValue("0") String groupStartId) {
     }
 }

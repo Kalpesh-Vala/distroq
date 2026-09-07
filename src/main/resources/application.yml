@@ -24,6 +24,11 @@ spring:
       # the app runs on the host, outside the compose network
       host: localhost
       port: 6379
+  task:
+    scheduling:
+      # two @Scheduled tasks that must not block each other: the retry sweep has to keep ticking
+      # while the recovery sweep is executing a reclaimed job on the same pool
+      pool-size: 2
 
 server:
   error:
@@ -32,8 +37,11 @@ server:
     include-message: always
 
 distroq:
+  # v0.5: only the startup migration reads this key and its three tier variants
   queue-key: distroq:jobs:pending
   delayed-key: distroq:jobs:delayed
+  # base for distroq:jobs:stream:{high,normal,low}
+  stream-key: distroq:jobs:stream
   retry:
     default-max-attempts: 3
     base-delay-ms: 1000
@@ -44,8 +52,20 @@ distroq:
   dlq:
     replay-attempts: 3
   priority:
-    # a count of dequeues, not a duration - see NOTES.md for what this does and does not bound
+    # a count of deliveries, not a duration - see NOTES.md for what this does and does not bound
     starvation-threshold: 10
+  streams:
+    group-name: distroq-workers
+    # a random per-process suffix is appended; two instances must never share a consumer name
+    consumer-name-prefix: worker
+    # also the point at which a healthy but slow worker's entry looks abandoned to everyone else,
+    # so it must exceed the longest expected job duration
+    claim-min-idle-ms: 10000
+    claim-batch-size: 100
+    read-count: 1
+    block-timeout-ms: 1000
+    # 0 means the group starts at the beginning of the stream, not at its tail
+    group-start-id: "0"
 
 logging:
   level:
