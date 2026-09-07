@@ -22,6 +22,12 @@ public record DeadLetterDetailResponse(
         boolean replayed,
         Instant replayedAt,
         int replayCount,
+        /**
+         * The execution time originally requested. Kept in the DLQ view on purpose: replay is
+         * immediate regardless, so an operator deciding whether to replay should be able to see
+         * that this job was meant to run at a particular time and will not this time.
+         */
+        Instant scheduledAt,
         List<AttemptResponse> attempts) {
 
     public static DeadLetterDetailResponse from(DeadLetter deadLetter, Job job, List<JobAttempt> attempts) {
@@ -38,6 +44,7 @@ public record DeadLetterDetailResponse(
                 deadLetter.isReplayed(),
                 deadLetter.getReplayedAt(),
                 deadLetter.getReplayCount(),
+                job.getScheduledAt(),
                 attempts.stream().map(AttemptResponse::from).toList());
     }
 }

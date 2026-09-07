@@ -9,6 +9,7 @@ import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
 import com.distroq.queue.EnqueueSource;
 import com.distroq.queue.JobQueue;
+import com.distroq.queue.ScheduledJobQueue;
 import com.distroq.repository.DeadLetterRepository;
 import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
@@ -25,6 +26,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +42,7 @@ public class JobController {
     private final JobAttemptRepository jobAttemptRepository;
     private final DeadLetterRepository deadLetterRepository;
     private final JobQueue jobQueue;
+    private final ScheduledJobQueue scheduledJobQueue;
     private final int defaultMaxAttempts;
     private final int replayAttempts;
 
@@ -47,26 +50,46 @@ public class JobController {
                          JobAttemptRepository jobAttemptRepository,
                          DeadLetterRepository deadLetterRepository,
                          JobQueue jobQueue,
+                         ScheduledJobQueue scheduledJobQueue,
                          DistroqProperties properties) {
         this.jobRepository = jobRepository;
         this.jobAttemptRepository = jobAttemptRepository;
         this.deadLetterRepository = deadLetterRepository;
         this.jobQueue = jobQueue;
+        this.scheduledJobQueue = scheduledJobQueue;
         this.defaultMaxAttempts = properties.retry().defaultMaxAttempts();
         this.replayAttempts = properties.dlq().replayAttempts();
     }
 
+    /**
+     * Two outcomes, decided entirely by {@code scheduledAt}.
+     *
+     * <p>Every validation runs before the first write, so a rejected request leaves nothing behind
+     * in either system. A future time saves the job SCHEDULED and puts it on the scheduled sorted
+     * set; anything else saves it QUEUED and puts it straight on its tier's stream.
+     */
     @PostMapping("/jobs")
     public ResponseEntity<JobResponse> submit(@RequestBody SubmitJobRequest request) {
         int maxAttempts = resolveMaxAttempts(request.maxAttempts());
         Priority priority = resolvePriority(request.priority());
+        Instant scheduledAt = ScheduledAtParser.parse(request.scheduledAt());
+
         Job job = jobRepository.save(
-                Job.create(request.type(), request.payload(), maxAttempts, priority));
-        // first of the three dual writes: the row is committed, the XADD is a separate system and
-        // can still fail on its own. Streams did not change that - see NOTES.md
-        String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.SUBMIT);
-        log.info("Job {} ({}) QUEUED at {} with maxAttempts {} as stream entry {}",
-                job.getId(), job.getType(), job.getPriority(), maxAttempts, entryId);
+                Job.create(request.type(), request.payload(), maxAttempts, priority, scheduledAt));
+
+        // first of the three dual writes: the row is committed, the Redis write is a separate
+        // system and can still fail on its own. Streams did not change that and neither does
+        // scheduling - a crash here leaves a SCHEDULED row with no sorted-set member. See NOTES.md
+        if (job.isScheduled()) {
+            scheduledJobQueue.schedule(job.getId(), job.getPriority(), scheduledAt);
+            log.info("Job {} ({}) SCHEDULED at {} for {} with maxAttempts {}",
+                    job.getId(), job.getType(), job.getPriority(), scheduledAt, maxAttempts);
+        } else {
+            String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.SUBMIT);
+            log.info("Job {} ({}) QUEUED at {} with maxAttempts {} as stream entry {}{}",
+                    job.getId(), job.getType(), job.getPriority(), maxAttempts, entryId,
+                    scheduledAt == null ? "" : " (requested time " + scheduledAt + " already past)");
+        }
         return ResponseEntity.accepted().body(JobResponse.from(job));
     }
 
@@ -146,6 +169,11 @@ public class JobController {
         // The job's own tier, not the default - a LOW job replayed as NORMAL would jump ahead of
         // work it was deliberately ranked behind, and a HIGH one would silently lose its rank.
         // Third of the three dual writes; the window is unchanged from v0.4.
+        //
+        // Immediate even when the job carried a scheduledAt. That timestamp described the original
+        // request; replaying is a new operator action taken now, and re-honouring a time that has
+        // usually already passed would either run immediately anyway or strand the job. The
+        // original value stays on the row as history - see NOTES.md.
         String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.REPLAY);
         log.info("Job {} ({}) replayed from the DLQ as stream entry {}, attemptCount {} preserved, "
                         + "maxAttempts {} -> {}",
@@ -170,6 +198,13 @@ public class JobController {
      *
      * <p>{@code activeConsumers} counts consumers <em>holding</em> pending entries, not consumers
      * registered in the group: an idle worker holds nothing and does not appear here.
+     *
+     * <p>v0.6 adds a fourth kind of waiting, kept out of all three of the above.
+     * {@code scheduledDepth} counts jobs waiting on a time the submitter asked for. They are not
+     * backlog — no worker could run them yet even if every worker were idle — and folding them
+     * into {@code queueDepth} would make an autoscaler start workers for work that is not due, or
+     * into {@code delayedDepth} would make a retry-rate alarm fire because someone scheduled a
+     * report for midnight.
      */
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
@@ -179,6 +214,8 @@ public class JobController {
         metrics.put("queueDepth", jobQueue.readyDepth());
         metrics.put("queueDepthByPriority", jobQueue.readyDepthByPriority());
         metrics.put("delayedDepth", jobQueue.delayedDepth());
+        metrics.put("scheduledDepth", scheduledJobQueue.scheduledDepth());
+        metrics.put("scheduledDepthByPriority", scheduledJobQueue.scheduledDepthByPriority());
         metrics.put("totalJobs", jobRepository.count());
         metrics.put("deadLetterCount", deadLetterRepository.countByReplayed(false));
         metrics.put("replayedCount", deadLetterRepository.countByReplayed(true));

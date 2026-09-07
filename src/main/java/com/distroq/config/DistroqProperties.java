@@ -8,11 +8,14 @@ public record DistroqProperties(
         /** v0.4 list base. From v0.5 it names only the keys the startup migration drains. */
         @DefaultValue("distroq:jobs:pending") String queueKey,
         @DefaultValue("distroq:jobs:delayed") String delayedKey,
+        /** User-requested execution times. Deliberately not {@code delayedKey} — see NOTES.md. */
+        @DefaultValue("distroq:jobs:scheduled") String scheduledKey,
         @DefaultValue("distroq:jobs:stream") String streamKey,
         @DefaultValue Retry retry,
         @DefaultValue Dlq dlq,
         @DefaultValue PriorityTuning priority,
-        @DefaultValue Streams streams) {
+        @DefaultValue Streams streams,
+        @DefaultValue Scheduling scheduling) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -59,5 +62,23 @@ public record DistroqProperties(
             @DefaultValue("1") int readCount,
             @DefaultValue("1000") long blockTimeoutMs,
             @DefaultValue("0") String groupStartId) {
+    }
+
+    /**
+     * User-scheduled job promotion.
+     *
+     * <p>{@code pollIntervalMs} is the dominant term in scheduling latency: a job is promoted on
+     * the first tick at or after its due time, so the mean delay it contributes is half the
+     * interval and the worst case is the whole of it. Lowering it costs one {@code ZRANGEBYSCORE}
+     * per tick against a set that is usually empty; it does not make the requested time a hard
+     * guarantee, because stream delivery and worker availability are still in front of the job.
+     *
+     * <p>Mirrors {@link Retry} rather than reusing it. The two pollers sweep different sorted sets
+     * for different reasons, and tying retry backoff resolution to user-scheduling resolution
+     * would mean one could not be tuned without moving the other.
+     */
+    public record Scheduling(
+            @DefaultValue("1000") long pollIntervalMs,
+            @DefaultValue("100") int promoteBatchSize) {
     }
 }

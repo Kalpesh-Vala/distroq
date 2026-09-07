@@ -17,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -275,8 +276,146 @@ class WorkerDeliveryTest {
         assertThat(worker.isInFlight(STREAM, ENTRY)).isFalse();
     }
 
+    // ---- v0.6: user-scheduled deliveries ----
+
+    @Test
+    void aDueScheduledJobRunsItsFirstAttemptThroughTheNormalLifecycle() throws Exception {
+        Instant scheduledAt = Instant.now().minusSeconds(1);
+        Job job = scheduled(Priority.HIGH, scheduledAt);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.HIGH));
+
+        verify(jobExecutor).execute(job);
+        assertThat(job.getStatus()).isEqualTo(JobStatus.SUCCEEDED);
+        assertThat(job.getAttemptCount()).isEqualTo(1);
+        // exactly one attempt row, opened then closed - promotion itself is not an attempt
+        ArgumentCaptor<JobAttempt> saved = ArgumentCaptor.forClass(JobAttempt.class);
+        verify(jobAttemptRepository, times(2)).save(saved.capture());
+        assertThat(saved.getAllValues().get(0)).isSameAs(saved.getAllValues().get(1));
+        assertThat(saved.getAllValues().get(1).getAttemptNumber()).isEqualTo(1);
+        verify(consumer).acknowledge(streamKey(Priority.HIGH), ENTRY);
+    }
+
+    @Test
+    void theRequestedTimeIsStillOnTheJobAfterItHasRun() throws Exception {
+        Instant scheduledAt = Instant.now().minusSeconds(1);
+        Job job = scheduled(Priority.NORMAL, scheduledAt);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.NORMAL));
+
+        assertThat(job.getScheduledAt()).isEqualTo(scheduledAt);
+    }
+
+    @Test
+    void anEntryThatArrivesBeforeItsTimeIsNeitherRunNorAcknowledged() throws Exception {
+        // PostgreSQL holds what the submitter asked for and wins over the sorted-set score that
+        // caused the promotion. Leaving the entry pending costs one reclaim cycle and is the only
+        // option that neither executes early, nor loses the job, nor writes a second schedule
+        Job job = scheduled(Priority.HIGH, Instant.now().plusSeconds(3600));
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.HIGH));
+
+        verifyNoInteractions(jobExecutor);
+        verify(consumer, never()).acknowledge(any(), any());
+        verify(jobRepository, never()).save(any());
+        verify(jobAttemptRepository, never()).save(any());
+        verify(jobQueue, never()).scheduleAt(any(), any(), any());
+        assertThat(job.getStatus()).isEqualTo(JobStatus.SCHEDULED);
+        assertThat(job.getAttemptCount()).isZero();
+    }
+
+    @Test
+    void aScheduledJobWithNoRequestedTimeIsTreatedAsDueRatherThanStuckForever() throws Exception {
+        // only reachable through a hand-written row, but "runs now" is a better failure than an
+        // entry that is redelivered and refused for the rest of the stream's life
+        Job job = scheduled(Priority.NORMAL, null);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.NORMAL));
+
+        verify(jobExecutor).execute(job);
+        assertThat(job.getStatus()).isEqualTo(JobStatus.SUCCEEDED);
+    }
+
+    @Test
+    void aScheduledJobThatFailsRetriesThroughTheRetrySetLikeAnyOther() throws Exception {
+        Instant scheduledAt = Instant.now().minusSeconds(1);
+        Job job = scheduled(Priority.LOW, scheduledAt);
+        doThrow(new IllegalStateException("boom")).when(jobExecutor).execute(job);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.LOW));
+
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RETRYING);
+        // its own tier, on the retry set - never back onto the scheduled set
+        verify(jobQueue).scheduleAt(eq(job.getId()), eq(Priority.LOW), any());
+        assertThat(job.getScheduledAt()).isEqualTo(scheduledAt);
+        assertThat(job.getNextAttemptAt()).isNotNull().isNotEqualTo(scheduledAt);
+        verify(consumer).acknowledge(streamKey(Priority.LOW), ENTRY);
+    }
+
+    @Test
+    void aDuplicateScheduledDeliveryOfAFinishedJobAddsNoSecondAttempt() throws Exception {
+        // promotion is at-least-once too: a redelivered SCHEDULED entry for a job that has already
+        // run must not open a second attempt row
+        Job job = scheduled(Priority.HIGH, Instant.now().minusSeconds(1));
+        worker.handle(scheduledDelivery(job.getId(), Priority.HIGH));
+        assertThat(job.getStatus()).isEqualTo(JobStatus.SUCCEEDED);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.HIGH));
+
+        verify(jobExecutor, times(1)).execute(job);
+        verify(jobAttemptRepository, times(2)).save(any());
+        verify(consumer, times(2)).acknowledge(streamKey(Priority.HIGH), ENTRY);
+        assertThat(job.getAttemptCount()).isEqualTo(1);
+    }
+
+    @Test
+    void aScheduledEntryForAJobThatIsAlreadyRetryingIsNotTreatedAsAFirstRun() throws Exception {
+        // the entry that started this job is redelivered after the retry was scheduled. The
+        // RETRYING rules own this, not the scheduling ones, and they supersede it
+        Job job = Job.create("fail_n_times", "1", 3, Priority.NORMAL, Instant.now().plusSeconds(1));
+        job.markQueuedFromSchedule();
+        job.markRunning();
+        job.markRetrying("boom", Instant.now().plusSeconds(30));
+        present(job);
+
+        worker.handle(scheduledDelivery(job.getId(), Priority.NORMAL));
+
+        verifyNoInteractions(jobExecutor);
+        verify(consumer).acknowledge(streamKey(Priority.NORMAL), ENTRY);
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RETRYING);
+    }
+
+    @Test
+    void aScheduledJobIsRoutedByItsDatabaseTierWhenTheStreamDisagrees() throws Exception {
+        Job job = scheduled(Priority.LOW, Instant.now().minusSeconds(1));
+
+        worker.handle(new StreamDelivery(streamKey(Priority.HIGH), ENTRY, job.getId(),
+                Priority.HIGH, fields(job.getId(), Priority.HIGH, EnqueueSource.SCHEDULED, 1L)));
+
+        verify(jobExecutor).execute(job);
+        assertThat(job.getPriority()).isEqualTo(Priority.LOW);
+        verify(consumer).acknowledge(streamKey(Priority.HIGH), ENTRY);
+    }
+
     private Job queued(Priority priority) {
         Job job = Job.create("sleep", "1", 3, priority);
+        present(job);
+        return job;
+    }
+
+    /**
+     * Built in the future so the factory produces SCHEDULED, then the field is rewound to the
+     * value under test. There is no setter, which is the point of the design being tested.
+     */
+    private Job scheduled(Priority priority, Instant scheduledAt) {
+        Job job = Job.create("sleep", "1", 3, priority, Instant.now().plusSeconds(3600));
+        try {
+            Field field = Job.class.getDeclaredField("scheduledAt");
+            field.setAccessible(true);
+            field.set(job, scheduledAt);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
         present(job);
         return job;
     }
@@ -293,8 +432,17 @@ class WorkerDeliveryTest {
         when(jobRepository.findById(job.getId())).thenReturn(Optional.of(job));
     }
 
+    private static String streamKey(Priority priority) {
+        return "distroq:jobs:stream:" + priority.keySuffix();
+    }
+
     private static StreamDelivery delivery(UUID jobId, Priority priority, EnqueueSource source) {
         return new StreamDelivery(STREAM, ENTRY, jobId, priority, fields(jobId, priority, source, 1L));
+    }
+
+    private static StreamDelivery scheduledDelivery(UUID jobId, Priority priority) {
+        return new StreamDelivery(streamKey(priority), ENTRY, jobId, priority,
+                fields(jobId, priority, EnqueueSource.SCHEDULED, System.currentTimeMillis()));
     }
 
     private static Map<String, String> fields(UUID jobId, Priority priority, EnqueueSource source,

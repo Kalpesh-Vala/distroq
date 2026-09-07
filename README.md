@@ -1,8 +1,8 @@
-# DistroQ v0.5
+# DistroQ v0.6
 
 A minimal, end-to-end distributed task queue with priority scheduling, automatic retries,
-exponential backoff, a dead-letter queue with explicit replay, and **at-least-once delivery over
-Redis Streams with acknowledgements and crash recovery**.
+exponential backoff, a dead-letter queue with explicit replay, at-least-once delivery over
+Redis Streams with acknowledgements and crash recovery, and **durable user-scheduled execution**.
 
 A job submitted over HTTP is persisted to PostgreSQL, its ID appended to **the Redis Stream for
 its priority tier**, delivered to a worker through a **consumer group**, executed, and its terminal
@@ -13,10 +13,45 @@ with an exponentially increasing delay, **at its original priority**. A job that
 retries is **moved to a dead-letter queue** rather than merely marked failed, and can be replayed
 on demand with its failure history and its priority intact.
 
+A job may also carry a **`scheduledAt`** timestamp. It is then persisted as `SCHEDULED`, parked in
+a Redis sorted set scored by its execution time, and promoted onto its own priority stream when
+that time arrives — surviving application restarts, because nothing about the schedule lives in
+the JVM.
+
 **PostgreSQL is the single source of truth.** Redis carries job ID strings and a little routing
 metadata; the job itself is never serialized into Redis. The API and the worker run in the same
 Spring Boot process, but are decoupled — the worker talks only to the `queue` package and the
 repositories, and neither side references the other's internals.
+
+## What changed in v0.6
+
+One feature: a submission may ask for a future execution time.
+
+```text
+Future POST
+  -> PostgreSQL SCHEDULED
+  -> Redis scheduled Sorted Set
+  -> due-time promotion
+  -> priority Redis Stream
+  -> XREADGROUP
+  -> worker
+  -> success/retry/DLQ
+```
+
+| | v0.5 | v0.6 |
+| --- | --- | --- |
+| Submission | runs as soon as a worker is free | optional `scheduledAt`; a future time waits |
+| Statuses | `QUEUED`, `RUNNING`, `RETRYING`, `SUCCEEDED`, `FAILED`, `DEAD_LETTERED` | plus **`SCHEDULED`** |
+| Sorted sets | `distroq:jobs:delayed` (retry backoff) | plus **`distroq:jobs:scheduled`** (user-requested times) |
+| Entry sources | `SUBMIT`, `RETRY`, `REPLAY`, `LEGACY_MIGRATION` | plus **`SCHEDULED`** |
+| Pollers | retry sweep, recovery sweep | plus the **scheduled-job promoter** |
+| Metrics | `delayedDepth` | plus `scheduledDepth`, `scheduledDepthByPriority` |
+| Migrations | V1–V4 | plus **V5** (`jobs.scheduled_at`) |
+
+What did **not** change: the priority model, the retry and backoff policy, the delayed sorted set,
+the DLQ and replay endpoints, the consumer-group delivery path, and the three known dual-write
+windows. Scheduling adds a fourth instance of the same dual write rather than fixing any of them.
+See *Known limitations*.
 
 ## What changed in v0.5
 
@@ -49,6 +84,7 @@ distroq:jobs:stream:high      # one stream per tier, derived from distroq.stream
 distroq:jobs:stream:normal
 distroq:jobs:stream:low
 distroq:jobs:delayed          # unchanged: one sorted set for all tiers, members "<TIER>:<uuid>"
+distroq:jobs:scheduled        # v0.6: user-requested execution times, same member format
 ```
 
 Three streams rather than one. A single stream would still give acknowledgements, but a HIGH job
@@ -94,7 +130,7 @@ Redis-generated IDs (`*`), four fields, no payload:
   jobId       57bf8cfc-d4aa-4dea-bc31-028e6f8e88b7
   priority    HIGH
   enqueuedAt  1788795125062
-  source      SUBMIT | RETRY | REPLAY | LEGACY_MIGRATION
+  source      SUBMIT | RETRY | SCHEDULED | REPLAY | LEGACY_MIGRATION
 ```
 
 `priority` is duplicated from PostgreSQL deliberately: the retry-promotion script needs it to pick
@@ -103,7 +139,8 @@ incident. If it disagrees with the database, **PostgreSQL wins** — the worker 
 warning naming both values and executes at the database's tier.
 
 `source` exists because the worker's decision for a `RETRYING` job depends on where the entry came
-from. See *Duplicate deliveries* below.
+from, and from v0.6 because a `SCHEDULED` entry means "this job's requested time has arrived"
+rather than "run it now". See *Duplicate deliveries* and *Scheduled jobs*.
 
 There is **no `MAXLEN` trimming**. A trimmed entry that is still pending cannot be inspected or
 reclaimed, and inspection is the point. The streams therefore grow without bound in v0.5 — a real
@@ -350,6 +387,269 @@ The poller moves IDs only; it does not touch job status. A job stays `RETRYING` 
 picks it up and sets `RUNNING`, so there is no transient `QUEUED` flicker.
 
 
+## Scheduled jobs
+
+A submission may name the time it should run:
+
+```json
+{
+  "type": "sleep",
+  "payload": "1000",
+  "priority": "HIGH",
+  "scheduledAt": "2026-09-07T15:30:00Z"
+}
+```
+
+```text
+POST /api/jobs with scheduledAt
+        |
+        v
+PostgreSQL job row: SCHEDULED
+        |
+        v
+Redis Sorted Set: distroq:jobs:scheduled
+        |
+        | when due
+        v
+Redis priority Stream          (source=SCHEDULED)
+        |
+        v
+XREADGROUP
+        |
+        v
+Worker execution
+```
+
+Everything after the stream is the ordinary v0.5 path. A scheduled job is not a special kind of
+job once it is running: it retries, dead-letters, is replayed and is recovered exactly like any
+other.
+
+### `SCHEDULED` is not `RETRYING`, and not `QUEUED`
+
+Three different reasons a job can be waiting, and they are three different statuses because they
+mean three different things to whoever is looking at the queue.
+
+| Status | Why it is waiting | Which Redis key holds it | Has it ever run? |
+| --- | --- | --- | --- |
+| `SCHEDULED` | the submitter asked for a future time | `distroq:jobs:scheduled` | no |
+| `QUEUED` | ready now, waiting for a free worker | a priority stream | maybe (a replay is `QUEUED`) |
+| `RETRYING` | an attempt failed and the backoff has not elapsed | `distroq:jobs:delayed` | yes |
+
+Reusing `QUEUED` for a job due next Tuesday would make queue depth a lie — it would report work
+that no worker could pick up even if every worker were idle, and an autoscaler reading it would
+start capacity for nothing. Reusing `RETRYING` would be worse: it would report a failure that
+never happened, and every "how many jobs are failing right now" panel would be wrong.
+
+### The scheduled sorted set
+
+```
+ZADD distroq:jobs:scheduled NX <epochMillis> <TIER>:<uuid>
+```
+
+A **separate key** from `distroq:jobs:delayed`, not a second use of it. The mechanism is identical
+— that part is shared code — but the meaning is not, and merging them would tie two independently
+tunable behaviours together forever and make `delayedDepth` unanswerable. See `NOTES.md`.
+
+The member carries its tier for the same reason the delayed set's members do: the sorted set is a
+single key with no tier of its own, so promotion has to learn the destination from the member
+itself if range + `ZREM` + `XADD` are to stay inside one atomic script.
+
+`ZADD` is issued with **`NX`**. Rescheduling is out of scope in v0.6, so the only thing that can
+produce a second `ZADD` for a job already in the set is a repeat of a request that has already
+been accepted — and silently moving that job's execution time is the worse of the two failures. A
+duplicate schedule is therefore an **idempotent no-op**, logged at WARN, that leaves the original
+score untouched.
+
+### Promotion
+
+`ScheduledJobPromoter` runs on a Spring `@Scheduled` fixed delay (1s by default) and calls the
+same Lua script the retry sweep uses, against a different key and with a different `source` label.
+The script ranges the set for members scored at or before now, removes each one, and `XADD`s it
+onto the stream for its own tier:
+
+```lua
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local tiers = #KEYS - 1
+local dest = {}
+for i = 1, tiers do
+  dest[ARGV[i + 2]] = KEYS[i + 1]
+end
+local fallbackTier = ARGV[tiers + 3]
+local source = ARGV[tiers + 4]
+local moved = 0
+for i = 1, #due do
+  local member = due[i]
+  if redis.call('ZREM', KEYS[1], member) == 1 then
+    local sep = string.find(member, ':', 1, true)
+    local id = member
+    local tier = fallbackTier
+    if sep then
+      local parsed = string.sub(member, 1, sep - 1)
+      if dest[parsed] then
+        tier = parsed
+        id = string.sub(member, sep + 1)
+      end
+    end
+    redis.call('XADD', dest[tier], '*',
+      'jobId', id,
+      'priority', tier,
+      'enqueuedAt', ARGV[1],
+      'source', source)
+    moved = moved + 1
+  end
+end
+return moved
+```
+
+`KEYS[1]` is the scheduled set and `KEYS[2..]` the three tier streams in `Priority` declaration
+order; the tier names arrive as `ARGV` in the matching order. **The script never builds a Redis
+key name or an enum name itself**, and it never touches PostgreSQL. A member it cannot recognise
+goes to the default tier rather than stopping the sweep, and the worker corrects the tier against
+the database on arrival.
+
+The `ZREM` return value is what decides ownership: only the caller whose `ZREM` returned 1 writes
+the `XADD`, so no member can be promoted twice even with several processes running the script.
+
+The promoter never executes a job, never opens an attempt row and never writes a job status. All
+of that belongs to the worker that receives the entry.
+
+### The worker's side
+
+An entry with `source=SCHEDULED` for a job that is still `SCHEDULED` means its time has come. The
+worker re-reads `scheduledAt` from PostgreSQL rather than trusting the sorted-set score that
+caused the promotion, moves the job `SCHEDULED -> QUEUED`, and then runs the ordinary attempt
+lifecycle. Promotion is **not** an attempt: no attempt row, no `attemptCount` change, and
+`scheduledAt` is kept.
+
+If the database says the job is **not yet due** — only reachable through clock skew or a
+hand-written `ZADD` — the worker does nothing at all: it does not execute, does not create an
+attempt, does not change any status, and above all does not write a second sorted-set member. The
+entry is simply left **pending**, so `XAUTOCLAIM` redelivers it after `claim-min-idle-ms` and it
+is re-evaluated then. That costs one reclaim cycle of latency and a WARN per attempt, and it is
+the only option that neither runs early, nor loses the job, nor duplicates its schedule.
+
+### Timestamps
+
+Accepted: ISO-8601 with an **explicit** offset or `Z`.
+
+```
+2026-09-07T15:30:00Z
+2026-09-07T17:30:00+02:00
+2026-09-07T10:30:00-05:00
+```
+
+All three are the same instant, and after parsing they are indistinguishable — the same
+`java.time.Instant`, the same `timestamptz` value, the same sorted-set score, the same API
+response. The offset describes how the request was written, not when the job should run.
+
+| Input | Result |
+| --- | --- |
+| omitted | immediate |
+| JSON `null` | immediate |
+| `""` or whitespace | **400** — omitting the field already means "now", so blank cannot also mean it |
+| `2026-09-07T15:30:00` | **400** — no offset; reading it would require guessing a timezone |
+| `2026-09-07 15:30:00` | **400** — not ISO-8601 |
+| `1788715215167` | **400** — epoch millis is a second wire format for one field |
+| `not-a-date` | **400** |
+
+```json
+{
+  "status": 400,
+  "message": "scheduledAt must be an ISO-8601 timestamp with an explicit UTC offset, e.g. 2026-09-07T15:30:00Z or 2026-09-07T17:30:00+02:00, got '2026-09-07T15:30:00'"
+}
+```
+
+Every check runs **before the first write**, so a rejected submission leaves no PostgreSQL row and
+no Redis member behind.
+
+`LocalDateTime`, the JVM default zone and the PostgreSQL server zone are all deliberately unused.
+Any of them would make "run this at 15:30" mean different things on different hosts, and none of
+it would be visible in the response. Verified rather than assumed: the application in the
+transcript below runs with a JVM default of `India Standard Time` against a PostgreSQL server set
+to `UTC`, and the stored value round-trips unchanged.
+
+### A past timestamp runs immediately
+
+`scheduledAt <= now` is not an error — it is a request that is already due. The job is persisted
+as `QUEUED`, `XADD`ed straight onto its tier's stream with `source=SUBMIT`, and **never touches
+the scheduled sorted set**. Parking it there only to promote it on the next tick would add up to a
+poll interval of latency for nothing.
+
+The original timestamp is still recorded on the row. It is what was asked for, and it stays
+visible.
+
+### Scheduling is best-effort
+
+The requested time is a **floor, not a guarantee**. A job starts at some point at or after it,
+delayed by:
+
+- **the poll interval** — the dominant term, and the only one this configuration controls. Mean
+  contribution is half of `distroq.scheduling.poll-interval-ms`, worst case is all of it
+- Redis latency for the `ZRANGEBYSCORE` + `ZREM` + `XADD` script
+- stream delivery: the worker's next `XREADGROUP` has to come round
+- worker availability: there is one worker thread per process
+- higher-priority work: a HIGH backlog is served before a promoted LOW job
+
+Measured on the transcript below with the default 1s poll interval: **518 ms** from requested time
+to `startedAt` for an idle HIGH job, and **624 ms** for one promoted immediately after an
+application restart.
+
+### `scheduledAt` is history, not working state
+
+Once set, it is never changed. Not by promotion, not by a retry, not by dead-lettering, not by
+replay. It is immutable in v0.6 — there is no setter on the entity and no reschedule endpoint.
+
+`nextAttemptAt` remains exclusively retry timing. A scheduled job that has failed once carries
+both, and they answer different questions:
+
+```json
+{
+  "status": "RETRYING",
+  "scheduledAt": "2026-09-07T18:08:46Z",     // what was asked for
+  "nextAttemptAt": "2026-09-07T18:08:50.7Z"  // when attempt 3 is due
+}
+```
+
+### Retry, DLQ and replay for a scheduled job
+
+Once a scheduled job starts, everything downstream is the v0.5 behaviour unchanged:
+
+```text
+SCHEDULED
+  -> source=SCHEDULED stream entry -> RUNNING
+  -> RETRYING -> distroq:jobs:delayed -> source=RETRY stream entry -> RUNNING
+  -> SUCCEEDED | DEAD_LETTERED
+```
+
+- Retries use the **retry** sorted set and `source=RETRY`. A job never returns to `SCHEDULED`.
+- The priority is unchanged at every hop.
+- Attempt history contains only real execution attempts — the promotion is not one of them.
+- A scheduled job that exhausts its retries enters the DLQ normally, and `scheduledAt` stays
+  visible in both `GET /api/jobs/{id}` and the DLQ responses.
+
+**Replay is immediate.** `POST /api/jobs/{id}/retry` goes straight onto the job's priority stream
+with `source=REPLAY` and creates **no** scheduled sorted-set member, even when the original job
+had a future `scheduledAt`.
+
+> `scheduledAt` describes the original execution request. Replaying a dead-lettered job
+> is a new operator action and is intentionally immediate.
+
+Re-honouring a timestamp that has almost always already passed would either run the job
+immediately anyway or, for a genuinely future one, strand an operator's deliberate intervention
+until a time they were not asked about.
+
+### Restart durability
+
+The schedule lives in Redis, so it survives the application dying. The transcript below kills the
+process outright (not a graceful stop) while a job is `SCHEDULED`, confirms the sorted-set member
+is still there with the application gone, restarts before the target time, and the job runs once,
+on time, with a single attempt row.
+
+What this does **not** survive is Redis losing the key. The scheduled set is subject to whatever
+persistence the Redis deployment is configured for, and the `docker-compose.yml` here configures
+none.
+
+
 ## Dead-letter queue
 
 A job whose retries are exhausted becomes `DEAD_LETTERED` and gets a row in the
@@ -436,6 +736,24 @@ writes DDL.
 | `V2__add_query_indexes_and_drop_enum_check.sql` | Indexes for the three existing queries, and dropping the last Hibernate-generated enum CHECK. |
 | `V3__dead_letters.sql` | The `dead_letters` table with its two indexes, plus the foreign key `job_attempts` never had. Contains **no** DDL for `DEAD_LETTERED` — see below. |
 | `V4__job_priority.sql` | `jobs.priority` as `varchar(255) NOT NULL DEFAULT 'NORMAL'`, plus `idx_jobs_priority`. The DB-level default backfills every pre-v0.4 row, which is the correct reading of a job submitted before priority existed. |
+| `V5__scheduled_jobs.sql` | `jobs.scheduled_at` as a **nullable** `timestamp(6) with time zone`, plus `idx_jobs_scheduled_at`. Nullable because an immediate job was never scheduled at all, and NULL is the only value that says so. |
+
+**V5 adds no constraint tying `status` to `scheduled_at`,** consistent with V1–V4. The invariant
+"`SCHEDULED` implies a non-null `scheduled_at` in the future" is real but *time-dependent*: it
+stops being true the instant the job is promoted, and a constraint that only holds at INSERT is
+not a constraint. Enforcing it would also mean the database knowing about a seventh status value
+— exactly the coupling V1 documents as having already caused one silent failure. The application
+maintains the invariant instead; the worker treats a `SCHEDULED` job with a null `scheduled_at` as
+due now, so the failure mode is "runs immediately", not "stuck forever".
+
+The column type is `timestamp(6) with time zone`, matching `created_at`, `started_at`,
+`finished_at` and `next_attempt_at` exactly. A plain `timestamp` — what PostgreSQL gives you if
+you forget the qualifier — fails startup under `ddl-auto: validate` rather than silently storing a
+local-time value, which is the last place a timezone could have crept back in.
+
+Applied against the live database with fourteen existing rows: **`Successfully applied 1 migration
+to schema "public", now at version v5`**, `SELECT count(*) FROM jobs` unchanged at 14 before and
+after, no checksum errors.
 
 **v0.5 added no migration.** It adds two `AttemptOutcome` values, `IN_PROGRESS` and `ABANDONED`,
 and needs zero DDL to do it: `job_attempts.outcome` is `varchar(255)` with no CHECK constraint,
@@ -519,6 +837,7 @@ Bound as a single `@ConfigurationProperties` record (`DistroqProperties`):
 distroq:
   queue-key: distroq:jobs:pending    # v0.4 lists; only the startup migration reads these now
   delayed-key: distroq:jobs:delayed
+  scheduled-key: distroq:jobs:scheduled  # v0.6: user-requested execution times
   stream-key: distroq:jobs:stream    # base for :high / :normal / :low
   retry:
     default-max-attempts: 3      # used when the request omits maxAttempts
@@ -539,7 +858,20 @@ distroq:
     read-count: 1                # COUNT on XREADGROUP
     block-timeout-ms: 1000       # BLOCK on the fallback read, so shutdown is noticed promptly
     group-start-id: "0"          # groups start at the beginning of the stream, not its tail
+  scheduling:
+    poll-interval-ms: 1000       # how often the scheduled set is swept
+    promote-batch-size: 100      # max scheduled jobs promoted per sweep
 ```
+
+`scheduling` mirrors the `retry` block rather than reusing it. The two pollers sweep different
+sorted sets for different reasons, and tying retry-backoff resolution to user-scheduling
+resolution would mean neither could be tuned without moving the other.
+
+`scheduling.poll-interval-ms` is the **dominant term in scheduling latency**: a job is promoted on
+the first tick at or after its due time, so the mean delay it contributes is half the interval and
+the worst case is the whole of it. Lowering it costs one `ZRANGEBYSCORE` per tick against a set
+that is usually empty. It does not make the requested time a hard guarantee — stream delivery and
+worker availability are still in front of the job.
 
 `starvation-threshold` is a **count of deliveries, not a duration**. See *Scheduling policy*.
 
@@ -556,15 +888,16 @@ Also set, outside the `distroq` namespace:
 spring:
   task:
     scheduling:
-      pool-size: 2               # the retry sweep and the recovery sweep must not block each other
+      pool-size: 3               # the retry, scheduled-job and recovery sweeps must not block each other
 server:
   error:
     include-message: always      # otherwise the 409 body would not name the job's actual status
 ```
 
-The scheduler pool is 2 because the recovery sweep executes reclaimed jobs on the scheduler
-thread. With Spring Boot's default pool size of 1, a reclaimed thirty-second job would stall the
-retry sweep for its whole duration.
+The scheduler pool is 3 because the recovery sweep executes reclaimed jobs on the scheduler
+thread. With Spring Boot's default pool size of 1, a reclaimed thirty-second job would stall both
+the retry sweep and the scheduled-job sweep for its whole duration. It was 2 in v0.5 and grew by
+one with the scheduled-job promoter.
 
 Spring Boot omits the `message` field from error bodies by default, which silently discards
 the `reason` on every `ResponseStatusException` the app throws. The cost is that unhandled
@@ -636,6 +969,7 @@ twice — see *At-least-once delivery is not exactly-once execution*.
 
 | Status      | Meaning                                                         |
 | ----------- | --------------------------------------------------------------- |
+| `SCHEDULED` | Waiting for a user-requested future execution time. **Has never run.** |
 | `QUEUED`    | Ready to run, waiting for a free worker.                          |
 | `RUNNING`   | Currently executing.                                              |
 | `RETRYING`  | Failed, attempts remaining, waiting out its backoff window.        |
@@ -645,6 +979,12 @@ twice — see *At-least-once delivery is not exactly-once execution*.
 
 `RETRYING` is deliberately distinct from `QUEUED`: conflating them would make queue depth
 meaningless and hide backoff entirely.
+
+`SCHEDULED` is deliberately distinct from **both**. It is not `QUEUED`, because a job due next
+Tuesday is not ready for execution and counting it as backlog would be misleading. It is not
+`RETRYING`, because `RETRYING` means an attempt failed and another is pending, while a `SCHEDULED`
+job has not had a first attempt at all. A job leaves `SCHEDULED` exactly once and never returns to
+it — not through a retry, not through the DLQ, not through a replay. See *Scheduled jobs*.
 
 ### `FAILED` vs `DEAD_LETTERED`
 
@@ -700,13 +1040,13 @@ since that is an ordinary failure, it is retried before it becomes terminally
 
 | Method | Path                     | Notes                                                          |
 | ------ | ------------------------ | -------------------------------------------------------------- |
-| POST   | `/api/jobs`              | Returns **202 Accepted** — the work is accepted, not completed. `400` on an unknown `priority`. |
-| GET    | `/api/jobs/{id}`         | Includes the full `attempts` history. `404` if unknown.         |
-| GET    | `/api/jobs?status=&priority=` | Optional `JobStatus` and `Priority` filters, combinable; 50 most recent, newest first. Both are pushed into SQL, never filtered in memory. No attempts (avoids N+1). |
-| POST   | `/api/jobs/{id}/retry`   | Replay a dead-lettered job at its original priority. **202**; `409` if not `DEAD_LETTERED`, `404` if unknown. |
-| GET    | `/api/dlq`               | 50 most recent dead-letters, newest `moved_at` first. Optional `?replayed=true\|false`. Includes `priority`. |
-| GET    | `/api/dlq/{jobId}`       | Single entry with the full attempt history and `priority`. `404` if not dead-lettered. |
-| GET    | `/api/metrics`           | Queue, stream, delayed-set and DLQ counters — see below. |
+| POST   | `/api/jobs`              | Returns **202 Accepted** — the work is accepted, not completed. `400` on an unknown `priority` or an unparseable `scheduledAt`. |
+| GET    | `/api/jobs/{id}`         | Includes the full `attempts` history and `scheduledAt`. `404` if unknown.         |
+| GET    | `/api/jobs?status=&priority=` | Optional `JobStatus` (including `SCHEDULED`) and `Priority` filters, combinable; 50 most recent, newest first. Both are pushed into SQL, never filtered in memory. No attempts (avoids N+1). |
+| POST   | `/api/jobs/{id}/retry`   | Replay a dead-lettered job at its original priority, **immediately** — never on its original schedule. **202**; `409` if not `DEAD_LETTERED`, `404` if unknown. |
+| GET    | `/api/dlq`               | 50 most recent dead-letters, newest `moved_at` first. Optional `?replayed=true\|false`. Includes `priority` and `scheduledAt`. |
+| GET    | `/api/dlq/{jobId}`       | Single entry with the full attempt history, `priority` and `scheduledAt`. `404` if not dead-lettered. |
+| GET    | `/api/metrics`           | Queue, stream, delayed-set, scheduled-set and DLQ counters — see below. |
 
 `deadLetterCount` counts rows with `replayed = false` (currently sitting in the DLQ);
 `replayedCount` counts rows with `replayed = true` (replayed and not since re-failed).
@@ -716,6 +1056,8 @@ since that is an ordinary failure, it is retried before it becomes terminally
   "queueDepth": 5,
   "queueDepthByPriority": { "HIGH": 0, "NORMAL": 0, "LOW": 5 },
   "delayedDepth": 0,
+  "scheduledDepth": 1,
+  "scheduledDepthByPriority": { "HIGH": 1, "NORMAL": 0, "LOW": 0 },
   "totalJobs": 10,
   "deadLetterCount": 1,
   "replayedCount": 0,
@@ -731,15 +1073,28 @@ sample that shows why: the LOW stream had eleven entries and five jobs waiting.
 
 | Metric | Question | Source | Exact? |
 | --- | --- | --- | --- |
-| `queueDepth`, `queueDepthByPriority` | How much work is waiting to be delivered? | the consumer group's `lag` from `XINFO GROUPS` | Exact while nothing is trimmed or deleted — and nothing in v0.5 trims or deletes. Redis reports `lag` as null once entries have been removed, in which case this reports 0 and logs at DEBUG. |
+| `queueDepth`, `queueDepthByPriority` | How much work is waiting to be delivered? | the consumer group's `lag` from `XINFO GROUPS` | Exact while nothing is trimmed or deleted — and nothing in v0.6 trims or deletes. Redis reports `lag` as null once entries have been removed, in which case this reports 0 and logs at DEBUG. |
 | `streamDepthByPriority` | How many entries does the stream hold? | `XLEN` | Exact, and **not a backlog**. It counts every entry the stream has ever been given, acknowledged or not, and only ever grows. |
 | `pendingEntriesByPriority` | How much work has been handed out and not confirmed? | `XPENDING` summary | Exact. In-flight work plus anything abandoned and not yet reclaimed. |
-| `delayedDepth` | How many retries are waiting out a backoff? | `ZCARD` | Exact. |
+| `delayedDepth` | How many **retries** are waiting out a backoff? | `ZCARD distroq:jobs:delayed` | Exact. Retry depth only — it does not include user-scheduled jobs. |
+| `scheduledDepth`, `scheduledDepthByPriority` | How many jobs are waiting for a **user-requested time**? | `ZCARD` / `ZRANGE` on `distroq:jobs:scheduled` | Exact. Not backlog, not retries, not stream entries, not pending deliveries. |
 | `activeConsumers` | How many consumers are holding work? | distinct consumers in the `XPENDING` summaries | Exact for that question, which is **not** "how many workers are registered". An idle worker holds nothing and does not appear; a dead worker still holding an unreclaimed entry does. |
 
 > `XLEN` is not queue depth. `streamDepthByPriority` is the count that would grow forever on a
 > healthy, fully drained system, and treating it as a backlog would page you at 3am about a queue
 > that is empty.
+
+**Four kinds of waiting, kept apart on purpose.** A scheduled job is not backlog: no worker could
+run it even if every worker were idle. A retrying job is a *failure* signal; a scheduled one is
+not. A stream entry is history. A pending delivery is work in flight. Adding scheduled jobs to
+`queueDepth` would make an autoscaler start capacity for work that is not due; adding them to
+`delayedDepth` would fire a retry-rate alarm because someone scheduled a report for midnight.
+
+`scheduledDepthByPriority` groups by the tier encoded in the member. That is a `ZRANGE 0 -1` and a
+count — O(N) in the number of jobs currently waiting on a time. There is no Redis command that
+groups a sorted set by a member prefix, and the alternatives (three sets, or a companion hash)
+would each add a write that is not atomic with the `ZADD` that matters. It is bounded by
+outstanding scheduled work rather than by history, but it is a real cost at scale.
 
 `queueDepth` and `queueDepthByPriority` keep their v0.4 names and meaning — "waiting to run" — so
 anything already watching them keeps working. Their *source* changed from `LLEN` to consumer-group
@@ -752,7 +1107,13 @@ lag.
 ### Submit body
 
 ```json
-{ "type": "fail_n_times", "payload": "2", "maxAttempts": 5, "priority": "HIGH" }
+{
+  "type": "fail_n_times",
+  "payload": "2",
+  "maxAttempts": 5,
+  "priority": "HIGH",
+  "scheduledAt": "2026-09-07T15:30:00Z"
+}
 ```
 
 `maxAttempts` is optional. Omitted or `null` → the configured default (3). Any value below
@@ -768,9 +1129,17 @@ not a tier name is rejected with **400** naming the valid values, and no job is 
 It is bound as a `String` rather than the enum precisely so that this message is the one the
 caller sees, instead of Jackson's deserialization error about a type they have never heard of.
 
+`scheduledAt` is optional. Omitted or `null` → immediate. A time in the past or equal to now →
+immediate, with the requested value still recorded. A future time → `SCHEDULED`. Blank or
+unparseable → **400**, and no job is created. It is bound as a `String` for the same reason
+`priority` is, and a stronger one: bound as an `Instant`, Jackson accepts `2026-09-07T15:30:00Z`
+but rejects `2026-09-07T17:30:00+02:00` — a perfectly valid ISO-8601 instant — before the
+controller ever sees it. See *Scheduled jobs*.
+
 ### Job detail response
 
-Adds `priority`, `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`) and `attempts`:
+Adds `priority`, `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`), `scheduledAt`
+(non-null only for a job that was submitted with one) and `attempts`:
 
 ```json
 {
@@ -779,6 +1148,7 @@ Adds `priority`, `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`)
   "attemptCount": 3,
   "maxAttempts": 5,
   "nextAttemptAt": null,
+  "scheduledAt": "2026-09-07T18:08:46Z",
   "attempts": [
     { "attemptNumber": 1, "workerId": "worker-1a2b3c4d", "outcome": "FAILURE", "errorMessage": "...", "durationMs": 2 },
     { "attemptNumber": 2, "workerId": "worker-1a2b3c4d", "outcome": "FAILURE", "errorMessage": "...", "durationMs": 1 },
@@ -786,6 +1156,10 @@ Adds `priority`, `maxAttempts`, `nextAttemptAt` (non-null only while `RETRYING`)
   ]
 }
 ```
+
+`scheduledAt` and `nextAttemptAt` are never the same field. The first is what was asked for and
+never changes; the second is when the next automatic retry is due and is cleared as soon as that
+attempt starts.
 
 The `jobs` row holds only the *most recent* error; `job_attempts` holds the history, one
 row per execution attempt, recorded on both success and failure.
@@ -931,8 +1305,104 @@ docker exec distroq-redis redis-cli XPENDING distroq:jobs:stream:high distroq-wo
 # the owner column changes from worker-one-... to worker-two-...; instance 2 logs the reclaim,
 # marks attempt 1 ABANDONED, runs attempt 2, and acknowledges
 
-# 24. Ctrl+C with work in flight -> no stack trace from the worker loop, the retry sweep or the
-#     recovery sweep; the shutdown hook logs "Worker ... shutting down" and exits cleanly
+# 24. Ctrl+C with work in flight -> no stack trace from the worker loop, the retry sweep, the
+#     scheduled-job sweep or the recovery sweep; the shutdown hook logs "Worker ... shutting down"
+#     and exits cleanly
+
+# ---- v0.6 ----
+
+# 25. A future job is SCHEDULED, not QUEUED, and sits in the scheduled sorted set
+$scheduled = (Get-Date).ToUniversalTime().AddSeconds(10).ToString("yyyy-MM-ddTHH:mm:ssZ")
+$j = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' `
+  -Body (@{ type='sleep'; payload='500'; priority='HIGH'; scheduledAt=$scheduled } | ConvertTo-Json)
+$j | ConvertTo-Json -Depth 5
+docker exec distroq-redis redis-cli ZRANGE distroq:jobs:scheduled 0 -1 WITHSCORES
+docker exec distroq-redis redis-cli XLEN distroq:jobs:stream:high
+# status SCHEDULED, member "HIGH:<uuid>" scored at the target epoch millis, XLEN unchanged
+
+# 26. It runs after its target time, once, with scheduledAt still on the row
+1..15 | ForEach-Object {
+  $s = Invoke-RestMethod -Uri "http://localhost:8080/api/jobs/$($j.id)"
+  "{0,2}s status={1,-10} attempts={2} scheduledAt={3}" -f $_, $s.status, $s.attemptCount, $s.scheduledAt
+  Start-Sleep -Seconds 1
+}
+# SCHEDULED ... SCHEDULED, RUNNING, SUCCEEDED; attemptCount 1; scheduledAt unchanged
+
+# 27. The promoted entry carries source=SCHEDULED on the job's OWN tier stream
+docker exec distroq-redis redis-cli XRANGE distroq:jobs:stream:high - + COUNT 100 |
+  Select-String -Pattern $j.id -Context 0,8
+
+# 28. A past timestamp runs immediately and never touches the scheduled set
+$past = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString("yyyy-MM-ddTHH:mm:ssZ")
+$p = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' `
+  -Body (@{ type='sleep'; payload='300'; priority='NORMAL'; scheduledAt=$past } | ConvertTo-Json)
+$p.status                                                   # QUEUED, not SCHEDULED
+docker exec distroq-redis redis-cli ZSCORE distroq:jobs:scheduled "NORMAL:$($p.id)"   # empty
+
+# 29. Timestamp validation. Valid values are accepted and normalised to the same instant
+@("2026-09-07T15:30:00Z", "2026-09-07T17:30:00+02:00", "2026-09-07T10:30:00-05:00") |
+  ForEach-Object {
+    (Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+      -ContentType 'application/json' `
+      -Body (@{ type='sleep'; payload='100'; scheduledAt=$_ } | ConvertTo-Json)).scheduledAt
+  }
+# all three print 2026-09-07T15:30:00Z
+
+# 30. Invalid values are 400s that name the field, and create nothing.
+#     curl.exe rather than Invoke-RestMethod: Windows PowerShell 5.1 discards a non-2xx body.
+$before = (Invoke-RestMethod -Uri http://localhost:8080/api/metrics).totalJobs
+@("", "not-a-date", "2026-09-07 15:30:00", "2026-09-07T15:30:00") | ForEach-Object {
+  (@{ type='sleep'; payload='100'; scheduledAt=$_ } | ConvertTo-Json -Compress) |
+    curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST http://localhost:8080/api/jobs `
+      -H "Content-Type: application/json" --data-binary "@-"
+}
+(Invoke-RestMethod -Uri http://localhost:8080/api/metrics).totalJobs - $before   # 0
+
+# 31. Two spellings of the same FUTURE instant get the same Redis score and the same DB value
+$ids = @("2027-03-01T15:30:00Z", "2027-03-01T17:30:00+02:00") | ForEach-Object {
+  (Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs -ContentType 'application/json' `
+    -Body (@{ type='sleep'; payload='100'; priority='LOW'; scheduledAt=$_ } | ConvertTo-Json)).id
+}
+$ids | ForEach-Object { docker exec distroq-redis redis-cli ZSCORE distroq:jobs:scheduled "LOW:$_" }
+# identical scores; and the JVM's default zone is irrelevant:
+[System.TimeZoneInfo]::Local.Id
+docker exec distroq-postgres psql -U distroq -d distroq -c "SHOW timezone;"
+
+# 32. Scheduled priority routing. Submit future HIGH/NORMAL/LOW with one target time, then:
+docker exec distroq-redis redis-cli XRANGE distroq:jobs:stream:high - +
+docker exec distroq-redis redis-cli XRANGE distroq:jobs:stream:normal - +
+docker exec distroq-redis redis-cli XRANGE distroq:jobs:stream:low - +
+# each ID appears on exactly its own stream, every entry with source=SCHEDULED
+
+# 33. Restart durability. Submit ~20s out, wait 3s, kill the app (NOT Redis or PostgreSQL),
+#     confirm the member survives, restart before the target time.
+docker exec distroq-redis redis-cli ZRANGE distroq:jobs:scheduled 0 -1 WITHSCORES
+# the member is still there with the process gone; after restart the job runs once, on time
+
+# 34. Scheduled metrics, during the waiting window and after promotion
+Invoke-RestMethod -Uri http://localhost:8080/api/metrics | ConvertTo-Json -Depth 6
+# scheduledDepth > 0 and scheduledDepthByPriority.HIGH = 1 while waiting;
+# after promotion scheduledDepth falls, the tier's streamDepth rises, pendingEntries goes 1 -> 0
+
+# 35. Scheduled retry: the first entry is source=SCHEDULED, later ones source=RETRY,
+#     and the job never goes back to SCHEDULED
+$future = (Get-Date).ToUniversalTime().AddSeconds(5).ToString("yyyy-MM-ddTHH:mm:ssZ")
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' `
+  -Body (@{ type='fail_n_times'; payload='2'; priority='HIGH'; maxAttempts=5; scheduledAt=$future } | ConvertTo-Json)
+docker exec distroq-redis redis-cli XRANGE distroq:jobs:stream:high - + COUNT 500 |
+  Select-String -Pattern $r.id -Context 0,8
+
+# 36. Replay is immediate and creates no scheduled member
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/jobs/<dead-lettered-id>/retry"
+docker exec distroq-redis redis-cli ZSCORE distroq:jobs:scheduled "LOW:<dead-lettered-id>"   # empty
+# the new entry carries source=REPLAY on the job's own tier; scheduledAt is still on the row
+
+# 37. Filters
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs?status=SCHEDULED"
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs?priority=HIGH&status=SCHEDULED"
 ```
 
 `com.distroq` logs at `DEBUG`, so the QUEUED → RUNNING → RETRYING → SUCCEEDED/DEAD_LETTERED
@@ -970,9 +1440,39 @@ v0.5 adds:
 `PriorityStrategyTest` is unchanged from v0.4 and still passes, which was the point of keeping the
 scheduling policy free of any Redis knowledge.
 
+v0.6 adds:
+
+- `ScheduledAtParserTest` — the whole timezone argument, as assertions: `Z`, a positive offset and
+  a negative offset all producing the same `Instant`; blank, offsetless, space-separated, bare-date
+  and epoch-millis input all rejected with a 400 that names the field; a null value meaning
+  immediate rather than invalid.
+- `SortedSetMemberTest` — the `<TIER>:<uuid>` format in both directions for all three tiers, and
+  that a bare UUID, an unknown tier, a malformed UUID or an empty member is rejected without
+  throwing. This is data that can be written by hand during an incident; it must not be able to
+  break a sweep or a metrics call.
+- `ScheduledJobQueueTest` — that scheduling issues `ZADD NX` at the right key with the right score,
+  that a duplicate is an idempotent no-op that writes nothing else, that promotion delegates with
+  the scheduled key and the `SCHEDULED` source and never the retry ones, and that the depth
+  breakdown reports every tier, survives an absent key and excludes unreadable members.
+- `DueSetPromoterTest` — the positional contract between Java and the Lua: the sorted set first,
+  then the tier streams in strict priority order, with the tier names lining up. Reordering
+  `Priority` would otherwise route every HIGH job to the LOW stream with nothing throwing.
+- `ScheduledJobPromoterTest` — that the poller promotes at the configured batch size, swallows
+  exceptions so Spring cannot cancel its own schedule, stops touching Redis after
+  `ContextClosedEvent`, and does **nothing** to a job beyond moving it.
+- `JobTest` and `WorkerDeliveryTest` additions — the `SCHEDULED`/`QUEUED` decision at creation,
+  `markQueuedFromSchedule` and its guard against every other status, `scheduledAt` surviving
+  promotion, retry, dead-lettering and replay, and the worker refusing to run — or acknowledge —
+  an entry that arrives before its time.
+
 All are plain unit tests and need no infrastructure — no Testcontainers, and the dependency set is
 unchanged from v0.1 apart from the two Flyway artifacts added in v0.2.1. Everything Redis-specific
 is verified end to end against the Docker containers instead; see *Verification*.
+
+What the unit tests deliberately do **not** cover is what the promotion Lua script does to a live
+sorted set — that a future score is left alone, that the limit bounds the batch, that a promoted
+member is removed. A mock would only echo the test's own assumptions back at it, so those are
+verified against real Redis in checks 25–34 above.
 
 `DistroqApplicationTests.contextLoads` is annotated `@Disabled` because it needs a live
 PostgreSQL and Redis. Run `docker compose up -d` and remove the `@Disabled` annotation to
@@ -980,10 +1480,10 @@ exercise it.
 
 ## Known limitations
 
-> **The three dual writes are unchanged.** Streams did not fix any of them, and nothing in v0.5
-> claims to.
+> **The three dual writes are unchanged.** Streams did not fix any of them, scheduling does not
+> fix any of them, and nothing in v0.6 claims to.
 >
-> 1. `POST /api/jobs`: `jobRepository.save()` then `jobQueue.enqueue()` (now an `XADD`). A crash
+> 1. `POST /api/jobs`: `jobRepository.save()` then `jobQueue.enqueue()` (an `XADD`). A crash
 >    between them leaves a job `QUEUED` that no stream entry refers to.
 > 2. Retry scheduling: `jobRepository.save()` then `jobQueue.scheduleAt()`. A crash between them
 >    leaves a job `RETRYING` with a `nextAttemptAt` that will never arrive.
@@ -991,11 +1491,34 @@ exercise it.
 >    leaves a job `QUEUED` with its DLQ row already marked `replayed` — invisible from both
 >    directions.
 >
+> v0.6 adds a **fourth instance of the same shape**, not a fourth problem: `POST /api/jobs` with a
+> future `scheduledAt` saves the row as `SCHEDULED` and then issues the `ZADD`. A crash between
+> them leaves a stuck `SCHEDULED` row with no sorted-set member, and nothing will ever promote it.
+> It is the same window as case 1, with a different Redis command on the far side.
+>
 > The `@Transactional` on the exhaustion path makes the two *database* writes atomic with each
-> other; it does **not** touch this, because Redis cannot enlist in a JPA transaction. The
-> promotion Lua script is atomic *within Redis* for the same reason and with the same limit. The
+> other; it does **not** touch this, because Redis cannot enlist in a JPA transaction. Both
+> promotion Lua scripts are atomic *within Redis* for the same reason and with the same limit. The
 > standard fixes are a transactional outbox or a periodic reconciliation sweep over stale rows,
 > and both are out of scope until v0.7 or a dedicated reliability version.
+
+> **Scheduled times are best-effort.** A job starts at or after its requested time, never before,
+> but the delay is bounded only by the poll interval plus stream delivery plus worker
+> availability. This is not a real-time scheduler and does not try to be.
+
+> **No rescheduling, and no cancellation.** `scheduledAt` and `priority` are both immutable after
+> submission. Moving a job's execution time would mean changing a sorted-set score and a database
+> row that are not written atomically together, in a system that already has four unrepaired
+> instances of exactly that problem — it needs its own consistency design, not a `ZADD XX`.
+
+> **`scheduledDepthByPriority` is O(N).** It reads every member of the scheduled set and counts
+> prefixes, because Redis cannot group a sorted set by a member prefix. It is bounded by
+> outstanding scheduled work rather than by history, but a very large backlog of scheduled jobs
+> makes `/api/metrics` proportionally slower.
+
+> **The schedule is only as durable as Redis.** The sorted set survives an application restart
+> because it is not in the JVM — but it does not survive Redis losing the key, and the
+> `docker-compose.yml` here configures no persistence at all.
 
 > **At-least-once, not exactly-once.** A job can execute more than once: after a genuine crash, and
 > also whenever an execution outlasts `claim-min-idle-ms`, because Redis cannot distinguish a slow
@@ -1015,26 +1538,38 @@ v0.4 orphan problem, and pending-entry recovery is exactly the fix. But it is bo
 `claim-min-idle-ms` plus the sweep interval, and it needs *another* instance to be running: a
 single-instance deployment recovers only when it is restarted.
 
-A job due at time T is picked up at up to T + `poll-interval-ms`. Backoff delays are
-therefore a floor, not an exact schedule.
+A job due at time T is picked up at up to T + `poll-interval-ms` — for retries and for
+user-scheduled jobs alike. Backoff delays and requested execution times are both a floor, not an
+exact schedule.
 
 There is still one worker thread per process. Two instances give two concurrent jobs, not two
 threads in one.
 
+The scheduled-job promoter runs in **every** instance. That is safe — the Lua script's `ZREM`
+decides ownership, so a member cannot be promoted twice — but it is not leader-elected, and every
+instance therefore pays for a `ZRANGEBYSCORE` per tick.
+
 ## Not implemented yet
 
-Deliberately out of scope for v0.5:
+Deliberately out of scope for v0.6:
 
-- Reconciliation for the three dual writes, stream retention, and worker leases (**v0.5.1** — see
+- Reconciliation for the four dual writes, stream retention, and worker leases (**v0.5.1** — see
   *Planned for v0.5.1* in `NOTES.md`)
-- User-scheduled future jobs via `scheduled_at` (v0.6)
+- Cancelling a scheduled job, rescheduling it, or editing `scheduledAt` after submission
+- Recurring jobs and cron expressions
+- Calendar-aware or timezone-aware scheduling (v0.6 stores normalised UTC instants only)
+- Bulk scheduling, and scheduled DLQ replay
 - Idempotency keys, exactly-once side-effect protection, and a separate multi-worker service (v0.7)
 - WebSockets and a live dashboard (v0.8)
 - Bulk DLQ replay, automatic replay, and any retention policy for `dead_letters`
 - Re-prioritising a submitted job
 - Job cancellation
+- Distributed leader election for the schedulers
 - Kubernetes deployment and horizontal autoscaling
 
-The delayed sorted set is the mechanism v0.6 needs; scheduling an arbitrary future job is a small
-addition to `scheduleAt`, but that capability is not exposed now.
+v0.5 predicted that user scheduling would be "a small addition to `scheduleAt`". It was not. The
+mechanism was indeed already there — the same Lua promotion, reused verbatim — but reusing the
+*key* would have conflated retry state with user intent, and the real work turned out to be the
+status, the timestamp parsing and the worker's behaviour on an entry that arrives early. See
+*What v0.6 changed about the plan* in `NOTES.md`.
 

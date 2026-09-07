@@ -15,6 +15,12 @@ public enum EnqueueSource {
     /** Promoted out of the delayed sorted set by the retry sweep. */
     RETRY,
 
+    /**
+     * Promoted out of the scheduled sorted set because the execution time the submitter asked for
+     * has arrived. The job's first run, not a retry — see NOTES.md for why the two are separate.
+     */
+    SCHEDULED,
+
     /** POST /api/jobs/{id}/retry, replaying a dead-lettered job. */
     REPLAY,
 

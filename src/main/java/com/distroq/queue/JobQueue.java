@@ -8,15 +8,11 @@ import org.springframework.data.redis.connection.stream.PendingMessagesSummary;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.core.StreamOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
-import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -43,77 +39,24 @@ public class JobQueue {
 
     private static final Logger log = LoggerFactory.getLogger(JobQueue.class);
 
-    /** Separates the tier from the UUID in a delayed-set member: {@code HIGH:<uuid>}. */
-    private static final char TIER_SEPARATOR = ':';
-
-    /**
-     * Range + remove + XADD in one server-side round trip, so no ID can be promoted twice.
-     *
-     * <p>v0.5 change: the destination is a stream and the push is an {@code XADD} carrying the
-     * same four fields every other enqueue path writes. The member format is unchanged from v0.4
-     * — {@code <TIER>:<uuid>} — because it is still the only thing that lets the script pick a
-     * destination without a PostgreSQL lookup per promoted job.
-     *
-     * <p>KEYS[1] is the delayed set and KEYS[2..] the tier streams in {@link Priority} declaration
-     * order. ARGV[3..] are the matching tier names, then the default tier name, then the source
-     * label — so the script never builds a key name or an enum name itself. A member with no
-     * separator, or with one this application does not recognise, is treated as a bare UUID and
-     * goes to the default tier.
-     *
-     * <p>{@code XADD *} inside a script is safe on Redis 5+: scripts replicate by their effects,
-     * so a replica receives the ID the primary generated rather than generating its own.
-     */
-    private static final String PROMOTE_LUA = """
-            local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
-            local tiers = #KEYS - 1
-            local dest = {}
-            for i = 1, tiers do
-              dest[ARGV[i + 2]] = KEYS[i + 1]
-            end
-            local fallbackTier = ARGV[tiers + 3]
-            local source = ARGV[tiers + 4]
-            local moved = 0
-            for i = 1, #due do
-              local member = due[i]
-              if redis.call('ZREM', KEYS[1], member) == 1 then
-                local sep = string.find(member, ':', 1, true)
-                local id = member
-                local tier = fallbackTier
-                if sep then
-                  local parsed = string.sub(member, 1, sep - 1)
-                  if dest[parsed] then
-                    tier = parsed
-                    id = string.sub(member, sep + 1)
-                  end
-                end
-                redis.call('XADD', dest[tier], '*',
-                  'jobId', id,
-                  'priority', tier,
-                  'enqueuedAt', ARGV[1],
-                  'source', source)
-                moved = moved + 1
-              end
-            end
-            return moved
-            """;
-
     private final StringRedisTemplate redis;
     private final StreamKeys streamKeys;
     private final LettuceStreamCommands lettuce;
+    private final DueSetPromoter promoter;
     private final String delayedKey;
     private final String groupName;
-    private final RedisScript<Long> promoteScript;
 
     public JobQueue(StringRedisTemplate redis,
                     StreamKeys streamKeys,
                     LettuceStreamCommands lettuce,
+                    DueSetPromoter promoter,
                     DistroqProperties properties) {
         this.redis = redis;
         this.streamKeys = streamKeys;
         this.lettuce = lettuce;
+        this.promoter = promoter;
         this.delayedKey = properties.delayedKey();
         this.groupName = properties.streams().groupName();
-        this.promoteScript = new DefaultRedisScript<>(PROMOTE_LUA, Long.class);
     }
 
     /**
@@ -145,7 +88,7 @@ public class JobQueue {
      * competing retry.
      */
     public void scheduleAt(UUID jobId, Priority priority, Instant dueAt) {
-        redis.opsForZSet().add(delayedKey, member(jobId, priority), dueAt.toEpochMilli());
+        redis.opsForZSet().add(delayedKey, SortedSetMember.encode(jobId, priority), dueAt.toEpochMilli());
         log.debug("Scheduled job {} ({}) on {} for {}", jobId, priority, delayedKey, dueAt);
     }
 
@@ -155,19 +98,7 @@ public class JobQueue {
      * @return how many were moved
      */
     public int promoteDueJobs(Instant now, int limit) {
-        List<String> keys = new ArrayList<>();
-        keys.add(delayedKey);
-        keys.addAll(streamKeys.all());
-
-        List<String> args = new ArrayList<>();
-        args.add(Long.toString(now.toEpochMilli()));
-        args.add(Integer.toString(limit));
-        Priority.STRICT_ORDER.forEach(priority -> args.add(priority.name()));
-        args.add(Priority.DEFAULT.name());
-        args.add(EnqueueSource.RETRY.name());
-
-        Long moved = redis.execute(promoteScript, keys, args.toArray());
-        return moved == null ? 0 : moved.intValue();
+        return promoter.promote(delayedKey, now, limit, EnqueueSource.RETRY);
     }
 
     public long delayedDepth() {
@@ -242,9 +173,5 @@ public class JobQueue {
 
     private StreamOperations<String, String, String> streamOps() {
         return redis.opsForStream();
-    }
-
-    private String member(UUID jobId, Priority priority) {
-        return Priority.orDefault(priority).name() + TIER_SEPARATOR + jobId;
     }
 }

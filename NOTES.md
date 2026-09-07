@@ -287,6 +287,34 @@ work picked up by another instance. The caveats:
   worker whose job outlasts `claim-min-idle-ms`. Detection is now possible; distinguishing "slow"
   from "dead" still is not.
 
+### 6. User scheduling adds a fourth instance of limitation 1, and does not fix the first three
+
+`JobController.submit` with a future `scheduledAt` does the same two writes to the same two
+systems as §1, with a different Redis command on the far side:
+
+```java
+Job job = jobRepository.save(Job.create(type, payload, maxAttempts, priority, scheduledAt));
+scheduledJobQueue.schedule(job.getId(), job.getPriority(), scheduledAt);
+```
+
+A crash between them leaves a `SCHEDULED` row with no sorted-set member. Nothing will ever promote
+it, and — exactly as in §1 — it fails in a shape that looks correct: the client has its `202`,
+`GET /api/jobs/{id}` says `SCHEDULED`, and it sits alongside jobs that genuinely are waiting for a
+time that will arrive. The only thing distinguishing the two is that one of them has a member in
+`distroq:jobs:scheduled` and the other does not, and nothing checks.
+
+It is arguably *worse* to notice than §1, because a `QUEUED` job that never runs is anomalous
+within seconds, whereas a `SCHEDULED` job that never runs looks entirely normal until its
+requested time passes. That gives reconciliation a much better signal to work with, though:
+"`SCHEDULED` rows whose `scheduled_at` is comfortably in the past" is a cheap indexed query —
+which is part of why V5 indexes `scheduled_at` at all — and it is a stronger predicate than
+anything available for the other three windows.
+
+What scheduling explicitly does **not** do is narrow §1, §2 or the DLQ replay window by any
+amount. The promotion Lua script is atomic within Redis, and only within Redis; the job's row was
+committed by a different write at a different time, and either side can fail without the other.
+The three known windows remain three known windows, and there are now four.
+
 ## Design decisions
 
 **Why v0.4 was built on a mechanism v0.5 will delete, on purpose.** v0.5 replaces the Redis list
@@ -1304,6 +1332,214 @@ those. It is the one liveness question that *can* be answered locally, and answe
 set lookup. Across processes the question remains unanswerable, which is what §3 says about idle
 time not being death.
 
+## What v0.6 changed about the plan
+
+The v0.5 README predicted that user scheduling would be "a small addition to `scheduleAt`". The
+*mechanism* was indeed already there — the promotion Lua script is reused verbatim, with a
+different key and a different label — but almost none of the actual work turned out to be the
+mechanism. It was the status, the timestamp, and what a worker should do with an entry that
+arrives before its time.
+
+### 1. Why `SCHEDULED` is separate from `RETRYING`
+
+They are both "waiting", and that is the only thing they have in common.
+
+`RETRYING` means *an attempt failed and another is pending*. It carries an `errorMessage`, an
+`attemptCount` above zero, a `nextAttemptAt` computed by the backoff policy, and at least one row
+in `job_attempts`. It is a failure signal, and it is read as one: every "how much is failing right
+now" question in this system goes through it.
+
+`SCHEDULED` means *the submitter asked for a time that has not arrived*. It carries no error, zero
+attempts, no attempt rows, and a timestamp that came from the request rather than from a policy.
+Nothing has gone wrong.
+
+Reusing `RETRYING` would have made "jobs currently failing" include jobs that have never run.
+Reusing `QUEUED` would have been the other mistake: `queueDepth` is read as *backlog*, and a job
+due next Tuesday is not backlog — no worker could run it if every worker in the fleet were idle.
+An autoscaler watching `queueDepth` would start capacity for work that is not due.
+
+The transition is also one-way, which is what makes the status honest. A job leaves `SCHEDULED`
+exactly once, on its first promotion, and cannot return: `markQueuedFromSchedule()` throws for any
+other status, so no duplicate delivery, no retry and no replay can walk a job that has already run
+back into the scheduling path.
+
+### 2. Why user scheduling uses a separate Sorted Set
+
+`distroq:jobs:delayed` already existed, already held `<TIER>:<uuid>` members scored by epoch
+millis, and was already swept by an atomic promotion script. Putting scheduled jobs in it was one
+line. It was still the wrong answer.
+
+- **The two mean different things.** One holds automatic retry state produced by the backoff
+  policy; the other holds a user's stated intent. A key that holds both can answer neither
+  question.
+- **The metrics would have merged.** `delayedDepth` is "how many retries are backing off" — a
+  health signal. Folding in user-scheduled work would make it fire because someone scheduled a
+  report for midnight.
+- **The write semantics differ, and they conflict.** The retry set wants plain `ZADD`: a newly
+  computed backoff *should* overwrite the old score, and that idempotency is what stops a
+  redelivered entry producing a second competing retry. The scheduled set wants `ZADD NX`:
+  rescheduling is out of scope, so the only thing that can produce a second `ZADD` is a repeat of
+  an already-accepted request, and silently moving that job's execution time is worse than doing
+  nothing. One key cannot have both.
+- **They should evolve independently.** Retry promotion and scheduled promotion happen to be
+  identical today. Retry promotion will change when leases arrive; scheduled promotion will change
+  if recurring jobs ever do. Coupling them now means one cannot move without the other.
+
+What *is* shared is the code: `DueSetPromoter` holds the Lua once and both callers pass their own
+key and `source`. Sharing the implementation while separating the data is the right split — the
+alternative was thirty lines of duplicated Lua, and the worst outcome for duplicated Lua is a copy
+that has quietly drifted.
+
+### 3. Why timestamps are `Instant`
+
+There were four candidate readings of "run this at 15:30" and three of them are ambiguous:
+`LocalDateTime` (a calendar position with no idea which calendar), the JVM default zone (a
+property of whichever machine started the process), and the PostgreSQL server zone (a fourth
+answer again). None of the three is visible in the response, so a system that picked one would
+give different answers on different hosts and look identical from outside.
+
+Requiring an explicit offset moves the ambiguity to the request, where it can be *rejected*.
+`DateTimeFormatter.ISO_OFFSET_DATE_TIME` is the entire validation rule: it accepts `Z` and any
+numeric offset and fails on a value carrying neither, which is why `2026-09-07T15:30:00` is a 400
+rather than a silent reading in the server's zone. The offset is then applied and discarded —
+`17:30:00+02:00` and `15:30:00Z` become the same `Instant`, the same `timestamptz`, the same
+sorted-set score and the same response.
+
+This is checked rather than assumed. The verification run below has a JVM default of `India
+Standard Time` against a PostgreSQL server set to `UTC` — two different wrong answers available —
+and all three spellings of the same instant produce byte-identical stored values.
+
+The DTO field is a `String` for the same reason `priority` is, and a stronger one. Bound as an
+`Instant`, Jackson accepts `2026-09-07T15:30:00Z` and *rejects* `2026-09-07T17:30:00+02:00` — a
+perfectly valid ISO-8601 instant — with a deserialization error the controller never sees and the
+caller cannot act on.
+
+Blank is rejected rather than treated as absent. Omitting the field already means "now"; there is
+no second thing an empty string could mean, and accepting it would create two spellings of one
+request for no benefit.
+
+### 4. Why past timestamps execute immediately
+
+`scheduledAt <= now` is not an error. It is a request that is already due — a client computing a
+target time, a retried HTTP call, a queue of submissions that took longer to drain than expected.
+Rejecting it would make every caller do clock arithmetic before submitting.
+
+The alternative implementation — put it in the sorted set anyway and let the next sweep promote it
+— is simpler by one branch and costs up to a full poll interval of latency for nothing. So a past
+or equal timestamp persists as `QUEUED` and goes straight to its stream with `source=SUBMIT`,
+never touching the scheduled set.
+
+The requested value is still stored. It is what the submitter asked for, and a job whose
+`scheduledAt` is an hour before its `createdAt` is genuinely useful information about a client
+that is behind.
+
+### 5. Scheduling precision
+
+The requested time is a floor, not a guarantee. Actual start time is pushed out by:
+
+- **the poll interval** — the dominant term, and the only one configurable here. A job is promoted
+  on the first tick at or after its due time, so the mean contribution is half of
+  `distroq.scheduling.poll-interval-ms` and the worst case is all of it
+- Redis latency for `ZRANGEBYSCORE` + `ZREM` + `XADD`
+- stream delivery — the worker's next `XREADGROUP` has to come round, and on an idle queue that is
+  a blocking read with its own timeout
+- worker availability — one worker thread per process
+- higher-priority work — a HIGH backlog is served before a promoted LOW job, by design
+
+Measured with the default 1s interval: 518 ms from requested time to `startedAt` on an idle queue,
+624 ms for a job promoted right after a restart. Both well inside one poll interval, and neither
+is a number to build a real-time system on.
+
+Lowering the interval is cheap — one `ZRANGEBYSCORE` per tick against a set that is usually empty
+— but it only shrinks the first term. The rest are properties of the delivery path.
+
+### 6. Restart durability
+
+The whole reason this is a Redis sorted set and a poller rather than a `ScheduledExecutorService`.
+An in-memory schedule dies with the process; a sorted-set member does not. There is no
+`Thread.sleep` anywhere on this path and nothing about a job's due time is held in the JVM, so
+"restart the app" and "the app crashed" are the same event as far as a scheduled job is concerned.
+
+Verified with a hard kill rather than a graceful stop, which matters: a graceful stop would let a
+shutdown hook do something, and the claim is that nothing needs to.
+
+What this does not survive is Redis losing the key. The durability is exactly Redis' durability,
+and the `docker-compose.yml` here configures none.
+
+### 7. Promotion atomicity
+
+The Lua script removes the member and writes the stream entry in one server-side round trip, so no
+member can be promoted twice even with several instances sweeping concurrently. The `ZREM` return
+value is what decides ownership: only the caller whose `ZREM` returned 1 writes the `XADD`. That
+is also why the promoter needs no leader election — running it in every instance is safe, it just
+costs each of them a `ZRANGEBYSCORE` per tick.
+
+Two constraints on the script, both deliberate:
+
+- **Every Redis key arrives through `KEYS`.** The script never concatenates a key name. That keeps
+  it correct under Redis Cluster and, more usefully here, means the tier-to-key mapping has
+  exactly one definition (`StreamKeys`) instead of one in Java and one in Lua that can drift.
+- **It never touches PostgreSQL, and cannot.** So the job's row still says `SCHEDULED` at the
+  moment its entry is already on a stream. That intermediate state is normal, not a failure, and
+  the worker resolves it.
+
+`XADD *` inside a script is safe on Redis 5+: scripts replicate by effects, so a replica receives
+the ID the primary generated.
+
+### 8. The remaining dual-write problem
+
+Scheduling does not fix the PostgreSQL-to-Redis gap. It adds a fourth instance of it:
+
+```text
+save job as SCHEDULED
+then ZADD scheduled member
+```
+
+A crash between those leaves a stuck `SCHEDULED` row that nothing will ever promote. See *Known
+limitations* §6. The three windows from v0.1–v0.3 are untouched, and nothing in v0.6 should be
+read as narrowing them.
+
+### 9. The scheduled retry distinction
+
+`scheduledAt` and `nextAttemptAt` are two fields because they answer two questions, and
+overloading one would destroy the other's answer the first time a scheduled job failed.
+
+`scheduledAt` is historical metadata: written once at submission, never cleared, never modified by
+promotion, retry, dead-lettering or replay. `nextAttemptAt` is working state: written by the
+backoff policy, cleared by `markRunning()`, meaningless outside `RETRYING`.
+
+A scheduled job that has failed once carries both, and both are correct. Merging them would mean
+that after the first failure there is no longer any record of when the job was asked to run — and
+"why did this run at 03:12 when I asked for 15:30" is exactly the question you want answerable
+after an incident.
+
+### 10. Replay semantics
+
+Replay is immediate, even for a job whose original `scheduledAt` was in the future.
+
+`scheduledAt` describes the original execution request. Replaying a dead-lettered job is a new
+operator action, taken now, by someone looking at a failure — and re-honouring the original
+timestamp would do one of two useless things: run immediately anyway, because the time has passed,
+or strand a deliberate human intervention until a time nobody asked about. The original value
+stays on the row as history and is visible in both the job detail and the DLQ responses, so the
+operator can see that this job was meant to run at a particular time and will not this time.
+
+Replay therefore creates no scheduled sorted-set member. It writes a `source=REPLAY` entry onto
+the job's own priority stream, unchanged from v0.5.
+
+### 11. No rescheduling
+
+`scheduledAt` and `priority` are both immutable after submission, for the same reason and with the
+same honesty about it: changing either would mean updating a PostgreSQL row and a Redis structure
+that are not written atomically together, in a system that already documents four unrepaired
+instances of exactly that failure.
+
+Rescheduling is not `ZADD XX` plus an `UPDATE`. It needs an answer to what happens when the row
+moves and the score does not, when a job is rescheduled while its promotion script is mid-flight,
+and when a job is rescheduled after it has already been promoted but before a worker has picked it
+up. Those are a consistency design, not a feature, and adding them casually would put a fifth
+window into a version whose main claim is that it added no new categories of problem.
+
 ## Planned for v0.5.1 — reliability
 
 Five things v0.5 either left untouched or newly exposed. None is a v0.6 feature; all of them are
@@ -1637,6 +1873,175 @@ started normally.
 v0.1 because it needs live infrastructure. `PriorityStrategyTest` passes unchanged, which is the
 concrete return on having kept the scheduling policy free of any queue mechanism: the entire
 delivery layer underneath it was replaced and its twelve tests did not move.
+
+## Verified in v0.6
+
+**V5 applied to a populated database with no data loss and no checksum error.** Fourteen rows in
+`jobs` before, fourteen after. Flyway logged `Migrating schema "public" to version "5 - scheduled
+jobs"` then `Successfully applied 1 migration ... now at version v5 (execution time 00:00.079s)`,
+and `flyway_schema_history` lists V1–V5 all `success = t`. `scheduled_at` came out as
+`timestamp with time zone`, nullable, with `idx_jobs_scheduled_at` present. Hibernate's
+`ddl-auto: validate` then accepted the entity, which is the actual check: a plain `timestamp`
+would have failed startup here rather than silently storing local time.
+
+**A future job waited, then ran once, on time.** Submitted 10 seconds out at HIGH:
+
+```
+status            SCHEDULED
+scheduledAt       2026-09-07T17:57:52Z
+ZRANGE            HIGH:89baf9bc-...  1788803872000
+XLEN high         4 (unchanged)
+scheduledDepth    1
+```
+
+Nine polls of `SCHEDULED`, then `RUNNING`, then `SUCCEEDED`. `startedAt` 2026-09-07T17:57:52.517Z
+against a requested 17:57:52.000Z — **518 ms**, inside one poll interval. `attemptCount` 1, one
+`job_attempts` row, `scheduledAt` still present after success, the sorted-set member gone, `XLEN`
+4 → 5, `XPENDING` back to 0. The promoted entry:
+
+```
+jobId       89baf9bc-3a13-4cb6-95b6-fa4d62b1fdd4
+priority    HIGH
+enqueuedAt  1788803872497
+source      SCHEDULED
+```
+
+**Three spellings of one instant are indistinguishable afterwards.** `2027-03-01T15:30:00Z`,
+`2027-03-01T17:30:00+02:00` and `2027-03-01T10:30:00-05:00` submitted as three separate jobs:
+
+```
+API           2027-03-01T15:30:00Z          (all three)
+PostgreSQL    2027-03-01 15:30:00+00        (all three)
+epoch_ms      1803915000000                 (all three)
+ZSCORE        1803915000000                 (all three)
+```
+
+With `[System.TimeZoneInfo]::Local.Id` = `India Standard Time` and PostgreSQL `SHOW timezone` =
+`UTC`. Two different wrong answers were available and neither appeared.
+
+**Every invalid timestamp is a 400 that names the field, and creates nothing.** `""`,
+`not-a-date`, `2026-09-07 15:30:00`, `2026-09-07T15:30:00`, `2026-13-01T00:00:00Z` and
+`1788715215167` all rejected. `totalJobs` and `ZCARD` on the scheduled set identical before and
+after. The offsetless case is the one that matters:
+
+```json
+{"status":400,"message":"scheduledAt must be an ISO-8601 timestamp with an explicit UTC offset, e.g. 2026-09-07T15:30:00Z or 2026-09-07T17:30:00+02:00, got '2026-09-07T15:30:00'"}
+```
+
+`curl.exe` rather than `Invoke-RestMethod` for these: Windows PowerShell 5.1 throws away the
+response body of a non-2xx, so the message under test is exactly the thing the obvious tooling
+hides. Same class of mistake as the shutdown-log truncation in v0.5.
+
+**A past timestamp went straight to the stream.** Submitted five minutes in the past: `QUEUED` in
+the POST response, `SUCCEEDED` two seconds later, `ZRANGE` on the scheduled set never contained
+it, and the entry carried `source=SUBMIT` — not `SCHEDULED`. `scheduledAt` still on the row at
+`2026-09-07T17:53:37Z`, five minutes before its own `createdAt`.
+
+**Priority routing held through promotion.** Future HIGH, NORMAL and LOW with one common target
+time. All nine stream/tier combinations checked, not just the three expected ones:
+
+```
+HIGH   on high True   normal False  low False
+NORMAL on high False  normal True   low False
+LOW    on high False  normal False  low True
+```
+
+Every promoted entry carried `source=SCHEDULED`, and PostgreSQL agreed with the stream on all
+three.
+
+**Metrics separated scheduled work from everything else.** During the waiting window, with six
+jobs scheduled and nothing else happening:
+
+```json
+"delayedDepth": 0,
+"scheduledDepth": 6,
+"scheduledDepthByPriority": { "HIGH": 1, "NORMAL": 1, "LOW": 4 },
+"queueDepth": 0,
+"pendingEntriesByPriority": { "HIGH": 0, "NORMAL": 0, "LOW": 0 }
+```
+
+At the target time `scheduledDepth` fell 6 → 3, the three stream depths each rose by one, and
+`pendingEntriesByPriority` was caught mid-promotion at `{HIGH:0, NORMAL:1, LOW:1}` before
+returning to all zeros. `queueDepth` stayed 0 throughout — which is the point: none of that work
+was ever backlog.
+
+**A scheduled job survived a hard kill.** Submitted 35 seconds out at HIGH, then
+`Stop-Process -Force` on the application only — process confirmed gone, port 8080 refusing
+connections, Redis `PONG` and PostgreSQL `accepting connections` both confirmed still up. With the
+application dead, `ZSCORE distroq:jobs:scheduled HIGH:3f8dea6a-...` still returned `1788804453000`
+and the row still read `SCHEDULED`. Restarted at 18:07:19, promoted at 18:07:33.624 against a
+requested 18:07:33 — **624 ms**. One attempt row, exactly one occurrence on the high stream, no
+duplicate member, and the attempt is attributed to `worker-867545fa` where the pre-kill process
+was `worker-c6f81df4`, so it demonstrably ran in the new process.
+
+**A scheduled job retried like any other.** `fail_n_times` payload 2, `maxAttempts` 5, scheduled 6
+seconds out. Observed sequence `SCHEDULED -> RETRYING -> SUCCEEDED`, `attemptCount` 3, attempt
+history FAILURE / FAILURE / SUCCESS. The three stream entries:
+
+```
+enqueuedAt 1788804526648  source SCHEDULED
+enqueuedAt 1788804528679  source RETRY
+enqueuedAt 1788804531702  source RETRY
+```
+
+All on `distroq:jobs:stream:high`. The retry members were in `distroq:jobs:delayed`, never in the
+scheduled set. `scheduledAt` stayed `2026-09-07T18:08:46Z` throughout while `nextAttemptAt` moved
+18:08:47.854 → 18:08:50.758 → null. The job never returned to `SCHEDULED`.
+
+**A scheduled job reached the DLQ and replayed immediately.** `always_fail`, LOW,
+`maxAttempts` 2, scheduled 6 seconds out. `SCHEDULED -> RETRYING -> DEAD_LETTERED`, two FAILURE
+attempts, no scheduled member and no delayed member left. Both DLQ responses carried the original
+`scheduledAt` alongside `priority: LOW`.
+
+The replay then went out at 18:10:16.887 with `replayedAt` 18:10:16.882 and attempt 3 starting at
+18:10:16.894 — **12 ms** from operator action to execution, with `source=REPLAY` on the LOW stream
+and `ZSCORE` on the scheduled set empty immediately afterwards and again five seconds later. Four
+entries on the low stream for that job, in order: `SCHEDULED`, `RETRY`, `REPLAY`, `RETRY`. Nothing
+on the other two streams.
+
+**Filtering works on the new status.** With seven jobs waiting, `?status=SCHEDULED` returned 7,
+`&priority=HIGH` returned 2, `NORMAL` 2 and `LOW` 3. Every row carried a non-null `scheduledAt`.
+`?status=SUCCEEDED` returned 24, of which the pre-v0.6 rows show `scheduledAt` null — the column
+was not backfilled, which is the correct reading of a job submitted before scheduling existed.
+
+**v0.1–v0.5 behaviour is unchanged, checked against the running system.** Immediate `sleep`
+succeeded in 825 ms; `fail_n_times` recovered on attempt 3 with FAILURE/FAILURE/SUCCESS;
+`always_fail` reached the DLQ and replayed with `replayCount` 0 → 1; replaying a `SUCCEEDED` job
+was still a 409 naming the status; immediate HIGH/NORMAL/LOW each landed on exactly one stream;
+all four legacy list keys were `type=none`; and three invalid timestamps left `totalJobs` at 42.
+
+**`XAUTOCLAIM` recovery still works, reconstructed rather than raced for.** With the application
+stopped, two entries were handed to a consumer named `ghost-worker` that does not exist. On
+restart the sweep took them after 10999 ms idle, logged both owners, recognised the job as already
+`SUCCEEDED` and acknowledged without executing. Pending went 2 → 0 and `attemptCount` stayed 1:
+
+```
+XAUTOCLAIM on distroq:jobs:stream:normal took 2 idle entr(ies) for worker-94773c47
+Reclaimed entry 1788804770403-0 ... previous owner ghost-worker, new owner worker-94773c47, idle 10999ms
+Stale delivery 1788804770403-0 ... already SUCCEEDED, acknowledging without executing
+```
+
+**The legacy list migration still runs.** A real job ID seeded into `distroq:jobs:pending:normal`
+while the app was down was migrated on startup with `source=LEGACY_MIGRATION`, the list drained to
+`llen=0`, and the entry was delivered and dismissed as stale.
+
+**Graceful shutdown is still clean with a third sweep running.** Ctrl+C sent as a real
+`CTRL_C_EVENT` — again, because `Stop-Process` and `taskkill` without `/F` do not produce one and
+would pass for the wrong reason — with a 4-second HIGH job in flight. Tomcat drained, the worker
+logged `Worker worker-867545fa shutting down`, the in-flight job completed and was persisted
+*after* the shutdown hook started, Hikari closed. Zero stack frames and zero ERROR lines in the
+last 120 log lines, and nothing from the retry sweep, the scheduled-job sweep or the recovery
+sweep. The `ContextClosedEvent` pattern from v0.1 extended to `ScheduledJobPromoter` unchanged.
+
+**169 tests, one skipped**, up from 99 in v0.5. Same skip, same reason. Every v0.5 test passes
+untouched except `WorkerDeliveryTest`, which gained cases rather than changing any.
+
+**One test-only discovery worth recording.** Mockito's `any()` in a varargs position matches
+exactly one argument, not "any number of arguments" — so verifying
+`redis.execute(script, keys, args...)` with `any()` silently failed to match a seven-argument
+call and reported an argument mismatch that looked like a production bug. `any(Object[].class)`
+matches the whole varargs array and captures it as one. Five red tests that were entirely the
+test's fault.
 
 ## Resolved issues
 

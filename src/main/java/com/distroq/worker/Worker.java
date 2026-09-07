@@ -187,10 +187,50 @@ public class Worker implements DeliveryHandler {
 
         switch (job.getStatus()) {
             case SUCCEEDED, DEAD_LETTERED, FAILED -> acknowledgeStale(job, delivery);
+            case SCHEDULED -> handleScheduled(job, delivery);
             case RETRYING -> handleRetrying(job, delivery);
             case RUNNING -> reclaimAndExecute(job, delivery);
             case QUEUED -> execute(job, delivery);
         }
+    }
+
+    /**
+     * A user-scheduled job whose entry has arrived. Normally this means the promoter moved it
+     * because its time came, and the only thing left to do is run it.
+     *
+     * <p>The timestamp is checked again here rather than trusted. The promotion decided due-ness
+     * from a sorted-set score, and PostgreSQL holds the value the submitter actually asked for; if
+     * those disagree the database wins, exactly as it does for priority. An entry that is early is
+     * therefore not executed.
+     *
+     * <p>An early entry is left <em>pending</em>: not executed, not acknowledged, no attempt row,
+     * no state change, and above all not re-scheduled — a second {@code ZADD} for a member that
+     * may still be in the set is how one job becomes two entries. Doing nothing is safe because
+     * the entry is already in the group's Pending Entries List, so {@code XAUTOCLAIM} redelivers
+     * it after {@code claim-min-idle-ms} and it is re-evaluated then. The cost is one reclaim
+     * cycle of latency and a WARN per attempt, which is the right trade for a case that should
+     * only ever be reachable through clock skew or a hand-written ZADD.
+     */
+    private void handleScheduled(Job job, StreamDelivery delivery) {
+        Instant dueAt = job.getScheduledAt();
+        // a SCHEDULED row with no scheduledAt cannot have been written by this application; treat
+        // it as due rather than leaving it to churn in the pending list forever
+        if (dueAt != null && dueAt.isAfter(Instant.now())) {
+            log.warn("Delivery {} for job {} arrived {}ms before its scheduled time {}; leaving it "
+                            + "pending for redelivery rather than running early",
+                    delivery.entryId(), job.getId(),
+                    Duration.between(Instant.now(), dueAt).toMillis(), dueAt);
+            return;
+        }
+        log.info("Job {} reached its scheduled time {} (entry {}, source {}); queuing for its "
+                        + "first attempt",
+                job.getId(), dueAt, delivery.entryId(), delivery.source());
+        // SCHEDULED -> QUEUED is committed before the attempt starts, so a crash in between leaves
+        // a runnable job rather than one still claiming to be waiting for a time that has passed.
+        // Not an attempt: no attempt row, no attemptCount change, and scheduledAt is kept
+        job.markQueuedFromSchedule();
+        jobRepository.save(job);
+        execute(job, delivery);
     }
 
     /**

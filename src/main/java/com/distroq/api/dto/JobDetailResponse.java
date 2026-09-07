@@ -25,6 +25,12 @@ public record JobDetailResponse(
         Instant startedAt,
         Instant finishedAt,
         Instant nextAttemptAt,
+        /**
+         * The execution time originally requested, or null. Sits alongside {@code nextAttemptAt}
+         * rather than replacing it: this is what was asked for, that is when the next automatic
+         * retry is due, and a scheduled job that has failed once has both.
+         */
+        Instant scheduledAt,
         Long durationMs,
         List<AttemptResponse> attempts) {
 
@@ -48,6 +54,7 @@ public record JobDetailResponse(
                 startedAt,
                 finishedAt,
                 job.getNextAttemptAt(),
+                job.getScheduledAt(),
                 durationMs,
                 attempts.stream().map(AttemptResponse::from).toList());
     }

@@ -1,6 +1,12 @@
 package com.distroq.model;
 
 public enum JobStatus {
+    /**
+     * Waiting for a user-requested execution time that has not arrived yet, in the scheduled
+     * sorted set. Distinct from {@link #RETRYING} on purpose: this job has never run, so counting
+     * it as backlog or as a failure would both be wrong. See NOTES.md.
+     */
+    SCHEDULED,
     QUEUED,
     RUNNING,
     /** Failed with attempts remaining; waiting in the delayed set for its backoff window. */
