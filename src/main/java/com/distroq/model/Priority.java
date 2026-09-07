@@ -14,6 +14,9 @@ import java.util.stream.Collectors;
  * fixed set of tiers maps onto one list per tier and keeps both. See NOTES.md for what this
  * cannot express.
  *
+ * <p>v0.5 replaced the lists with Streams and the argument survived intact: a stream is also
+ * append-ordered with no priority of its own, so the tiers are still one key each.
+ *
  * <p>Declaration order is significant: it is the strict scheduling order, highest first.
  */
 public enum Priority {
@@ -53,7 +56,10 @@ public enum Priority {
         return Arrays.stream(values()).map(Enum::name).collect(Collectors.joining(", "));
     }
 
-    /** Redis key suffix for this tier, e.g. {@code distroq:jobs:pending} + {@code :high}. */
+    /**
+     * Redis key suffix for this tier, e.g. {@code distroq:jobs:stream} + {@code :high}. Also the
+     * suffix the one-time v0.4 list migration looks for on {@code distroq:jobs:pending}.
+     */
     public String keySuffix() {
         return name().toLowerCase();
     }

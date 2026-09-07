@@ -7,6 +7,7 @@ import com.distroq.config.DistroqProperties;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
+import com.distroq.queue.EnqueueSource;
 import com.distroq.queue.JobQueue;
 import com.distroq.repository.DeadLetterRepository;
 import com.distroq.repository.JobAttemptRepository;
@@ -61,9 +62,11 @@ public class JobController {
         Priority priority = resolvePriority(request.priority());
         Job job = jobRepository.save(
                 Job.create(request.type(), request.payload(), maxAttempts, priority));
-        jobQueue.enqueue(job.getId(), job.getPriority());
-        log.info("Job {} ({}) QUEUED at {} with maxAttempts {}",
-                job.getId(), job.getType(), job.getPriority(), maxAttempts);
+        // first of the three dual writes: the row is committed, the XADD is a separate system and
+        // can still fail on its own. Streams did not change that - see NOTES.md
+        String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.SUBMIT);
+        log.info("Job {} ({}) QUEUED at {} with maxAttempts {} as stream entry {}",
+                job.getId(), job.getType(), job.getPriority(), maxAttempts, entryId);
         return ResponseEntity.accepted().body(JobResponse.from(job));
     }
 
@@ -138,28 +141,50 @@ public class JobController {
             deadLetterRepository.save(deadLetter);
         });
 
-        // straight onto the pending list: replay is an explicit human action, so making the
+        // straight onto the tier's stream: replay is an explicit human action, so making the
         // operator wait out a backoff window they did not ask for would be surprising.
         // The job's own tier, not the default - a LOW job replayed as NORMAL would jump ahead of
         // work it was deliberately ranked behind, and a HIGH one would silently lose its rank.
-        jobQueue.enqueue(job.getId(), job.getPriority());
-        log.info("Job {} ({}) replayed from the DLQ, attemptCount {} preserved, maxAttempts {} -> {}",
-                job.getId(), job.getPriority(), job.getAttemptCount(), previousMaxAttempts,
+        // Third of the three dual writes; the window is unchanged from v0.4.
+        String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.REPLAY);
+        log.info("Job {} ({}) replayed from the DLQ as stream entry {}, attemptCount {} preserved, "
+                        + "maxAttempts {} -> {}",
+                job.getId(), job.getPriority(), entryId, job.getAttemptCount(), previousMaxAttempts,
                 job.getMaxAttempts());
         return ResponseEntity.accepted().body(JobResponse.from(job));
     }
 
+    /**
+     * Three different counts of "entries in a stream", because they answer three different
+     * questions and conflating them is the easiest mistake to make with Streams:
+     *
+     * <ul>
+     *   <li>{@code queueDepth} / {@code queueDepthByPriority} — waiting to be delivered. The
+     *       successor to v0.4's list depth, read from the consumer group's {@code lag}. Exact
+     *       while nothing is trimmed or deleted, and nothing in v0.5 trims or deletes.</li>
+     *   <li>{@code streamDepthByPriority} — {@code XLEN}. Everything the stream has ever held,
+     *       acknowledged or not. It only ever grows. It is not a backlog.</li>
+     *   <li>{@code pendingEntriesByPriority} — delivered and not yet acknowledged. In-flight work
+     *       plus anything abandoned and not yet reclaimed. Exact.</li>
+     * </ul>
+     *
+     * <p>{@code activeConsumers} counts consumers <em>holding</em> pending entries, not consumers
+     * registered in the group: an idle worker holds nothing and does not appear here.
+     */
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
-        // LinkedHashMap rather than Map.of: the key order is stable in the response, and there is
-        // now one entry past Map.of's ten-pair overload set
+        // LinkedHashMap rather than Map.of: the key order is stable in the response, and there are
+        // now well over Map.of's ten-pair overload set
         Map<String, Object> metrics = new LinkedHashMap<>();
-        metrics.put("queueDepth", jobQueue.depth());
-        metrics.put("queueDepthByPriority", jobQueue.depthByPriority());
+        metrics.put("queueDepth", jobQueue.readyDepth());
+        metrics.put("queueDepthByPriority", jobQueue.readyDepthByPriority());
         metrics.put("delayedDepth", jobQueue.delayedDepth());
         metrics.put("totalJobs", jobRepository.count());
         metrics.put("deadLetterCount", deadLetterRepository.countByReplayed(false));
         metrics.put("replayedCount", deadLetterRepository.countByReplayed(true));
+        metrics.put("streamDepthByPriority", jobQueue.streamDepthByPriority());
+        metrics.put("pendingEntriesByPriority", jobQueue.pendingEntriesByPriority());
+        metrics.put("activeConsumers", jobQueue.consumersHoldingEntries().size());
         return metrics;
     }
 }
