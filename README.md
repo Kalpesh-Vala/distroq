@@ -1,4 +1,216 @@
-# DistroQ v0.6
+# DistroQ v0.7
+
+v0.7 is the first reliability-focused release. PostgreSQL transactions now persist both business
+state and an immutable publication intent; an outbox relay publishes that intent to Redis with
+event-ID deduplication. Submission can be idempotent, one process can run multiple unique Redis
+consumers, and every execution must first obtain a renewable database lease.
+
+```text
+HTTP request
+    |
+PostgreSQL transaction: jobs + optional idempotency_keys + outbox_events
+    |
+Outbox relay: FOR UPDATE SKIP LOCKED + short lease
+    |
+Redis Stream or Sorted Set: atomic publish + event dedupe marker
+    |
+XREADGROUP / XAUTOCLAIM
+    |
+conditional PostgreSQL execution claim + heartbeat
+    |
+worker execution -> success / retry outbox event / DLQ
+```
+
+PostgreSQL remains the source of truth. Redis remains an at-least-once delivery mechanism.
+Neither the outbox nor the execution lease makes arbitrary external side effects exactly once.
+
+## What changed in v0.7
+
+### Transactional outbox
+
+The four former database-to-Redis windows now commit an `outbox_events` row in the same database
+transaction as their business state:
+
+| Business transition | Event type | Redis destination |
+| --- | --- | --- |
+| immediate submission | `ENQUEUE_SUBMIT` | priority Stream |
+| retryable failure | `SCHEDULE_RETRY` | `distroq:jobs:delayed` |
+| future submission | `SCHEDULE_USER_JOB` | `distroq:jobs:scheduled` |
+| DLQ replay | `ENQUEUE_REPLAY` | priority Stream |
+
+Each immutable event payload contains `eventId`, `jobId`, validated `priority`, `source`, and the
+relevant `dueAt`/`scheduledAt`. Only relay bookkeeping (`published_at`, `attempt_count`,
+`last_error`, and `locked_until`) changes after creation.
+
+Relay instances claim batches with PostgreSQL `FOR UPDATE SKIP LOCKED`, commit a 30-second lease,
+publish each event independently, and mark it published only after Redis returns success. A bad
+event increments its attempt count, records its error, releases its lock, and does not block later
+events. Unpublished events are never automatically deleted. Published-event cleanup is not
+automatic in v0.7; `retention-days` is the operational retention target.
+
+When an event reaches `outbox.max-attempts`, the relay logs that it is terminal and stops claiming
+it. The row remains unpublished with its final `attempt_count` and `last_error` for operator
+inspection; v0.7 does not automatically discard or reset terminal events. `outboxFailed` counts
+retryable failures, while `outboxTerminalFailed` separately counts rows at or above the ceiling.
+
+Redis publication and its marker are one Lua operation. The marker key is:
+
+```text
+distroq:outbox:published:<event-id>
+```
+
+For Streams the script atomically performs `XADD` and stores the generated Stream ID in the marker.
+For sorted sets it atomically performs `ZADD` and stores the member in the marker. A repeated relay
+attempt returns the marker value without writing again. Stream fields now include
+`outboxEventId`. New sorted-set members are `<TIER>:<job-id>:<event-id>`; the parser and promotion
+script still accept v0.6 `<TIER>:<job-id>` members.
+
+Markers expire after seven days. This must exceed the maximum expected relay retry window.
+Expiring too early can let an old unpublished row publish again; retaining markers forever would
+grow Redis without bound. Unpublished rows approaching that window must be investigated.
+
+The relay has two acceptance controls:
+
+```yaml
+distroq:
+  outbox:
+    relay-enabled: false       # commit rows without publishing
+    fail-after-publish: true   # publish, then fail before published_at is set
+```
+
+Both default to the safe production values shown in the complete configuration below.
+
+### Idempotent submission
+
+`POST /api/jobs` accepts an optional global `Idempotency-Key` until authentication provides a
+tenant/client scope:
+
+```http
+Idempotency-Key: customer-request-123
+```
+
+Keys are trimmed, must contain 1-128 characters, and are otherwise opaque. A PostgreSQL advisory
+transaction lock serializes concurrent first use of the same key. The canonical SHA-256 request
+hash contains `type`, `payload`, resolved `maxAttempts`, resolved `priority`, and `scheduledAt` as
+a normalized UTC `Instant` or null. It is serialized from a fixed-order record, not raw request
+JSON, so JSON whitespace/property order and equivalent timestamp offsets do not create conflicts.
+
+```text
+first request:
+  creates job 7f..., idempotency row, and one outbox event
+retry with same key and same body:
+  returns job 7f... with HTTP 202 and Idempotent-Replay: true
+same key with a different body:
+  returns HTTP 409 and creates nothing
+```
+
+`GET /api/idempotency/{key}` returns the key, hash, original job ID, creation time, and current job
+status, or `404`. It does not return the job payload.
+
+### Multiple workers and execution leases
+
+`distroq.worker.concurrency` creates that many worker loops in one process. Each loop receives a
+different `<prefix>-<8 random hex>` consumer name, and that exact name is written as the attempt's
+`workerId`. Every loop processes at most one active job at a time.
+
+Before user code runs, `ExecutionClaimService` executes one conditional `UPDATE jobs`. It accepts
+due `QUEUED`, `SCHEDULED`, or `RETRYING` work, or a `RUNNING` job whose lease expired. The same
+statement sets `RUNNING`, owner, lease deadline, active attempt UUID, timestamps, and increments
+`attempt_count` and `version`. Terminal states and live leases cannot match. Only a matching,
+unexpired owner plus `active_attempt_id` may renew or finalize.
+
+While user code runs, a heartbeat renews the lease. If renewal or owner-guarded finalization
+fails, that worker logs ownership loss, does not persist success/retry/DLQ state, and leaves the
+Stream entry pending. Java execution is cooperative: a sleeping or externally blocked thread
+cannot be forcibly stopped safely. An old worker may therefore complete an external side effect
+after losing its lease, but it cannot finalize the DistroQ row.
+
+`XAUTOCLAIM` remains the transport recovery mechanism. A reclaiming consumer still must win the
+database claim. When it wins an expired lease, previous `IN_PROGRESS` attempts become
+`ABANDONED`, a new attempt opens, and the attempt count advances. When it loses, it does not run,
+does not abandon the active attempt, does not acknowledge, and leaves the delivery for a later
+reclaim. This preserves the invariant that at most one current database lease owner may finalize.
+Each process gives its recovery sweep a dedicated generated consumer name rather than sharing the
+identity of worker loop 1; that recovery name is also used as the database execution owner.
+
+### Configuration
+
+```yaml
+distroq:
+  outbox:
+    poll-interval-ms: 500
+    batch-size: 100
+    lock-duration-ms: 30000
+    max-attempts: 100
+    dedupe-retention-ms: 604800000
+    retention-days: 30
+    relay-enabled: true
+    fail-after-publish: false
+  worker:
+    concurrency: 1
+    execution-lease-ms: 30000
+    heartbeat-interval-ms: 5000
+```
+
+The default concurrency remains one. The heartbeat interval should be comfortably shorter than
+the execution lease. Redis `claim-min-idle-ms` determines when transport ownership can move;
+database lease expiry independently determines when execution ownership can move.
+
+### Metrics
+
+`GET /api/metrics` adds:
+
+| Field | Meaning and precision |
+| --- | --- |
+| `outboxPending` | exact DB count of eligible, unlocked unpublished rows below max attempts |
+| `outboxFailed` | exact DB count of retryable unpublished rows with at least one failed attempt |
+| `outboxTerminalFailed` | exact DB count of unpublished rows at or above max attempts; operator action is required |
+| `outboxOldestAgeMs` | age of the oldest unpublished DB row at query time |
+| `outboxPublishedTotal` | exact retained DB row count; retention can make it historical rather than lifetime total |
+| `workerConcurrency` | configured loops in this process |
+| `activeWorkers` | process-local gauge of loops currently executing user code |
+| `activeLeases` | exact DB count of unexpired execution leases |
+| `reclaimedEntries` | process-local cumulative count returned by `XAUTOCLAIM` |
+| `abandonedAttempts` | exact DB count of `ABANDONED` attempt rows |
+
+`activeConsumers` retains its older meaning: consumers currently holding pending entries, not
+active execution count.
+
+### V6 migration
+
+`V6__outbox_idempotency_and_execution_leases.sql` creates `outbox_events` and
+`idempotency_keys`, and adds `execution_owner`, `execution_lease_until`, `active_attempt_id`, and
+`version` to `jobs`. Hibernate continues to run with `ddl-auto: validate`.
+
+### Acceptance and two instances
+
+Build and inspect the migration:
+
+```powershell
+.\mvnw.cmd clean package
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT version, description, type, success FROM flyway_schema_history ORDER BY installed_rank;"
+Invoke-RestMethod http://localhost:8080/api/metrics | ConvertTo-Json -Depth 8
+```
+
+Start two instances with one worker each and a short lease:
+
+```powershell
+java -jar target/distroq-0.0.1-SNAPSHOT.jar `
+  --server.port=8080 --distroq.streams.consumer-name-prefix=worker-one `
+  --distroq.worker.concurrency=1 --distroq.worker.execution-lease-ms=3000 `
+  --distroq.worker.heartbeat-interval-ms=500
+
+java -jar target/distroq-0.0.1-SNAPSHOT.jar `
+  --server.port=8081 --distroq.streams.consumer-name-prefix=worker-two `
+  --distroq.worker.concurrency=1 --distroq.worker.execution-lease-ms=3000 `
+  --distroq.worker.heartbeat-interval-ms=500
+```
+
+To inspect three in-process consumers, start with `--distroq.worker.concurrency=3`, submit work,
+then run `XINFO CONSUMERS` for each priority Stream and group `distroq-workers`.
+
+## Historical v0.6 behavior
 
 A minimal, end-to-end distributed task queue with priority scheduling, automatic retries,
 exponential backoff, a dead-letter queue with explicit replay, at-least-once delivery over
@@ -1414,6 +1626,12 @@ when it does, so an idle system does not spam the console once a second.
 ```powershell
 .\mvnw.cmd test
 ```
+
+Release verification uses Maven Surefire's aggregate leaf-test count from
+`target/surefire-reports/TEST-*.xml`. VS Code may display a larger number because its Test view
+also reports discovered containers/tree items; that UI number is not compared with Surefire's
+executed-test total. The final v0.7 run was 193 Maven tests with one skipped: 192 passing leaf
+tests plus 24 passing class containers account exactly for VS Code's 216 passed items.
 
 `JobTest` covers the `Job` state transitions including `markRetrying`, `markDeadLettered`,
 `prepareForReplay` and the `hasAttemptsRemaining` boundary, `DeadLetterTest` covers the

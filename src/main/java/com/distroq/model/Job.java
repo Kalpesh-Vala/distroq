@@ -6,6 +6,7 @@ import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import org.hibernate.annotations.ColumnDefault;
 
 import java.time.Instant;
@@ -64,6 +65,13 @@ public class Job {
      * once. Immutable in v0.6: there is no setter and no reschedule endpoint.
      */
     private Instant scheduledAt;
+
+    private String executionOwner;
+    private Instant executionLeaseUntil;
+    private UUID activeAttemptId;
+
+    @Version
+    private long version;
 
     protected Job() {
         // for JPA
@@ -253,5 +261,21 @@ public class Job {
 
     public Instant getScheduledAt() {
         return scheduledAt;
+    }
+
+    public String getExecutionOwner() {
+        return executionOwner;
+    }
+
+    public Instant getExecutionLeaseUntil() {
+        return executionLeaseUntil;
+    }
+
+    public UUID getActiveAttemptId() {
+        return activeAttemptId;
+    }
+
+    public long getVersion() {
+        return version;
     }
 }

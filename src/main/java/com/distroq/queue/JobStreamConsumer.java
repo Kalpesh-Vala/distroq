@@ -55,6 +55,7 @@ public class JobStreamConsumer {
     private final StreamKeys streamKeys;
     private final LettuceStreamCommands lettuce;
     private final String groupName;
+    private final String consumerNamePrefix;
     private final String consumerName;
     private final long readCount;
     private final Duration blockTimeout;
@@ -69,10 +70,10 @@ public class JobStreamConsumer {
         this.streamKeys = streamKeys;
         this.lettuce = lettuce;
         this.groupName = properties.streams().groupName();
+        this.consumerNamePrefix = properties.streams().consumerNamePrefix();
         this.readCount = Math.max(1, properties.streams().readCount());
         this.blockTimeout = Duration.ofMillis(Math.max(1, properties.streams().blockTimeoutMs()));
-        this.consumerName = properties.streams().consumerNamePrefix()
-                + '-' + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        this.consumerName = newConsumerName();
     }
 
     public String consumerName() {
@@ -83,6 +84,11 @@ public class JobStreamConsumer {
         return groupName;
     }
 
+    public String newConsumerName() {
+        return consumerNamePrefix + '-'
+                + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+    }
+
     /**
      * New entries only ({@code >}), attempted in the order given.
      *
@@ -90,15 +96,20 @@ public class JobStreamConsumer {
      *         timed out with all tiers idle
      */
     public List<StreamDelivery> poll(List<Priority> order) {
+        return poll(consumerName, order);
+    }
+
+    public List<StreamDelivery> poll(String consumer, List<Priority> order) {
         List<Priority> tiers = order == null || order.isEmpty() ? Priority.STRICT_ORDER : order;
 
         for (Priority tier : tiers) {
-            List<StreamDelivery> served = read(StreamReadOptions.empty().count(readCount), List.of(tier), tiers);
+            List<StreamDelivery> served = read(consumer, StreamReadOptions.empty().count(readCount),
+                    List.of(tier), tiers);
             if (!served.isEmpty()) {
                 return served;
             }
         }
-        return read(StreamReadOptions.empty().count(readCount).block(blockTimeout), tiers, tiers);
+        return read(consumer, StreamReadOptions.empty().count(readCount).block(blockTimeout), tiers, tiers);
     }
 
     /**
@@ -117,9 +128,14 @@ public class JobStreamConsumer {
      * @param startId the cursor to resume from; {@code 0-0} starts a fresh scan
      */
     public ClaimedBatch claimStale(Priority tier, Duration minIdle, int count, String startId) {
+        return claimStale(consumerName, tier, minIdle, count, startId);
+    }
+
+    public ClaimedBatch claimStale(String consumer, Priority tier, Duration minIdle, int count,
+                                   String startId) {
         String streamKey = streamKeys.keyFor(tier);
         LettuceStreamCommands.AutoClaimResult result =
-                lettuce.autoClaim(streamKey, groupName, consumerName, minIdle, count, startId);
+                lettuce.autoClaim(streamKey, groupName, consumer, minIdle, count, startId);
 
         List<StreamDelivery> deliveries = new ArrayList<>();
         for (LettuceStreamCommands.ClaimedEntry claimed : result.entries()) {
@@ -128,7 +144,7 @@ public class JobStreamConsumer {
         return new ClaimedBatch(result.nextCursor(), result.entries().size(), deliveries);
     }
 
-    private List<StreamDelivery> read(StreamReadOptions options,
+    private List<StreamDelivery> read(String consumer, StreamReadOptions options,
                                       List<Priority> from,
                                       List<Priority> tierOrder) {
         @SuppressWarnings("unchecked")
@@ -137,7 +153,7 @@ public class JobStreamConsumer {
                 .toArray(StreamOffset[]::new);
 
         List<MapRecord<String, String, String>> records =
-                streamOps().read(Consumer.from(groupName, consumerName), options, offsets);
+                streamOps().read(Consumer.from(groupName, consumer), options, offsets);
         if (records == null || records.isEmpty()) {
             return List.of();
         }

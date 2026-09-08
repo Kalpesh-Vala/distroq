@@ -22,6 +22,12 @@ public final class TestProperties {
     public static final DistroqProperties.Scheduling SCHEDULING =
             new DistroqProperties.Scheduling(1000L, 100);
 
+        public static final DistroqProperties.Outbox OUTBOX =
+                new DistroqProperties.Outbox(500L, 100, 30_000L, 100, 604_800_000L, 30, true, false);
+
+        public static final DistroqProperties.Worker WORKER =
+            new DistroqProperties.Worker(1, 30_000L, 5_000L);
+
     private TestProperties() {
     }
 
@@ -51,7 +57,9 @@ public final class TestProperties {
                 DLQ,
                 PRIORITY,
                 STREAMS,
-                scheduling);
+                scheduling,
+                OUTBOX,
+                WORKER);
     }
 
     public static DistroqProperties of(DistroqProperties.Retry retry,
@@ -66,6 +74,8 @@ public final class TestProperties {
                 DLQ,
                 priority,
                 streams,
-                SCHEDULING);
+                SCHEDULING,
+                OUTBOX,
+                WORKER);
     }
 }

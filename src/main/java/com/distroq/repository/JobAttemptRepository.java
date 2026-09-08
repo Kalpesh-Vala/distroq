@@ -13,4 +13,6 @@ public interface JobAttemptRepository extends JpaRepository<JobAttempt, UUID> {
 
     /** Attempts left open by a worker that never reported back. Served by idx_job_attempts_job_id. */
     List<JobAttempt> findByJobIdAndOutcomeOrderByAttemptNumberAsc(UUID jobId, AttemptOutcome outcome);
+
+    long countByOutcome(AttemptOutcome outcome);
 }

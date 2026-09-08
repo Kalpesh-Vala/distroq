@@ -56,6 +56,7 @@ class WorkerDeliveryTest {
     private JobAttemptRepository jobAttemptRepository;
     private JobExecutor jobExecutor;
     private DeadLetterWriter deadLetterWriter;
+    private ExecutionClaimService claims;
     private Worker worker;
 
     @BeforeEach
@@ -66,16 +67,57 @@ class WorkerDeliveryTest {
         jobAttemptRepository = mock(JobAttemptRepository.class);
         jobExecutor = mock(JobExecutor.class);
         deadLetterWriter = mock(DeadLetterWriter.class);
+        claims = mock(ExecutionClaimService.class);
 
         when(consumer.consumerName()).thenReturn(CONSUMER);
         when(jobRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(jobAttemptRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
         when(jobAttemptRepository.findByJobIdAndOutcomeOrderByAttemptNumberAsc(any(), any()))
                 .thenReturn(List.of());
+        when(claims.claim(any(), any(), any())).thenAnswer(invocation -> {
+            UUID jobId = invocation.getArgument(0);
+            String owner = invocation.getArgument(1);
+            Job job = jobRepository.findById(jobId).orElseThrow();
+            for (JobAttempt open : jobAttemptRepository
+                    .findByJobIdAndOutcomeOrderByAttemptNumberAsc(jobId, AttemptOutcome.IN_PROGRESS)) {
+                open.abandon(Instant.now(), "claimed by " + owner + "; "
+                    + open.getWorkerId() + " no longer owns the database lease");
+                jobAttemptRepository.save(open);
+            }
+            job.markRunning();
+            JobAttempt attempt = jobAttemptRepository.save(
+                    JobAttempt.started(jobId, owner, job.getAttemptCount(), job.getStartedAt()));
+            return Optional.of(new ExecutionClaimService.Claim(job, attempt));
+        });
+        when(claims.succeed(any())).thenAnswer(invocation -> {
+            ExecutionClaimService.Claim claim = invocation.getArgument(0);
+            claim.job().markSucceeded();
+            claim.attempt().succeed(Instant.now());
+            jobAttemptRepository.save(claim.attempt());
+            return true;
+        });
+        when(claims.retry(any(), any(), any())).thenAnswer(invocation -> {
+            ExecutionClaimService.Claim claim = invocation.getArgument(0);
+            String error = invocation.getArgument(1);
+            Instant dueAt = invocation.getArgument(2);
+            claim.job().markRetrying(error, dueAt);
+            claim.attempt().fail(Instant.now(), error);
+            jobAttemptRepository.save(claim.attempt());
+            return true;
+        });
+        when(claims.deadLetter(any(), any())).thenAnswer(invocation -> {
+            ExecutionClaimService.Claim claim = invocation.getArgument(0);
+            String error = invocation.getArgument(1);
+            claim.job().markDeadLettered(error);
+            claim.attempt().fail(Instant.now(), error);
+            jobAttemptRepository.save(claim.attempt());
+            deadLetterWriter.deadLetter(claim.job(), error);
+            return true;
+        });
 
-        worker = new Worker(jobQueue, consumer, jobRepository, jobAttemptRepository, jobExecutor,
-                new BackoffPolicy(TestProperties.defaults()), deadLetterWriter,
-                new PriorityStrategy(TestProperties.defaults()));
+        worker = new Worker(consumer, jobRepository, jobExecutor,
+                new BackoffPolicy(TestProperties.defaults()), new PriorityStrategy(TestProperties.defaults()),
+                claims, new WorkerMetrics(TestProperties.defaults()), TestProperties.defaults());
     }
 
     @Test
@@ -217,7 +259,7 @@ class WorkerDeliveryTest {
         assertThat(saved.getAllValues().get(1).getErrorMessage()).isEqualTo("boom");
         assertThat(job.getStatus()).isEqualTo(JobStatus.RETRYING);
         // the retry keeps the job's own tier, and the entry is acknowledged all the same
-        verify(jobQueue).scheduleAt(eq(job.getId()), eq(Priority.HIGH), any());
+        verify(claims).retry(any(), eq("boom"), any());
         verify(consumer).acknowledge(STREAM, ENTRY);
     }
 
@@ -231,7 +273,7 @@ class WorkerDeliveryTest {
                 Priority.LOW, fields(job.getId(), Priority.LOW, EnqueueSource.SUBMIT, 1L)));
 
         verify(deadLetterWriter).deadLetter(job, "boom");
-        verify(jobQueue, never()).scheduleAt(any(), any(), any());
+        verify(claims, never()).retry(any(), any(), any());
         verify(consumer).acknowledge("distroq:jobs:stream:low", ENTRY);
     }
 
@@ -319,7 +361,7 @@ class WorkerDeliveryTest {
         verify(consumer, never()).acknowledge(any(), any());
         verify(jobRepository, never()).save(any());
         verify(jobAttemptRepository, never()).save(any());
-        verify(jobQueue, never()).scheduleAt(any(), any(), any());
+        verify(claims, never()).retry(any(), any(), any());
         assertThat(job.getStatus()).isEqualTo(JobStatus.SCHEDULED);
         assertThat(job.getAttemptCount()).isZero();
     }
@@ -346,7 +388,7 @@ class WorkerDeliveryTest {
 
         assertThat(job.getStatus()).isEqualTo(JobStatus.RETRYING);
         // its own tier, on the retry set - never back onto the scheduled set
-        verify(jobQueue).scheduleAt(eq(job.getId()), eq(Priority.LOW), any());
+        verify(claims).retry(any(), eq("boom"), any());
         assertThat(job.getScheduledAt()).isEqualTo(scheduledAt);
         assertThat(job.getNextAttemptAt()).isNotNull().isNotEqualTo(scheduledAt);
         verify(consumer).acknowledge(streamKey(Priority.LOW), ENTRY);

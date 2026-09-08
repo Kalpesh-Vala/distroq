@@ -1,15 +1,12 @@
 package com.distroq.worker;
 
-import com.distroq.model.AttemptOutcome;
+import com.distroq.config.DistroqProperties;
 import com.distroq.model.Job;
-import com.distroq.model.JobAttempt;
 import com.distroq.model.Priority;
 import com.distroq.queue.DeliveryHandler;
 import com.distroq.queue.EnqueueSource;
-import com.distroq.queue.JobQueue;
 import com.distroq.queue.JobStreamConsumer;
 import com.distroq.queue.StreamDelivery;
-import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -21,12 +18,16 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -50,14 +51,16 @@ public class Worker implements DeliveryHandler {
 
     private static final Logger log = LoggerFactory.getLogger(Worker.class);
 
-    private final JobQueue jobQueue;
     private final JobStreamConsumer consumer;
     private final JobRepository jobRepository;
-    private final JobAttemptRepository jobAttemptRepository;
     private final JobExecutor jobExecutor;
     private final BackoffPolicy backoffPolicy;
-    private final DeadLetterWriter deadLetterWriter;
     private final PriorityStrategy priorityStrategy;
+    private final ExecutionClaimService claims;
+    private final WorkerMetrics metrics;
+    private final List<String> consumerNames;
+    private final long heartbeatIntervalMs;
+    private final Semaphore executionPermits;
 
     private final String workerId;
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -66,23 +69,31 @@ public class Worker implements DeliveryHandler {
     private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 
     private ExecutorService pool;
+    private ScheduledExecutorService heartbeatPool;
 
-    public Worker(JobQueue jobQueue,
-                  JobStreamConsumer consumer,
+    public Worker(JobStreamConsumer consumer,
                   JobRepository jobRepository,
-                  JobAttemptRepository jobAttemptRepository,
                   JobExecutor jobExecutor,
                   BackoffPolicy backoffPolicy,
-                  DeadLetterWriter deadLetterWriter,
-                  PriorityStrategy priorityStrategy) {
-        this.jobQueue = jobQueue;
+                  PriorityStrategy priorityStrategy,
+                  ExecutionClaimService claims,
+                  WorkerMetrics metrics,
+                  DistroqProperties properties) {
         this.consumer = consumer;
         this.jobRepository = jobRepository;
-        this.jobAttemptRepository = jobAttemptRepository;
         this.jobExecutor = jobExecutor;
         this.backoffPolicy = backoffPolicy;
-        this.deadLetterWriter = deadLetterWriter;
         this.priorityStrategy = priorityStrategy;
+        this.claims = claims;
+        this.metrics = metrics;
+        int concurrency = Math.max(1, properties.worker().concurrency());
+        this.heartbeatIntervalMs = Math.max(1, properties.worker().heartbeatIntervalMs());
+        this.executionPermits = new Semaphore(concurrency);
+        this.consumerNames = new ArrayList<>(concurrency);
+        this.consumerNames.add(consumer.consumerName());
+        while (consumerNames.size() < concurrency) {
+            consumerNames.add(consumer.newConsumerName());
+        }
         // one identity: the Redis consumer name and the worker_id in job_attempts are the same
         // string, so a pending entry can be traced to the attempt row it produced
         this.workerId = consumer.consumerName();
@@ -94,22 +105,27 @@ public class Worker implements DeliveryHandler {
 
     @PostConstruct
     public void start() {
-        pool = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, workerId);
+        pool = Executors.newFixedThreadPool(consumerNames.size(), r -> {
+            Thread t = new Thread(r, "distroq-worker");
             t.setDaemon(true);
             return t;
         });
-        pool.submit(this::runLoop);
-        log.info("Worker {} started as consumer {} in group {}",
-                workerId, consumer.consumerName(), consumer.groupName());
+        heartbeatPool = Executors.newScheduledThreadPool(consumerNames.size(), r -> {
+            Thread t = new Thread(r, "distroq-lease-heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
+        consumerNames.forEach(name -> pool.submit(() -> runLoop(name)));
+        log.info("Started {} worker loop(s) as consumers {} in group {}",
+                consumerNames.size(), consumerNames, consumer.groupName());
     }
 
-    private void runLoop() {
+    private void runLoop(String consumerName) {
         while (running.get()) {
             try {
                 boolean guardDue = priorityStrategy.guardDue();
                 List<Priority> order = priorityStrategy.nextPollOrder();
-                for (StreamDelivery delivery : consumer.poll(order)) {
+                for (StreamDelivery delivery : consumer.poll(consumerName, order)) {
                     if (guardDue) {
                         log.info("Starvation guard fired after {} delivery(ies) above {}: polled {}, "
                                         + "served job {} from {}",
@@ -119,13 +135,13 @@ public class Worker implements DeliveryHandler {
                     }
                     // a timed-out poll served nothing, so it is not a bypass and must not count
                     priorityStrategy.recordServed(delivery.streamPriority());
-                    handle(delivery);
+                    handle(delivery, consumerName);
                 }
             } catch (Exception e) {
                 if (!running.get()) {
                     return;
                 }
-                log.error("Worker {} loop error, backing off", workerId, e);
+                log.error("Worker {} loop error, backing off", consumerName, e);
                 try {
                     Thread.sleep(1000L);
                 } catch (InterruptedException ie) {
@@ -149,6 +165,11 @@ public class Worker implements DeliveryHandler {
      */
     @Override
     public void handle(StreamDelivery delivery) {
+        handle(delivery, workerId);
+    }
+
+    @Override
+    public void handle(StreamDelivery delivery, String owner) {
         String key = inFlightKey(delivery.streamKey(), delivery.entryId());
         if (!inFlight.add(key)) {
             log.debug("Entry {} on {} is already being handled by this process, ignoring",
@@ -156,16 +177,16 @@ public class Worker implements DeliveryHandler {
             return;
         }
         try {
-            dispatch(delivery);
+            dispatch(delivery, owner);
         } finally {
             inFlight.remove(key);
         }
     }
 
-    private void dispatch(StreamDelivery delivery) {
+    private void dispatch(StreamDelivery delivery, String owner) {
         log.info("Delivery {} on {} -> job {} ({}, source {}) for consumer {}",
                 delivery.entryId(), delivery.streamKey(), delivery.jobId(),
-                delivery.streamPriority(), delivery.source(), workerId);
+                delivery.streamPriority(), delivery.source(), owner);
 
         Optional<Job> found = jobRepository.findById(delivery.jobId());
         if (found.isEmpty()) {
@@ -187,10 +208,9 @@ public class Worker implements DeliveryHandler {
 
         switch (job.getStatus()) {
             case SUCCEEDED, DEAD_LETTERED, FAILED -> acknowledgeStale(job, delivery);
-            case SCHEDULED -> handleScheduled(job, delivery);
-            case RETRYING -> handleRetrying(job, delivery);
-            case RUNNING -> reclaimAndExecute(job, delivery);
-            case QUEUED -> execute(job, delivery);
+            case SCHEDULED -> handleScheduled(job, delivery, owner);
+            case RETRYING -> handleRetrying(job, delivery, owner);
+            case RUNNING, QUEUED -> execute(job, delivery, owner);
         }
     }
 
@@ -211,7 +231,7 @@ public class Worker implements DeliveryHandler {
      * cycle of latency and a WARN per attempt, which is the right trade for a case that should
      * only ever be reachable through clock skew or a hand-written ZADD.
      */
-    private void handleScheduled(Job job, StreamDelivery delivery) {
+    private void handleScheduled(Job job, StreamDelivery delivery, String owner) {
         Instant dueAt = job.getScheduledAt();
         // a SCHEDULED row with no scheduledAt cannot have been written by this application; treat
         // it as due rather than leaving it to churn in the pending list forever
@@ -225,12 +245,7 @@ public class Worker implements DeliveryHandler {
         log.info("Job {} reached its scheduled time {} (entry {}, source {}); queuing for its "
                         + "first attempt",
                 job.getId(), dueAt, delivery.entryId(), delivery.source());
-        // SCHEDULED -> QUEUED is committed before the attempt starts, so a crash in between leaves
-        // a runnable job rather than one still claiming to be waiting for a time that has passed.
-        // Not an attempt: no attempt row, no attemptCount change, and scheduledAt is kept
-        job.markQueuedFromSchedule();
-        jobRepository.save(job);
-        execute(job, delivery);
+        execute(job, delivery, owner);
     }
 
     /**
@@ -258,12 +273,12 @@ public class Worker implements DeliveryHandler {
      * a schedule that has since been replaced falls in the same category, which is what the
      * timestamp comparison catches.
      */
-    private void handleRetrying(Job job, StreamDelivery delivery) {
+    private void handleRetrying(Job job, StreamDelivery delivery, String owner) {
         Instant dueAt = job.getNextAttemptAt();
         boolean isScheduledRetry = delivery.isFrom(EnqueueSource.RETRY)
                 && (dueAt == null || delivery.enqueuedAt() >= dueAt.toEpochMilli());
         if (isScheduledRetry) {
-            execute(job, delivery);
+            execute(job, delivery, owner);
             return;
         }
         log.info("Delivery {} ({}) for job {} is superseded by a retry due at {}; acknowledging "
@@ -284,71 +299,65 @@ public class Worker implements DeliveryHandler {
      * <p>This can duplicate execution and therefore duplicate side effects. That is at-least-once
      * delivery working as designed, not a bug being tolerated quietly.
      */
-    private void reclaimAndExecute(Job job, StreamDelivery delivery) {
-        List<JobAttempt> open = jobAttemptRepository
-                .findByJobIdAndOutcomeOrderByAttemptNumberAsc(job.getId(), AttemptOutcome.IN_PROGRESS);
-        for (JobAttempt attempt : open) {
-            attempt.abandon(Instant.now(), "Delivery " + delivery.entryId() + " reclaimed by "
-                    + workerId + "; " + attempt.getWorkerId() + " never reported an outcome");
-            jobAttemptRepository.save(attempt);
-            log.warn("Marked attempt {} of job {} ABANDONED (was owned by {})",
-                    attempt.getAttemptNumber(), job.getId(), attempt.getWorkerId());
+    private void execute(Job job, StreamDelivery delivery, String owner) {
+        if (!executionPermits.tryAcquire()) {
+            return;
         }
-        log.warn("Reclaimed RUNNING job {} on entry {}; starting attempt {} on {}",
-                job.getId(), delivery.entryId(), job.getAttemptCount() + 1, workerId);
-        execute(job, delivery);
-    }
-
-    private void execute(Job job, StreamDelivery delivery) {
-        job.markRunning();
-        jobRepository.save(job);
-        int attemptNumber = job.getAttemptCount();
-        Instant startedAt = job.getStartedAt();
-
-        // open the attempt row before running, so a worker that disappears leaves evidence
-        JobAttempt attempt = jobAttemptRepository.save(
-                JobAttempt.started(job.getId(), workerId, attemptNumber, startedAt));
-
-        log.info("Job {} ({}, served from {}) RUNNING on {}, attempt {} of {}",
-                job.getId(), job.getType(), delivery.streamPriority(), workerId,
-                attemptNumber, job.getMaxAttempts());
-
+        Optional<ExecutionClaimService.Claim> won = claims.claim(job.getId(), owner,
+                "Delivery " + delivery.entryId());
+        if (won.isEmpty()) {
+            executionPermits.release();
+            log.debug("Worker {} did not obtain the database lease for job {}; leaving {} pending",
+                    owner, job.getId(), delivery.entryId());
+            return;
+        }
+        ExecutionClaimService.Claim claim = won.get();
+        AtomicBoolean ownershipLost = new AtomicBoolean(false);
+        metrics.workerStarted();
+        ScheduledFuture<?> heartbeat = heartbeatPool == null ? null : heartbeatPool.scheduleAtFixedRate(() -> {
+            try {
+                if (!claims.renew(claim)) {
+                    ownershipLost.set(true);
+                    log.error("Worker {} lost the execution lease for job {}", owner, job.getId());
+                }
+            } catch (Exception e) {
+                log.error("Worker {} could not renew the execution lease for job {}", owner,
+                        job.getId(), e);
+            }
+        }, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+        boolean finalized = false;
         try {
-            jobExecutor.execute(job);
-            job.markSucceeded();
-            jobRepository.save(job);
-            attempt.succeed(Instant.now());
-            jobAttemptRepository.save(attempt);
-            log.info("Job {} SUCCEEDED on attempt {}", job.getId(), attemptNumber);
+            jobExecutor.execute(claim.job());
+            finalized = !ownershipLost.get() && claims.succeed(claim);
         } catch (Exception e) {
             String error = e.getMessage() == null ? e.toString() : e.getMessage();
-            attempt.fail(Instant.now(), error);
-            jobAttemptRepository.save(attempt);
-            handleFailure(job, attemptNumber, error);
+            if (!ownershipLost.get()) {
+                finalized = handleFailure(claim, error);
+            }
+        } finally {
+            if (heartbeat != null) {
+                heartbeat.cancel(false);
+            }
+            metrics.workerFinished();
+            executionPermits.release();
         }
-        // last, and only now: the database already describes the outcome, so a crash before this
-        // point redelivers an entry the duplicate-delivery rules above know how to dismiss
-        consumer.acknowledge(delivery.streamKey(), delivery.entryId());
+        if (finalized) {
+            consumer.acknowledge(delivery.streamKey(), delivery.entryId());
+        } else {
+            log.warn("Worker {} did not finalize job {}; leaving entry {} pending", owner,
+                    job.getId(), delivery.entryId());
+        }
     }
 
-    private void handleFailure(Job job, int attemptNumber, String error) {
+    private boolean handleFailure(ExecutionClaimService.Claim claim, String error) {
+        Job job = claim.job();
         if (!job.hasAttemptsRemaining()) {
-            deadLetterWriter.deadLetter(job, error);
-            log.error("Job {} DEAD_LETTERED after {} attempt(s): {}",
-                    job.getId(), attemptNumber, error);
-            return;
+            return claims.deadLetter(claim, error);
         }
 
         Duration delay = backoffPolicy.delayFor(job.getAttemptCount());
         Instant dueAt = Instant.now().plus(delay);
-        job.markRetrying(error, dueAt);
-        // second instance of the dual write from JobController.submit - see NOTES.md. Streams did
-        // not fix it: the row commits here and the sorted-set write is still a separate system.
-        jobRepository.save(job);
-        jobQueue.scheduleAt(job.getId(), job.getPriority(), dueAt);
-        log.warn("Job {} ({}) failed attempt {} of {} ({}), RETRYING in {}ms",
-                job.getId(), job.getPriority(), attemptNumber, job.getMaxAttempts(), error,
-                delay.toMillis());
+        return claims.retry(claim, error, dueAt);
     }
 
     private static String inFlightKey(String streamKey, String entryId) {
@@ -370,6 +379,9 @@ public class Worker implements DeliveryHandler {
             return;
         }
         pool.shutdown();
+        if (heartbeatPool != null) {
+            heartbeatPool.shutdown();
+        }
         try {
             if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
                 pool.shutdownNow();

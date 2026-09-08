@@ -1,18 +1,22 @@
 package com.distroq.api;
 
 import com.distroq.api.dto.JobDetailResponse;
+import com.distroq.api.dto.IdempotencyResponse;
 import com.distroq.api.dto.JobResponse;
 import com.distroq.api.dto.SubmitJobRequest;
 import com.distroq.config.DistroqProperties;
+import com.distroq.model.AttemptOutcome;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
-import com.distroq.queue.EnqueueSource;
 import com.distroq.queue.JobQueue;
 import com.distroq.queue.ScheduledJobQueue;
 import com.distroq.repository.DeadLetterRepository;
+import com.distroq.repository.IdempotencyKeyRepository;
 import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
+import com.distroq.repository.OutboxEventRepository;
+import com.distroq.worker.WorkerMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -21,11 +25,13 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -41,24 +47,34 @@ public class JobController {
     private final JobRepository jobRepository;
     private final JobAttemptRepository jobAttemptRepository;
     private final DeadLetterRepository deadLetterRepository;
+    private final IdempotencyKeyRepository idempotencyKeyRepository;
+    private final OutboxEventRepository outboxEventRepository;
+    private final JobSubmissionService submissionService;
+    private final WorkerMetrics workerMetrics;
     private final JobQueue jobQueue;
     private final ScheduledJobQueue scheduledJobQueue;
-    private final int defaultMaxAttempts;
-    private final int replayAttempts;
+    private final int outboxMaxAttempts;
 
     public JobController(JobRepository jobRepository,
                          JobAttemptRepository jobAttemptRepository,
                          DeadLetterRepository deadLetterRepository,
+                         IdempotencyKeyRepository idempotencyKeyRepository,
+                         OutboxEventRepository outboxEventRepository,
+                         JobSubmissionService submissionService,
+                         WorkerMetrics workerMetrics,
                          JobQueue jobQueue,
                          ScheduledJobQueue scheduledJobQueue,
                          DistroqProperties properties) {
         this.jobRepository = jobRepository;
         this.jobAttemptRepository = jobAttemptRepository;
         this.deadLetterRepository = deadLetterRepository;
+        this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.outboxEventRepository = outboxEventRepository;
+        this.submissionService = submissionService;
+        this.workerMetrics = workerMetrics;
         this.jobQueue = jobQueue;
         this.scheduledJobQueue = scheduledJobQueue;
-        this.defaultMaxAttempts = properties.retry().defaultMaxAttempts();
-        this.replayAttempts = properties.dlq().replayAttempts();
+        this.outboxMaxAttempts = properties.outbox().maxAttempts();
     }
 
     /**
@@ -69,47 +85,16 @@ public class JobController {
      * set; anything else saves it QUEUED and puts it straight on its tier's stream.
      */
     @PostMapping("/jobs")
-    public ResponseEntity<JobResponse> submit(@RequestBody SubmitJobRequest request) {
-        int maxAttempts = resolveMaxAttempts(request.maxAttempts());
-        Priority priority = resolvePriority(request.priority());
-        Instant scheduledAt = ScheduledAtParser.parse(request.scheduledAt());
-
-        Job job = jobRepository.save(
-                Job.create(request.type(), request.payload(), maxAttempts, priority, scheduledAt));
-
-        // first of the three dual writes: the row is committed, the Redis write is a separate
-        // system and can still fail on its own. Streams did not change that and neither does
-        // scheduling - a crash here leaves a SCHEDULED row with no sorted-set member. See NOTES.md
-        if (job.isScheduled()) {
-            scheduledJobQueue.schedule(job.getId(), job.getPriority(), scheduledAt);
-            log.info("Job {} ({}) SCHEDULED at {} for {} with maxAttempts {}",
-                    job.getId(), job.getType(), job.getPriority(), scheduledAt, maxAttempts);
-        } else {
-            String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.SUBMIT);
-            log.info("Job {} ({}) QUEUED at {} with maxAttempts {} as stream entry {}{}",
-                    job.getId(), job.getType(), job.getPriority(), maxAttempts, entryId,
-                    scheduledAt == null ? "" : " (requested time " + scheduledAt + " already past)");
+    public ResponseEntity<JobResponse> submit(
+            @RequestBody SubmitJobRequest request,
+            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey) {
+        JobSubmissionService.SubmissionResult result =
+                submissionService.submit(request, idempotencyKey);
+        ResponseEntity.BodyBuilder response = ResponseEntity.accepted();
+        if (result.replayed()) {
+            response.header("Idempotent-Replay", "true");
         }
-        return ResponseEntity.accepted().body(JobResponse.from(job));
-    }
-
-    private int resolveMaxAttempts(Integer requested) {
-        if (requested == null) {
-            return defaultMaxAttempts;
-        }
-        if (requested < 1) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "maxAttempts must be at least 1, got " + requested);
-        }
-        return requested;
-    }
-
-    /** Absent or blank is not an error and resolves to the default; an unknown value is a 400. */
-    private Priority resolvePriority(String requested) {
-        return Priority.parse(requested)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        "priority must be one of " + Priority.validValues()
-                                + " (case-insensitive), got '" + requested + "'"));
+        return response.body(JobResponse.from(result.job()));
     }
 
     @GetMapping("/jobs/{id}")
@@ -145,41 +130,16 @@ public class JobController {
      */
     @PostMapping("/jobs/{id}/retry")
     public ResponseEntity<JobResponse> replay(@PathVariable UUID id) {
-        Job job = jobRepository.findById(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
-                        "No job with id " + id));
-
-        if (job.getStatus() != JobStatus.DEAD_LETTERED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "Only DEAD_LETTERED jobs can be replayed; job " + id + " is " + job.getStatus());
+        return ResponseEntity.accepted().body(JobResponse.from(submissionService.replay(id)));
         }
 
-        int previousMaxAttempts = job.getMaxAttempts();
-        job.prepareForReplay(replayAttempts);
-        jobRepository.save(job);
-
-        // retained as history rather than deleted, so replayCount keeps naming repeat offenders
-        deadLetterRepository.findById(id).ifPresent(deadLetter -> {
-            deadLetter.markReplayed();
-            deadLetterRepository.save(deadLetter);
-        });
-
-        // straight onto the tier's stream: replay is an explicit human action, so making the
-        // operator wait out a backoff window they did not ask for would be surprising.
-        // The job's own tier, not the default - a LOW job replayed as NORMAL would jump ahead of
-        // work it was deliberately ranked behind, and a HIGH one would silently lose its rank.
-        // Third of the three dual writes; the window is unchanged from v0.4.
-        //
-        // Immediate even when the job carried a scheduledAt. That timestamp described the original
-        // request; replaying is a new operator action taken now, and re-honouring a time that has
-        // usually already passed would either run immediately anyway or strand the job. The
-        // original value stays on the row as history - see NOTES.md.
-        String entryId = jobQueue.enqueue(job.getId(), job.getPriority(), EnqueueSource.REPLAY);
-        log.info("Job {} ({}) replayed from the DLQ as stream entry {}, attemptCount {} preserved, "
-                        + "maxAttempts {} -> {}",
-                job.getId(), job.getPriority(), entryId, job.getAttemptCount(), previousMaxAttempts,
-                job.getMaxAttempts());
-        return ResponseEntity.accepted().body(JobResponse.from(job));
+        @GetMapping("/idempotency/{key}")
+        public ResponseEntity<IdempotencyResponse> idempotency(@PathVariable String key) {
+        return idempotencyKeyRepository.findById(key.trim())
+            .flatMap(record -> jobRepository.findById(record.getJobId())
+                .map(job -> IdempotencyResponse.from(record, job)))
+            .map(ResponseEntity::ok)
+            .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     /**
@@ -222,6 +182,20 @@ public class JobController {
         metrics.put("streamDepthByPriority", jobQueue.streamDepthByPriority());
         metrics.put("pendingEntriesByPriority", jobQueue.pendingEntriesByPriority());
         metrics.put("activeConsumers", jobQueue.consumersHoldingEntries().size());
+        Instant now = Instant.now();
+        Instant oldest = outboxEventRepository.oldestUnpublishedCreatedAt();
+        metrics.put("outboxPending", outboxEventRepository.countPending(now, outboxMaxAttempts));
+        metrics.put("outboxFailed", outboxEventRepository.countRetryableFailures(outboxMaxAttempts));
+        metrics.put("outboxTerminalFailed",
+            outboxEventRepository.countTerminalFailures(outboxMaxAttempts));
+        metrics.put("outboxOldestAgeMs", oldest == null ? 0L
+            : Math.max(0L, Duration.between(oldest, now).toMillis()));
+        metrics.put("outboxPublishedTotal", outboxEventRepository.countByPublishedAtIsNotNull());
+        metrics.put("workerConcurrency", workerMetrics.concurrency());
+        metrics.put("activeWorkers", workerMetrics.activeWorkers());
+        metrics.put("activeLeases", jobRepository.countActiveLeases(now));
+        metrics.put("reclaimedEntries", workerMetrics.reclaimedEntries());
+        metrics.put("abandonedAttempts", jobAttemptRepository.countByOutcome(AttemptOutcome.ABANDONED));
         return metrics;
     }
 }
