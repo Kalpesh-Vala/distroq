@@ -2,6 +2,7 @@ package com.distroq.queue;
 
 import com.distroq.config.DistroqProperties;
 import com.distroq.model.Priority;
+import com.distroq.worker.WorkerMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.event.ContextClosedEvent;
@@ -55,20 +56,25 @@ public class PendingEntryRecovery {
     private final StreamKeys streamKeys;
     private final StringRedisTemplate redis;
     private final String groupName;
+    private final String recoveryConsumerName;
     private final Duration minIdle;
     private final int batchSize;
+    private final WorkerMetrics workerMetrics;
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     public PendingEntryRecovery(JobStreamConsumer consumer,
                                 DeliveryHandler handler,
                                 StreamKeys streamKeys,
                                 StringRedisTemplate redis,
+                                WorkerMetrics workerMetrics,
                                 DistroqProperties properties) {
         this.consumer = consumer;
         this.handler = handler;
         this.streamKeys = streamKeys;
         this.redis = redis;
+        this.workerMetrics = workerMetrics;
         this.groupName = properties.streams().groupName();
+        this.recoveryConsumerName = consumer.newConsumerName();
         this.minIdle = Duration.ofMillis(properties.streams().claimMinIdleMs());
         this.batchSize = Math.max(1, properties.streams().claimBatchSize());
     }
@@ -102,11 +108,11 @@ public class PendingEntryRecovery {
             Map<String, PendingMessage> before = ownersOf(streamKey);
 
             JobStreamConsumer.ClaimedBatch claimed =
-                    consumer.claimStale(tier, minIdle, batchSize, cursor);
+                    consumer.claimStale(recoveryConsumerName, tier, minIdle, batchSize, cursor);
             if (claimed.claimed() > 0) {
+                workerMetrics.reclaimed(claimed.claimed());
                 log.warn("XAUTOCLAIM on {} took {} idle entr(ies) for {} (cursor {} -> {})",
-                        streamKey, claimed.claimed(), consumer.consumerName(), cursor,
-                        claimed.nextCursor());
+                    streamKey, claimed.claimed(), recoveryConsumerName, cursor, claimed.nextCursor());
             }
 
             for (StreamDelivery delivery : claimed.deliveries()) {
@@ -121,10 +127,10 @@ public class PendingEntryRecovery {
                                 + "idle {}ms, delivery count {}",
                         delivery.entryId(), streamKey, delivery.jobId(),
                         previous == null ? "unknown" : previous.getConsumerName(),
-                        consumer.consumerName(),
+                        recoveryConsumerName,
                         previous == null ? -1 : previous.getElapsedTimeSinceLastDelivery().toMillis(),
                         previous == null ? -1 : previous.getTotalDeliveryCount());
-                handler.handle(delivery);
+                handler.handle(delivery, recoveryConsumerName);
             }
 
             // 0-0 means the scan wrapped; a short batch means there was nothing more to take

@@ -66,11 +66,17 @@ public class DueSetPromoter {
                     id = string.sub(member, sep + 1)
                   end
                 end
-                redis.call('XADD', dest[tier], '*',
-                  'jobId', id,
-                  'priority', tier,
-                  'enqueuedAt', ARGV[1],
-                  'source', source)
+                local eventSep = string.find(id, ':', 1, true)
+                if eventSep then
+                  local eventId = string.sub(id, eventSep + 1)
+                  id = string.sub(id, 1, eventSep - 1)
+                  redis.call('XADD', dest[tier], '*',
+                    'jobId', id, 'priority', tier, 'enqueuedAt', ARGV[1],
+                    'source', source, 'outboxEventId', eventId)
+                else
+                  redis.call('XADD', dest[tier], '*',
+                    'jobId', id, 'priority', tier, 'enqueuedAt', ARGV[1], 'source', source)
+                end
                 moved = moved + 1
               end
             end

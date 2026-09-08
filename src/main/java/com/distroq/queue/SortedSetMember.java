@@ -34,6 +34,11 @@ public record SortedSetMember(UUID jobId, Priority priority) {
         return new SortedSetMember(jobId, priority).encode();
     }
 
+    public static String encode(UUID jobId, Priority priority, UUID outboxEventId) {
+        Objects.requireNonNull(outboxEventId, "outboxEventId");
+        return encode(jobId, priority) + SEPARATOR + outboxEventId;
+    }
+
     public String encode() {
         return priority.name() + SEPARATOR + jobId;
     }
@@ -66,9 +71,11 @@ public record SortedSetMember(UUID jobId, Priority priority) {
         if (priority.isEmpty()) {
             return Optional.empty();
         }
+        String remainder = raw.substring(separator + 1).trim();
+        int eventSeparator = remainder.indexOf(SEPARATOR);
+        String rawId = eventSeparator < 0 ? remainder : remainder.substring(0, eventSeparator);
         try {
-            return Optional.of(new SortedSetMember(
-                    UUID.fromString(raw.substring(separator + 1).trim()), priority.get()));
+            return Optional.of(new SortedSetMember(UUID.fromString(rawId), priority.get()));
         } catch (IllegalArgumentException e) {
             return Optional.empty();
         }

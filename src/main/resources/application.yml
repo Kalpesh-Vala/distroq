@@ -72,6 +72,20 @@ distroq:
     # the dominant term in scheduling latency: mean delay is half this, worst case is all of it
     poll-interval-ms: 1000
     promote-batch-size: 100
+  outbox:
+    poll-interval-ms: 500
+    batch-size: 100
+    lock-duration-ms: 30000
+    max-attempts: 100
+    dedupe-retention-ms: 604800000
+    retention-days: 30
+    relay-enabled: true
+    # acceptance hook: publish to Redis, then fail before PostgreSQL marks the row published
+    fail-after-publish: false
+  worker:
+    concurrency: 1
+    execution-lease-ms: 30000
+    heartbeat-interval-ms: 5000
 
 logging:
   level:

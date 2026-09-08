@@ -9,6 +9,8 @@ public interface DeliveryHandler {
 
     void handle(StreamDelivery delivery);
 
+    void handle(StreamDelivery delivery, String consumerName);
+
     /** True while this process is executing the entry, and so should not reclaim it from itself. */
     boolean isInFlight(String streamKey, String entryId);
 }
