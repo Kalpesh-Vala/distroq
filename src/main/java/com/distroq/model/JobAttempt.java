@@ -59,7 +59,15 @@ public class JobAttempt {
 
     /** Open row for an attempt that is about to run; {@code finishedAt} stays null until it ends. */
     public static JobAttempt started(UUID jobId, String workerId, int attemptNumber, Instant startedAt) {
-        return of(jobId, workerId, attemptNumber, startedAt, null, AttemptOutcome.IN_PROGRESS, null);
+        return started(UUID.randomUUID(), jobId, workerId, attemptNumber, startedAt);
+    }
+
+    public static JobAttempt started(UUID id, UUID jobId, String workerId, int attemptNumber,
+                                     Instant startedAt) {
+        JobAttempt attempt = of(jobId, workerId, attemptNumber, startedAt, null,
+                AttemptOutcome.IN_PROGRESS, null);
+        attempt.id = id;
+        return attempt;
     }
 
     public void succeed(Instant finishedAt) {

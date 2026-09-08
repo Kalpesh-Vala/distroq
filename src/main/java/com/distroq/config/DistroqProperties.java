@@ -15,7 +15,9 @@ public record DistroqProperties(
         @DefaultValue Dlq dlq,
         @DefaultValue PriorityTuning priority,
         @DefaultValue Streams streams,
-        @DefaultValue Scheduling scheduling) {
+        @DefaultValue Scheduling scheduling,
+        @DefaultValue Outbox outbox,
+        @DefaultValue Worker worker) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -80,5 +82,22 @@ public record DistroqProperties(
     public record Scheduling(
             @DefaultValue("1000") long pollIntervalMs,
             @DefaultValue("100") int promoteBatchSize) {
+    }
+
+    public record Outbox(
+            @DefaultValue("500") long pollIntervalMs,
+            @DefaultValue("100") int batchSize,
+            @DefaultValue("30000") long lockDurationMs,
+            @DefaultValue("100") int maxAttempts,
+            @DefaultValue("604800000") long dedupeRetentionMs,
+            @DefaultValue("30") int retentionDays,
+            @DefaultValue("true") boolean relayEnabled,
+            @DefaultValue("false") boolean failAfterPublish) {
+    }
+
+    public record Worker(
+            @DefaultValue("1") int concurrency,
+            @DefaultValue("30000") long executionLeaseMs,
+            @DefaultValue("5000") long heartbeatIntervalMs) {
     }
 }
