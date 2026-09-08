@@ -3,6 +3,110 @@
 Running log of known limitations, failure modes observed, and design decisions.
 Written for my own reference and interview prep.
 
+## What v0.7 changed about the plan
+
+### 1. Why the dual-write problem required an outbox
+
+PostgreSQL and Redis cannot participate in one local transaction. Annotating a method that writes
+both systems never made the pair atomic. v0.7 writes the job transition and its publication intent
+to PostgreSQL together, then lets a relay perform the Redis half later.
+
+### 2. What the outbox guarantees
+
+A committed submission, retry schedule, user schedule, or DLQ replay has a durable
+`outbox_events` row. A process crash before Redis publication no longer silently loses that intent.
+Multiple relays claim rows with `FOR UPDATE SKIP LOCKED` and a short lease.
+
+### 3. What the outbox does not guarantee
+
+The relay remains at-least-once. It does not by itself guarantee exactly-once Redis publication,
+and it says nothing about exactly-once external job side effects. Redis publication is separately
+deduplicated by event ID.
+
+### 4. Relay crash windows
+
+```text
+publish Redis
+crash before marking published
+relay retries
+Redis deduplicates by event ID
+```
+
+The Stream or sorted-set write and `distroq:outbox:published:<event-id>` marker happen in one Lua
+script. PostgreSQL `published_at` is written only after Redis confirms the script. The
+`fail-after-publish` acceptance hook reproduces this window without killing a transaction early.
+
+### 5. Outbox retention
+
+Unpublished events are never deleted automatically. Failed rows retain attempt count and the last
+error for investigation. Published rows have a 30-day retention target but no automatic cleanup
+in v0.7. Redis markers expire after seven days to bound memory; that period must exceed expected
+relay recovery time. An unpublished row older than the marker lifetime requires investigation
+before retry, because its prior marker may have expired.
+
+The retry ceiling is an explicit terminal operational state. Once `attempt_count` reaches
+`outbox.max-attempts`, the row is no longer claimable, the relay emits a terminal error, and
+`outboxTerminalFailed` counts it separately from retryable `outboxFailed` rows. The row is retained
+for inspection; v0.7 intentionally has no automatic reset or destructive dead-letter cleanup.
+
+### 6. Idempotency-Key semantics
+
+The key is optional, trimmed, globally scoped, opaque, and 1-128 characters. Same key plus the
+same canonical request returns the original job. Same key plus a different request returns 409.
+The hash uses resolved priority and attempts plus `scheduledAt` normalized to `Instant`, so
+equivalent offsets hash equally. Authentication and tenant-scoped keys remain deferred.
+
+### 7. Why idempotent submission is not idempotent execution
+
+Submission idempotency prevents a client retry from creating a second job. A worker crash can
+still cause the same job's user code to run again. External effects need their own idempotency key
+or a transaction supplied by the external system.
+
+### 8. Database execution leases
+
+Consumer-group ownership tracks a Stream delivery, not authority over the PostgreSQL job. v0.7
+therefore conditionally updates the job to set an execution owner, lease deadline, and active
+attempt ID before running. Only a matching unexpired owner/attempt can renew or finalize. Expired
+`RUNNING` work can be claimed by another worker; terminal work cannot.
+
+### 9. Lease renewal limitations
+
+Heartbeats extend long-running ownership. Losing ownership prevents final DistroQ persistence but
+cannot safely stop arbitrary Java code or undo an external effect already performed. A worker can
+lose its lease after external work and before persistence. The system remains at-least-once.
+
+### 10. Multiple consumers
+
+Each configured loop gets a unique `<prefix>-<8 random hex>` consumer name, uses the shared
+`distroq-workers` group, and writes that name to attempt history. Concurrency is per process and
+defaults to one. A process-local semaphore keeps active user-code executions within the configured
+limit, including reclaimed deliveries.
+
+The recovery sweep also gets a dedicated generated consumer name. It uses that exact identity for
+both `XAUTOCLAIM` and the conditional PostgreSQL execution claim, so it never shares worker loop
+1's Redis or database owner identity.
+
+### 11. Verification count
+
+Maven Surefire report totals are authoritative for release verification because they count
+executed leaf test cases. VS Code's Test view can include discovered class/container nodes in its
+displayed total. The final run had 193 Maven tests with one skipped, leaving 192 passing leaf
+tests; VS Code reported 216 passed items because it also counted 24 passing test-class containers.
+This is a reporting-model difference, not evidence that Maven omitted a test source set.
+
+### 12. Reconciliation
+
+Operational reconciliation is still useful. Stuck `SCHEDULED` rows should be compared with
+unpublished outbox rows and Redis membership; unpublished rows need age/error alerts; orphaned
+legacy jobs predating V6 may need repair; stale Redis dedupe markers disappear by TTL. The outbox
+removes new database-to-Redis loss windows but does not prove old data was healthy.
+
+### 13. Remaining exact-once limitation
+
+> v0.7 prevents duplicate submission and coordinates database ownership, but it does
+> not make arbitrary external side effects exactly once. That requires idempotency keys
+> or a transactional boundary at the external system.
+
 ## Known limitations
 
 ### 1. Dual write: job persisted but never enqueued
