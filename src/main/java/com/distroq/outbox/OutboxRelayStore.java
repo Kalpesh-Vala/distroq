@@ -26,8 +26,7 @@ public class OutboxRelayStore {
     public List<UUID> claimBatch() {
         Instant now = Instant.now();
         Instant lockedUntil = now.plus(Duration.ofMillis(properties.lockDurationMs()));
-        List<OutboxEvent> events = repository.claimable(now, properties.maxAttempts(),
-                properties.batchSize());
+        List<OutboxEvent> events = repository.claimable(now, properties.batchSize());
         events.forEach(event -> event.claimUntil(lockedUntil));
         return events.stream().map(OutboxEvent::getId).toList();
     }
@@ -50,11 +49,12 @@ public class OutboxRelayStore {
     public FailureResult markFailed(UUID id, Throwable failure) {
         return repository.findById(id)
                 .map(event -> {
-                    event.markFailed(errorMessage(failure));
-                    return new FailureResult(event.getAttemptCount(),
-                            event.getAttemptCount() >= properties.maxAttempts());
+                    boolean terminal = event.markFailed(errorMessage(failure),
+                            properties.maxAttempts());
+                    return new FailureResult(event.getAttemptCount(), terminal,
+                            event.terminalCeiling(properties.maxAttempts()));
                 })
-                .orElseGet(() -> new FailureResult(0, false));
+                .orElseGet(() -> new FailureResult(0, false, properties.maxAttempts()));
     }
 
     private static String errorMessage(Throwable failure) {
@@ -63,6 +63,6 @@ public class OutboxRelayStore {
         return value.length() <= 4000 ? value : value.substring(0, 4000);
     }
 
-    public record FailureResult(int attemptCount, boolean terminal) {
+    public record FailureResult(int attemptCount, boolean terminal, int ceiling) {
     }
 }

@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -93,6 +94,26 @@ public class ScheduledJobQueue {
     public long scheduledDepth() {
         Long size = redis.opsForZSet().zCard(scheduledKey);
         return size == null ? 0L : size;
+    }
+
+    /**
+     * Members whose due score has already passed and which are therefore still waiting on a
+     * promotion that should have happened.
+     *
+     * <p>Read-only, and used only by reconciliation. A non-empty result at a time when the
+     * promoter is healthy is a transient half-tick; one that persists past the stale threshold
+     * means promotion has stopped, which is the one thing the outbox tables alone cannot show.
+     */
+    public Set<UUID> overdueJobIds(Instant now, int limit) {
+        Set<String> members = redis.opsForZSet()
+                .rangeByScore(scheduledKey, Double.NEGATIVE_INFINITY, now.toEpochMilli(), 0, limit);
+        if (members == null) {
+            return Set.of();
+        }
+        Set<UUID> jobIds = new LinkedHashSet<>();
+        members.forEach(raw -> SortedSetMember.parse(raw)
+                .ifPresent(parsed -> jobIds.add(parsed.jobId())));
+        return jobIds;
     }
 
     /**

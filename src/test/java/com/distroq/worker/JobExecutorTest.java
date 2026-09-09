@@ -1,5 +1,6 @@
 package com.distroq.worker;
 
+import com.distroq.effects.JobEffectService;
 import com.distroq.model.Job;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -17,7 +18,8 @@ import static org.mockito.Mockito.when;
 class JobExecutorTest {
 
     private final StringRedisTemplate redis = mock(StringRedisTemplate.class);
-    private final JobExecutor executor = new JobExecutor(redis);
+    private final JobEffectService effects = mock(JobEffectService.class);
+    private final JobExecutor executor = new JobExecutor(redis, effects);
 
     @Test
     void sleepHonoursPayloadDuration() throws Exception {

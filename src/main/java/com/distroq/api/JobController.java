@@ -5,17 +5,18 @@ import com.distroq.api.dto.IdempotencyResponse;
 import com.distroq.api.dto.JobResponse;
 import com.distroq.api.dto.SubmitJobRequest;
 import com.distroq.config.DistroqProperties;
+import com.distroq.effects.JobEffectService;
 import com.distroq.model.AttemptOutcome;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
 import com.distroq.queue.JobQueue;
 import com.distroq.queue.ScheduledJobQueue;
+import com.distroq.reliability.ReliabilityMetrics;
 import com.distroq.repository.DeadLetterRepository;
 import com.distroq.repository.IdempotencyKeyRepository;
 import com.distroq.repository.JobAttemptRepository;
 import com.distroq.repository.JobRepository;
-import com.distroq.repository.OutboxEventRepository;
 import com.distroq.worker.WorkerMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,7 +32,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,33 +48,33 @@ public class JobController {
     private final JobAttemptRepository jobAttemptRepository;
     private final DeadLetterRepository deadLetterRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
-    private final OutboxEventRepository outboxEventRepository;
     private final JobSubmissionService submissionService;
+    private final JobEffectService effectService;
+    private final ReliabilityMetrics reliabilityMetrics;
     private final WorkerMetrics workerMetrics;
     private final JobQueue jobQueue;
     private final ScheduledJobQueue scheduledJobQueue;
-    private final int outboxMaxAttempts;
 
     public JobController(JobRepository jobRepository,
                          JobAttemptRepository jobAttemptRepository,
                          DeadLetterRepository deadLetterRepository,
                          IdempotencyKeyRepository idempotencyKeyRepository,
-                         OutboxEventRepository outboxEventRepository,
                          JobSubmissionService submissionService,
+                         JobEffectService effectService,
+                         ReliabilityMetrics reliabilityMetrics,
                          WorkerMetrics workerMetrics,
                          JobQueue jobQueue,
-                         ScheduledJobQueue scheduledJobQueue,
-                         DistroqProperties properties) {
+                         ScheduledJobQueue scheduledJobQueue) {
         this.jobRepository = jobRepository;
         this.jobAttemptRepository = jobAttemptRepository;
         this.deadLetterRepository = deadLetterRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
-        this.outboxEventRepository = outboxEventRepository;
         this.submissionService = submissionService;
+        this.effectService = effectService;
+        this.reliabilityMetrics = reliabilityMetrics;
         this.workerMetrics = workerMetrics;
         this.jobQueue = jobQueue;
         this.scheduledJobQueue = scheduledJobQueue;
-        this.outboxMaxAttempts = properties.outbox().maxAttempts();
     }
 
     /**
@@ -101,7 +101,8 @@ public class JobController {
     public ResponseEntity<JobDetailResponse> get(@PathVariable UUID id) {
         return jobRepository.findById(id)
                 .map(job -> JobDetailResponse.from(
-                        job, jobAttemptRepository.findByJobIdOrderByAttemptNumberAsc(job.getId())))
+                        job, jobAttemptRepository.findByJobIdOrderByAttemptNumberAsc(job.getId()),
+                        effectService.forJob(job.getId())))
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
@@ -165,6 +166,9 @@ public class JobController {
      * into {@code queueDepth} would make an autoscaler start workers for work that is not due, or
      * into {@code delayedDepth} would make a retry-rate alarm fire because someone scheduled a
      * report for midnight.
+     * <p>v0.8 adds a reliability block from {@link ReliabilityMetrics}. Those values are live
+     * database counts rather than remembered numbers, so they survive a restart and read the same
+     * on every instance; the two exceptions are named in that class.
      */
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
@@ -183,14 +187,7 @@ public class JobController {
         metrics.put("pendingEntriesByPriority", jobQueue.pendingEntriesByPriority());
         metrics.put("activeConsumers", jobQueue.consumersHoldingEntries().size());
         Instant now = Instant.now();
-        Instant oldest = outboxEventRepository.oldestUnpublishedCreatedAt();
-        metrics.put("outboxPending", outboxEventRepository.countPending(now, outboxMaxAttempts));
-        metrics.put("outboxFailed", outboxEventRepository.countRetryableFailures(outboxMaxAttempts));
-        metrics.put("outboxTerminalFailed",
-            outboxEventRepository.countTerminalFailures(outboxMaxAttempts));
-        metrics.put("outboxOldestAgeMs", oldest == null ? 0L
-            : Math.max(0L, Duration.between(oldest, now).toMillis()));
-        metrics.put("outboxPublishedTotal", outboxEventRepository.countByPublishedAtIsNotNull());
+        metrics.putAll(reliabilityMetrics.snapshot(now));
         metrics.put("workerConcurrency", workerMetrics.concurrency());
         metrics.put("activeWorkers", workerMetrics.activeWorkers());
         metrics.put("activeLeases", jobRepository.countActiveLeases(now));
