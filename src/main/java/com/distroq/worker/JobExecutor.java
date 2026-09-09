@@ -1,5 +1,7 @@
 package com.distroq.worker;
 
+import com.distroq.effects.EffectOutcome;
+import com.distroq.effects.JobEffectService;
 import com.distroq.model.Job;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -12,9 +14,11 @@ public class JobExecutor {
     private static final String FLAG_KEY_PREFIX = "distroq:test:flag:";
 
     private final StringRedisTemplate redis;
+    private final JobEffectService effects;
 
-    public JobExecutor(StringRedisTemplate redis) {
+    public JobExecutor(StringRedisTemplate redis, JobEffectService effects) {
         this.redis = redis;
+        this.effects = effects;
     }
 
     public void execute(Job job) throws Exception {
@@ -24,8 +28,28 @@ public class JobExecutor {
                     "Job type 'always_fail' always fails by design");
             case "fail_n_times" -> failFirstN(job);
             case "fail_until_flagged" -> failWhileFlagged(job);
+            case "idempotent_counter" -> incrementOnce(job);
             default -> throw new IllegalArgumentException("Unknown job type: " + job.getType());
         }
+    }
+
+    /**
+     * The only built-in job type with a side effect worth protecting.
+     *
+     * <p>The effect key ignores the attempt number on purpose, so running this job twice — by
+     * redelivery, by reclaim, or by an operator replaying it — increments the counter once. That
+     * is the demonstration: at-least-once delivery of a job, once-only application of its effect.
+     */
+    private void incrementOnce(Job job) {
+        EffectOutcome outcome =
+                effects.applyCounter(job.getId(), job.getAttemptCount(), job.getPayload());
+        if (effectsUnapplied(outcome)) {
+            throw new IllegalStateException("Effect " + outcome.effectKey() + " did not complete");
+        }
+    }
+
+    private static boolean effectsUnapplied(EffectOutcome outcome) {
+        return outcome.responseHash() == null;
     }
 
     // stateless: the attempt number comes from the job, not from a counter held here

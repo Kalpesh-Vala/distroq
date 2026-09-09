@@ -2,6 +2,7 @@ package com.distroq.api.dto;
 
 import com.distroq.model.Job;
 import com.distroq.model.JobAttempt;
+import com.distroq.model.JobEffect;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -32,9 +33,21 @@ public record JobDetailResponse(
          */
         Instant scheduledAt,
         Long durationMs,
-        List<AttemptResponse> attempts) {
+        List<AttemptResponse> attempts,
+        /**
+         * Protected side effects this job claimed, in v0.8 at most one. Sits alongside
+         * {@code attempts} rather than inside it: an attempt is one execution, an effect spans
+         * however many executions its key survives, and the whole point is that the two counts
+         * differ when redelivery happens.
+         */
+        List<EffectResponse> effects) {
 
     public static JobDetailResponse from(Job job, List<JobAttempt> attempts) {
+        return from(job, attempts, List.of());
+    }
+
+    public static JobDetailResponse from(Job job, List<JobAttempt> attempts,
+                                         List<JobEffect> effects) {
         Instant startedAt = job.getStartedAt();
         Instant finishedAt = job.getFinishedAt();
         Long durationMs = (startedAt == null || finishedAt == null)
@@ -56,6 +69,7 @@ public record JobDetailResponse(
                 job.getNextAttemptAt(),
                 job.getScheduledAt(),
                 durationMs,
-                attempts.stream().map(AttemptResponse::from).toList());
+                attempts.stream().map(AttemptResponse::from).toList(),
+                effects.stream().map(EffectResponse::from).toList());
     }
 }

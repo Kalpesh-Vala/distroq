@@ -3,6 +3,7 @@ package com.distroq.repository;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -86,6 +87,43 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
         @Query(value = "SELECT count(*) FROM jobs WHERE execution_owner IS NOT NULL "
                         + "AND execution_lease_until > :now", nativeQuery = true)
         long countActiveLeases(@Param("now") Instant now);
+
+        // ----------------------------------------------------------------- v0.8 reconciliation
+
+        @Query("select job from Job job where job.status = com.distroq.model.JobStatus.SCHEDULED "
+                        + "and job.scheduledAt < :before order by job.scheduledAt")
+        List<Job> staleScheduled(@Param("before") Instant before, Pageable page);
+
+        @Query("select count(job) from Job job where job.status = com.distroq.model.JobStatus.SCHEDULED "
+                        + "and job.scheduledAt < :before")
+        long countStaleScheduled(@Param("before") Instant before);
+
+        @Query("select job from Job job where job.status = com.distroq.model.JobStatus.RETRYING "
+                        + "and job.nextAttemptAt < :before order by job.nextAttemptAt")
+        List<Job> staleRetrying(@Param("before") Instant before, Pageable page);
+
+        @Query("select count(job) from Job job where job.status = com.distroq.model.JobStatus.RETRYING "
+                        + "and job.nextAttemptAt < :before")
+        long countStaleRetrying(@Param("before") Instant before);
+
+        @Query("select job from Job job where job.status = com.distroq.model.JobStatus.RUNNING "
+                        + "and job.executionLeaseUntil < :before order by job.executionLeaseUntil")
+        List<Job> expiredLeases(@Param("before") Instant before, Pageable page);
+
+        @Query("select count(job) from Job job where job.status = com.distroq.model.JobStatus.RUNNING "
+                        + "and job.executionLeaseUntil < :before")
+        long countExpiredLeases(@Param("before") Instant before);
+
+        /**
+         * Jobs that finished but kept their lease bookkeeping. Not reachable through the claim
+         * service, which clears all three columns in the same statement that sets the terminal
+         * status, so a row here means an out-of-band write.
+         */
+        @Query("select job from Job job where job.status in (com.distroq.model.JobStatus.SUCCEEDED, "
+                        + "com.distroq.model.JobStatus.FAILED, com.distroq.model.JobStatus.DEAD_LETTERED) "
+                        + "and (job.executionOwner is not null or job.activeAttemptId is not null) "
+                        + "order by job.updatedAt")
+        List<Job> terminalWithLease(Pageable page);
 
     List<Job> findTop50ByOrderByCreatedAtDesc();
 

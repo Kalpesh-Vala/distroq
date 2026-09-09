@@ -44,12 +44,13 @@ public class OutboxRelay {
             } catch (Exception failure) {
                 OutboxRelayStore.FailureResult result = store.markFailed(id, failure);
                 if (result.terminal()) {
-                    log.error("Outbox event {} reached the terminal retry limit after {} attempts; "
-                            + "it remains unpublished for operator inspection",
-                            id, result.attemptCount(), failure);
+                    log.error("Outbox event {} is now FAILED after {} attempts against a ceiling "
+                            + "of {}; the relay will not claim it again until an operator retries "
+                            + "it through POST /api/admin/outbox/{}/retry",
+                            id, result.attemptCount(), result.ceiling(), id, failure);
                 } else {
-                    log.error("Outbox event {} failed on attempt {}; it remains unpublished",
-                            id, result.attemptCount(), failure);
+                    log.error("Outbox event {} failed on attempt {} of {}; it returns to PENDING",
+                            id, result.attemptCount(), result.ceiling(), failure);
                 }
             }
         }

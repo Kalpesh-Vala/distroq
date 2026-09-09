@@ -26,9 +26,9 @@ spring:
       port: 6379
   task:
     scheduling:
-      # three @Scheduled tasks that must not block each other: the retry sweep and the scheduled-job
-      # sweep have to keep ticking while the recovery sweep is executing a reclaimed job
-      pool-size: 3
+      # @Scheduled tasks that must not block each other: the retry sweep, the scheduled-job sweep
+      # and the recovery sweep, plus v0.8's outbox relay, reconciliation and retention cleanup
+      pool-size: 6
 
 server:
   error:
@@ -76,12 +76,36 @@ distroq:
     poll-interval-ms: 500
     batch-size: 100
     lock-duration-ms: 30000
+    # the relay budget for one operator generation; the terminal ceiling is this times
+    # (operator-retry-count + 1), so a retry grants a fresh budget without erasing history
     max-attempts: 100
     dedupe-retention-ms: 604800000
-    retention-days: 30
+    published-retention-days: 30
+    # never deleted automatically; the value documents how long an operator should keep them
+    failed-retention-days: 90
+    cleanup-interval-ms: 3600000
+    cleanup-batch-size: 500
     relay-enabled: true
     # acceptance hook: publish to Redis, then fail before PostgreSQL marks the row published
     fail-after-publish: false
+  reconciliation:
+    enabled: true
+    poll-interval-ms: 30000
+    batch-size: 100
+    stale-scheduled-after-ms: 60000
+    stale-outbox-after-ms: 60000
+    stale-lease-after-ms: 60000
+    # the upper bound on repairs. A request may ask for less and never for more.
+    auto-repair: false
+    # off even when auto-repair is on: re-arming a terminal event is an operator decision
+    requeue-failed-outbox: false
+  effects:
+    enabled: true
+    stale-started-after-ms: 300000
+    # a STARTED effect is ambiguous, so closing one automatically is opt-in - see NOTES.md
+    auto-fail-stale: false
+  admin:
+    max-reason-length: 500
   worker:
     concurrency: 1
     execution-lease-ms: 30000

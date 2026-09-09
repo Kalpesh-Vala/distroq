@@ -23,10 +23,20 @@ public final class TestProperties {
             new DistroqProperties.Scheduling(1000L, 100);
 
         public static final DistroqProperties.Outbox OUTBOX =
-                new DistroqProperties.Outbox(500L, 100, 30_000L, 100, 604_800_000L, 30, true, false);
+                new DistroqProperties.Outbox(500L, 100, 30_000L, 100, 604_800_000L, 30, 90,
+                        3_600_000L, 500, true, false);
 
         public static final DistroqProperties.Worker WORKER =
             new DistroqProperties.Worker(1, 30_000L, 5_000L);
+
+    public static final DistroqProperties.Reconciliation RECONCILIATION =
+            new DistroqProperties.Reconciliation(true, 30_000L, 100, 60_000L, 60_000L, 60_000L,
+                    false, false);
+
+    public static final DistroqProperties.Effects EFFECTS =
+            new DistroqProperties.Effects(true, 300_000L, false);
+
+    public static final DistroqProperties.Admin ADMIN = new DistroqProperties.Admin(500);
 
     private TestProperties() {
     }
@@ -47,6 +57,77 @@ public final class TestProperties {
         return of(RETRY, PRIORITY, streams);
     }
 
+    public static DistroqProperties of(DistroqProperties.Outbox outbox) {
+        return new DistroqProperties(
+                "distroq:jobs:pending",
+                "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
+                "distroq:jobs:stream",
+                RETRY,
+                DLQ,
+                PRIORITY,
+                STREAMS,
+                SCHEDULING,
+                outbox,
+                WORKER,
+                RECONCILIATION,
+                EFFECTS,
+                ADMIN);
+    }
+
+    public static DistroqProperties of(DistroqProperties.Reconciliation reconciliation) {
+        return new DistroqProperties(
+                "distroq:jobs:pending",
+                "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
+                "distroq:jobs:stream",
+                RETRY,
+                DLQ,
+                PRIORITY,
+                STREAMS,
+                SCHEDULING,
+                OUTBOX,
+                WORKER,
+                reconciliation,
+                EFFECTS,
+                ADMIN);
+    }
+
+    public static DistroqProperties of(DistroqProperties.Effects effects) {        return new DistroqProperties(
+                "distroq:jobs:pending",
+                "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
+                "distroq:jobs:stream",
+                RETRY,
+                DLQ,
+                PRIORITY,
+                STREAMS,
+                SCHEDULING,
+                OUTBOX,
+                WORKER,
+                RECONCILIATION,
+                effects,
+                ADMIN);
+    }
+
+    public static DistroqProperties of(DistroqProperties.Admin admin) {
+        return new DistroqProperties(
+                "distroq:jobs:pending",
+                "distroq:jobs:delayed",
+                "distroq:jobs:scheduled",
+                "distroq:jobs:stream",
+                RETRY,
+                DLQ,
+                PRIORITY,
+                STREAMS,
+                SCHEDULING,
+                OUTBOX,
+                WORKER,
+                RECONCILIATION,
+                EFFECTS,
+                admin);
+    }
+
     public static DistroqProperties of(DistroqProperties.Scheduling scheduling) {
         return new DistroqProperties(
                 "distroq:jobs:pending",
@@ -59,7 +140,10 @@ public final class TestProperties {
                 STREAMS,
                 scheduling,
                 OUTBOX,
-                WORKER);
+                WORKER,
+                RECONCILIATION,
+                EFFECTS,
+                ADMIN);
     }
 
     public static DistroqProperties of(DistroqProperties.Retry retry,
@@ -76,6 +160,9 @@ public final class TestProperties {
                 streams,
                 SCHEDULING,
                 OUTBOX,
-                WORKER);
+                WORKER,
+                RECONCILIATION,
+                EFFECTS,
+                ADMIN);
     }
 }

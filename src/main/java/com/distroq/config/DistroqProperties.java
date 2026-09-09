@@ -17,7 +17,10 @@ public record DistroqProperties(
         @DefaultValue Streams streams,
         @DefaultValue Scheduling scheduling,
         @DefaultValue Outbox outbox,
-        @DefaultValue Worker worker) {
+        @DefaultValue Worker worker,
+        @DefaultValue Reconciliation reconciliation,
+        @DefaultValue Effects effects,
+        @DefaultValue Admin admin) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -84,13 +87,29 @@ public record DistroqProperties(
             @DefaultValue("100") int promoteBatchSize) {
     }
 
+    /**
+     * Relay, deduplication and retention.
+     *
+     * <p>{@code maxAttempts} is the relay budget for one operator generation of the event, not a
+     * lifetime cap: the terminal ceiling is {@code maxAttempts * (operatorRetryCount + 1)}, so an
+     * operator retry hands the event a fresh budget without erasing the attempts it already made.
+     *
+     * <p>{@code dedupeRetentionMs} is the TTL of the Redis marker that makes republication a
+     * no-op. It is deliberately compared against {@code publishedRetentionDays} before a row is
+     * deleted: deleting an outbox row while its marker is still alive is harmless, but deleting a
+     * row whose marker has expired removes the only two pieces of evidence that the publication
+     * ever happened. See NOTES.md.
+     */
     public record Outbox(
             @DefaultValue("500") long pollIntervalMs,
             @DefaultValue("100") int batchSize,
             @DefaultValue("30000") long lockDurationMs,
             @DefaultValue("100") int maxAttempts,
             @DefaultValue("604800000") long dedupeRetentionMs,
-            @DefaultValue("30") int retentionDays,
+            @DefaultValue("30") int publishedRetentionDays,
+            @DefaultValue("90") int failedRetentionDays,
+            @DefaultValue("3600000") long cleanupIntervalMs,
+            @DefaultValue("500") int cleanupBatchSize,
             @DefaultValue("true") boolean relayEnabled,
             @DefaultValue("false") boolean failAfterPublish) {
     }
@@ -99,5 +118,45 @@ public record DistroqProperties(
             @DefaultValue("1") int concurrency,
             @DefaultValue("30000") long executionLeaseMs,
             @DefaultValue("5000") long heartbeatIntervalMs) {
+    }
+
+    /**
+     * Reconciliation between PostgreSQL intent and Redis publication state.
+     *
+     * <p>{@code autoRepair} is an upper bound, not a default. A request may ask for less than the
+     * configuration allows and never for more, so turning repairs on is a deployment decision
+     * rather than something an HTTP body can do.
+     *
+     * <p>{@code requeueFailedOutbox} is the one repair that is off even when {@code autoRepair}
+     * is on: re-arming a terminal event is exactly the operator decision v0.8 refuses to make on
+     * its own.
+     */
+    public record Reconciliation(
+            @DefaultValue("true") boolean enabled,
+            @DefaultValue("30000") long pollIntervalMs,
+            @DefaultValue("100") int batchSize,
+            @DefaultValue("60000") long staleScheduledAfterMs,
+            @DefaultValue("60000") long staleOutboxAfterMs,
+            @DefaultValue("60000") long staleLeaseAfterMs,
+            @DefaultValue("false") boolean autoRepair,
+            @DefaultValue("false") boolean requeueFailedOutbox) {
+    }
+
+    /**
+     * The side-effect ledger.
+     *
+     * <p>{@code staleStartedAfterMs} is how long a STARTED effect may sit before reconciliation
+     * reports it. It is not a timeout after which the effect is assumed not to have happened —
+     * that is unknowable — which is why {@code autoFailStale} defaults to false.
+     */
+    public record Effects(
+            @DefaultValue("true") boolean enabled,
+            @DefaultValue("300000") long staleStartedAfterMs,
+            @DefaultValue("false") boolean autoFailStale) {
+    }
+
+    /** v0.8 has no authentication. {@code X-Admin-Reason} is an audit trail, not authorization. */
+    public record Admin(
+            @DefaultValue("500") int maxReasonLength) {
     }
 }

@@ -147,6 +147,26 @@ public class Job {
         return attemptCount < maxAttempts;
     }
 
+    /**
+     * Drop lease bookkeeping from a job that has already finished.
+     *
+     * <p>The only lease repair v0.8 performs without an operator, and only because a terminal
+     * status is proof that finalization already happened: whoever held the lease can no longer
+     * use it, since every finalizing statement requires a live lease it no longer has. A RUNNING
+     * job whose lease merely expired gets none of this — see NOTES.md.
+     */
+    public void releaseTerminalLease() {
+        if (status != JobStatus.SUCCEEDED && status != JobStatus.FAILED
+                && status != JobStatus.DEAD_LETTERED) {
+            throw new IllegalStateException("Only a finished job can have its lease released; job "
+                    + id + " is " + status);
+        }
+        this.executionOwner = null;
+        this.executionLeaseUntil = null;
+        this.activeAttemptId = null;
+        this.updatedAt = Instant.now();
+    }
+
     public void markRunning() {
         Instant now = Instant.now();
         this.status = JobStatus.RUNNING;
