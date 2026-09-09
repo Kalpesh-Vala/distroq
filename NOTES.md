@@ -99,6 +99,15 @@ job waiting on a worker look identical from the database. A Redis outage during 
 logged and skipped rather than turned into a finding — "I could not look" is not evidence of a
 problem, and turning it into one would make every network blip page somebody.
 
+Counting outbox events for one job needs the same care, and the first attempt got it wrong. A user
+schedule publishes **once, ever**, so any second non-terminal `SCHEDULE_USER_JOB` is a duplicate.
+A retry publishes **once per attempt**, so a job on its third attempt legitimately has two
+published `SCHEDULE_RETRY` events behind it, and only the *unpublished* ones can compete. The
+original rule counted published events as competitors in both cases, which would have made every
+healthy retrying job a permanent finding — exactly the kind of noise that trains an operator to
+ignore the report. Caught by writing the negative test rather than by the acceptance run, which
+happened not to produce a job in that shape.
+
 ### 5. Safe repair boundaries
 
 The rule: repair automatically only where the database state *proves* the repair correct. Not where
@@ -262,6 +271,10 @@ second run of A7 found the same ten findings and repaired zero of them.
 
 The second mechanism matters more than the first. The lock is a courtesy that keeps logs readable;
 idempotent repairs are what makes the design correct if the lock is ever wrong.
+
+Both halves are verified against a real database rather than a mock, because a mock decides the
+contention itself. `ReconciliationLockLiveTest` holds the advisory key open on one connection and
+shows a scheduled tick skipping while an operator run queues behind it and then completes.
 
 ### 12. Remaining limitations
 

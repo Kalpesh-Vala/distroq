@@ -2171,9 +2171,9 @@ Invoke-RestMethod -Uri http://localhost:8080/api/metrics |
   Select-Object effectApplications, effectDeduplicationHits
 # attemptCount 2, one effects entry, counter unchanged, effectDeduplicationHits +1
 
-# 48. Concurrent effect claims, against the real database
-.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest" "-Ddistroq.live=true" `
-  "-DfailIfNoSpecifiedTests=false"
+# 48. Concurrent effect claims and advisory-lock contention, against the real database
+.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest,ReconciliationLockLiveTest" `
+  "-Ddistroq.live=true" "-DfailIfNoSpecifiedTests=false"
 
 # 49. Admin filters, redaction and audit history
 Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox?status=FAILED"
@@ -2289,7 +2289,9 @@ v0.8 adds:
   empty ones; preview mutating nothing and auditing nothing; configuration bounding the request in
   both directions; an allowed repair being performed and audited; an expired execution lease and a
   stale effect being skipped even when repairs are on; a second run repairing nothing; and a run
-  that cannot take the advisory lock reporting that instead of scanning.
+  that cannot take the advisory lock reporting that instead of scanning. Also the two negative
+  cases that keep the duplicate-event rule honest: a healthy retrying job with published retry
+  events behind it is **not** a duplicate, while a second live schedule event for one job is.
 - `JobEffectServiceTest` — one ledger row and one increment; a repeated key not incrementing again;
   the recorded hash coming back on a deduplicated call; payload normalisation being part of the
   identity; a `FAILED` key being reclaimable on the same row; a `STARTED` key refusing to apply;
@@ -2302,16 +2304,19 @@ v0.8 adds:
 `JobEffectConcurrencyLiveTest` is the exception to "no infrastructure". The concurrent-claim
 guarantee comes from two connections colliding on a primary key — the loser blocks on the winner's
 uncommitted insert and then reads a committed `COMPLETED` row — and a stubbed repository decides
-that outcome by itself rather than demonstrating it. It is gated on a system property rather than
-`@Disabled`, so it can actually be run:
+that outcome by itself rather than demonstrating it. `ReconciliationLockLiveTest` is the same
+argument for the advisory lock: a mock can prove that a *denied* lock produces a skipped report,
+but not that the lock is genuinely contended, nor that the scheduled sweep and an operator run make
+opposite choices about waiting for it. Both are gated on a system property rather than `@Disabled`,
+so they can actually be run:
 
 ```powershell
-.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest" "-Ddistroq.live=true" `
-  "-DfailIfNoSpecifiedTests=false"
+.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest,ReconciliationLockLiveTest" `
+  "-Ddistroq.live=true" "-DfailIfNoSpecifiedTests=false"
 ```
 
-It redirects the queue keys so its worker polls its own empty streams instead of competing with a
-running instance for real work.
+Both redirect the queue keys so their workers poll their own empty streams instead of competing
+with a running instance for real work.
 
 ## Known limitations
 

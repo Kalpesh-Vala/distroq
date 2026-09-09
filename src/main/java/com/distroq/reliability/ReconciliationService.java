@@ -51,7 +51,7 @@ import java.util.UUID;
 public class ReconciliationService {
 
     /** Arbitrary but fixed: the advisory-lock namespace shared by every DistroQ instance. */
-    private static final long ADVISORY_LOCK_KEY = 0x4469_7374_726F_7100L;
+    static final long ADVISORY_LOCK_KEY = 0x4469_7374_726F_7100L;
 
     private static final Logger log = LoggerFactory.getLogger(ReconciliationService.class);
 
@@ -268,7 +268,7 @@ public class ReconciliationService {
                 continue;
             }
             reportEventAnomalies(context, job, events, FindingType.SCHEDULED_JOB_EVENT_FAILED,
-                    FindingType.DUPLICATE_SCHEDULE_EVENT, 1);
+                    FindingType.DUPLICATE_SCHEDULE_EVENT, true);
         }
         reportUnpromotedMembers(context);
     }
@@ -325,18 +325,20 @@ public class ReconciliationService {
                 continue;
             }
             reportEventAnomalies(context, job, events, FindingType.RETRY_EVENT_FAILED,
-                    FindingType.DUPLICATE_RETRY_EVENT, 0);
+                    FindingType.DUPLICATE_RETRY_EVENT, false);
         }
     }
 
     /**
-     * @param publishedAllowance how many PUBLISHED events are normal for this job. A user schedule
-     *                           publishes once; retries publish once per attempt, so only the
-     *                           unpublished ones can be duplicates there.
+     * @param oneEventPerLifetime true when a job may only ever have one non-terminal event of this
+     *                            type, as for a user schedule. False for retries, where one event
+     *                            per attempt is normal and only the unpublished ones can compete:
+     *                            a job on its third attempt legitimately has two published
+     *                            SCHEDULE_RETRY events behind it.
      */
     private void reportEventAnomalies(Context context, Job job, List<OutboxEvent> events,
                                       FindingType failedType, FindingType duplicateType,
-                                      int publishedAllowance) {
+                                      boolean oneEventPerLifetime) {
         events.stream()
                 .filter(OutboxEvent::isTerminal)
                 .forEach(event -> context.add(ReliabilityFinding.reported(failedType, "OutboxEvent",
@@ -350,9 +352,11 @@ public class ReconciliationService {
         long published = events.stream()
                 .filter(event -> event.getStatus() == OutboxStatus.PUBLISHED)
                 .count();
-        if (active > 1 || (active >= 1 && published > publishedAllowance)) {
+        long competing = oneEventPerLifetime ? active + published : active;
+        if (competing > 1) {
             context.add(ReliabilityFinding.reported(duplicateType, "Job", job.getId().toString(),
-                    active + " unpublished and " + published + " published event(s) for one job"));
+                    competing + " competing event(s) for one job: " + active + " unpublished, "
+                            + published + " published"));
         }
     }
 
