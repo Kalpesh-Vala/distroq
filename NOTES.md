@@ -3,6 +3,287 @@
 Running log of known limitations, failure modes observed, and design decisions.
 Written for my own reference and interview prep.
 
+## What v0.8 changed about the plan
+
+### 1. Why implicit outbox state was insufficient
+
+v0.7 stored no state. It stored four nullable columns — `published_at`, `attempt_count`,
+`locked_until`, `last_error` — and reconstructed state from them at every read. That is fine for a
+relay loop, which reads them all in one query with `max-attempts` already in hand. It is not fine
+for anything else.
+
+The specific failure is that `attempt_count = 100` does not mean anything on its own. Whether that
+row is being retried or has given up depends on a *configuration value at the time of the query*,
+which is not in the row, is not in the backup, and can have changed since. Two consequences
+followed. An alert had to know `max-attempts` to be written at all, so the alert and the
+configuration could drift apart silently. And "the relay gave up on this at 14:32" was simply not
+recorded anywhere: there was no `terminal_failed_at`, because there was no moment at which anything
+decided the event was terminal — terminality was a property of a comparison, re-evaluated on every
+read.
+
+The fix is not more columns. It is that a state transition should be an *event that happens once*
+and leaves a record, rather than a predicate re-derived forever. `status` is now written at the
+moment the relay reaches its verdict, `terminal_failed_at` is stamped then and never recomputed,
+and the four old columns became what they should always have been: the audit trail explaining how
+the row got to the state it is in.
+
+The other thing that only became possible with explicit state is *not claiming a row*. Under v0.7
+the claim query filtered on `attempt_count < :maxAttempts`, so lowering `max-attempts` retroactively
+retired live events and raising it silently resurrected dead ones. Now the query filters on
+`status`, and configuration affects only what happens next.
+
+### 2. Terminal failure semantics
+
+A `FAILED` row is not garbage. It is the only surviving evidence of an intent that was committed
+and never carried out, and it is usually the *only* thing that can tell an operator which jobs are
+affected by an outage that has since ended.
+
+So: the relay never claims it, cleanup never deletes it, and reconciliation never re-arms it. The
+one automatic path that can — `reconciliation.requeue-failed-outbox` — is off even when
+`auto-repair` is on, because it is precisely the decision v0.8 exists to hand to a human. Retrying
+a terminal event means asserting that the world has changed, and nothing in the database can
+observe that.
+
+`failed-retention-days` exists in configuration and is deliberately not wired to a delete. It
+documents how long an operator should keep this evidence. Making it enforce a deletion would put
+the code back in the business of throwing away the thing it just spent a release learning to keep.
+
+### 3. Operator retry
+
+Three properties, each of which rules out an easier implementation.
+
+**The event ID is preserved.** The obvious implementation — copy the payload into a fresh event —
+is wrong, and wrong in the worst way: it works. It publishes, the job runs, and nothing looks
+broken. What it discards is the Redis deduplication marker, which is keyed by event ID. If the
+original event *had* reached Redis before the relay lost its answer, the copy publishes a second
+time and the job runs twice. Preserving the identity is what makes an operator retry safe to press
+when you are not sure what happened.
+
+**The controller does not publish.** It sets `status` back to `PENDING` and stops. Publishing from
+the controller would reintroduce, in the repair path, exactly the dual write the outbox was built
+to remove — and the repair path is the one place you least want a new failure mode, because it is
+used during incidents.
+
+**`attempt_count` is preserved and the ceiling moves.** The alternative is resetting the count,
+which loses the history precisely when it is most useful ("has this been failing for two minutes or
+two days?"). The ceiling is `max-attempts × (operator_retry_count + 1)`, so a retry buys one fresh
+budget. `max-attempts` keeps meaning "tries before a human is asked" — the only reading an alert
+can act on — while `attempt_count` keeps meaning what it says.
+
+If it fails again it returns to `FAILED` with the retry history intact, and a second retry is a
+second audit row with a second reason. The reason is required in two places, header and body,
+which is redundant on purpose: the header is uniform across every mutating endpoint so a proxy or
+a log can rely on it, and the body is specific to this event.
+
+### 4. Reconciliation source of truth
+
+The tempting design is to scan the Streams and look for jobs that are missing. It cannot work, for
+two independent reasons, and they point in opposite directions.
+
+An acknowledged entry stays in the stream — nothing here trims — so **presence proves nothing**.
+An entry for a job that finished an hour ago looks exactly like an entry for one that never ran.
+
+And once trimming exists, or once the deduplication marker's TTL passes, **absence proves nothing
+either**. A job with no entry might never have been published, or might have been published,
+consumed, acknowledged and cleaned up.
+
+Both halves of the inference fail, so the inference is not weak — it is unavailable. The only
+statements that survive are about rows DistroQ wrote inside a transaction: the outbox row, the job
+row, the attempt row. Those have a definite history because a transaction gave them one.
+
+There is exactly one exception, and it is worth being precise about why. Reconciliation reads the
+scheduled sorted set and looks for a member whose score is already past. That is not an inference
+from absence: the member is *present*, it is *due*, and its presence is positive evidence that the
+promoter has not run. No PostgreSQL table can show that, because a job waiting on a promoter and a
+job waiting on a worker look identical from the database. A Redis outage during that read is
+logged and skipped rather than turned into a finding — "I could not look" is not evidence of a
+problem, and turning it into one would make every network blip page somebody.
+
+### 5. Safe repair boundaries
+
+The rule: repair automatically only where the database state *proves* the repair correct. Not where
+it makes the repair likely, or sensible, or what a human would probably do.
+
+Four repairs clear that bar:
+
+- **An expired relay lock.** The lease expiring is the proof. That is what a lease is for.
+- **A row with `published_at` set but `status` not `PUBLISHED`.** The timestamp is the proof.
+  Notably the mirror case — `PUBLISHED` with no timestamp — is *skipped*, because it proves
+  nothing in either direction.
+- **A `SCHEDULED` or `RETRYING` job with no event of that type at all.** Absence of the row is the
+  proof: an event that was never written cannot have published.
+- **A finished job still holding lease columns.** A terminal status is the proof, because every
+  finalizing statement requires a live lease the old owner no longer has.
+
+The one that most obviously *looks* repairable and is not is `EXPIRED_EXECUTION_LEASE`. A lapsed
+lease proves the worker stopped renewing. It does not prove the worker stopped working — the
+process may be alive and paused, or partitioned, or simply slow. Recovery already has an owner:
+`XAUTOCLAIM` moves transport ownership after `claim-min-idle-ms`, and the replacement worker takes
+execution ownership with a conditional `UPDATE` that abandons the old attempt. A "repair" here
+would create a second claim competing with the worker that is about to make the real one, and the
+whole point of the lease is that there is only ever one.
+
+`STALE_PENDING_OUTBOX` is likewise reported and not repaired, because the relay owns those rows
+and reconciliation touching them would race the relay for no benefit.
+
+The general shape: reconciliation repairs *bookkeeping*, never *ownership*.
+
+### 6. Retention
+
+Cleanup deletes only `PUBLISHED` rows, and only when three things hold at once: the row is past
+the retention window, no sibling event for the same job is `FAILED` or mid-publication, and the
+job is not itself in a state reconciliation would report. The last two exist because the worst
+possible time to delete evidence is during the incident that made it interesting.
+
+The subtle part is the window. It is **the longer of** `published-retention-days` and
+`dedupe-retention-ms`, and the reason is that the row and the Redis marker are two copies of the
+same fact with different lifetimes:
+
+```text
+marker alive, row alive    -> two protections against republication; losing either is survivable
+marker dead,  row alive    -> the row is the only remaining evidence the publication happened
+marker dead,  row deleted  -> nothing knows. A republication here creates a duplicate.
+```
+
+Deleting the row while the marker is still alive is harmless. Deleting it after the marker has
+expired, but while anything could still republish the event, is how a duplicate gets made. So
+cleanup waits for whichever clock runs longer, and configuring a short retention does not shorten
+it — it only means the marker is now the binding constraint.
+
+All three conditions live in the SQL rather than in Java. That is deliberate: a filter applied in
+Java after the query is a filter someone can forget to apply, and `OutboxRetentionPolicyTest`
+asserts against the query text for the same reason. A mocked repository cannot prove "`PENDING` is
+never deleted" — the mock is the thing deciding what comes back.
+
+### 7. Auditability
+
+`reliability_actions` gets a row for every mutation by an operator or by reconciliation, in the
+**same transaction** as the state change. Not "immediately after". The same transaction, because
+anything else has a window in which the database has been repaired and nothing says who did it —
+and that window is exactly where a confusing incident report comes from.
+
+`ReliabilityAuditService.record` is `@Transactional(propagation = MANDATORY)`. It throws if called
+outside a transaction. That turns "remember to audit inside the transaction" from a convention
+into a runtime failure, which is the only form of that rule that survives contact with a future
+change.
+
+`before_state` and `after_state` are short structural summaries — statuses, counts, timestamps.
+Never payloads. An audit table is read casually, copied into tickets, and outlives the job it
+describes; putting user data in it creates a redaction problem later, for no diagnostic benefit
+now. The same reasoning gives the outbox detail endpoint a payload *digest* instead of a payload:
+"is this the same thing twice?" is the question operators actually ask, and a hash answers it.
+
+### 8. Submission idempotency versus effect idempotency
+
+They are unrelated, and conflating them is the mistake v0.8 is most trying to prevent. Four
+mechanisms, four windows:
+
+```text
+Idempotency-Key   two jobs from one submission           HTTP request
+outbox event ID   two publications of one intent         Redis publication
+execution lease   a stale worker finalizing state        database ownership
+effect key        one side effect happening twice        one logical operation
+```
+
+A retried `POST` with the same `Idempotency-Key` creates one job — and says nothing about how many
+times that job runs. A job delivered three times has one outbox event and one dedupe marker — and
+runs three times if three workers get it. An execution lease guarantees one worker's `UPDATE`
+lands — and does nothing about the HTTP call that worker already made.
+
+Each closes exactly one window, and the windows do not overlap. Closing all four still leaves the
+gap between "the external system accepted the call" and "we recorded that it did".
+
+### 9. Effect ledger limitations
+
+The ledger works because the claim and the effect commit **in the same transaction**. That is why
+`idempotent_counter` is a counter in the same PostgreSQL database and not an HTTP call: there is
+no instant at which the counter has moved and the ledger does not know, because there is no
+instant between two statements in one transaction.
+
+An external HTTP call cannot join that transaction. It commits in someone else's system, on their
+schedule, and the acknowledgement travels back over a network that can drop it. The ledger can
+record an *intent* to call and a *belief* about the outcome; it cannot make the call atomic with
+the record of it.
+
+What the ledger does buy, for integrations that opt in: a stable identity for a logical operation,
+independent of how many times it was delivered or attempted, and arbitration between concurrent
+claimers that is done by the primary key rather than by timing. Two workers racing the same key
+are separated by PostgreSQL — the loser blocks on the winner's uncommitted insert and then reads
+`COMPLETED`.
+
+The effect key deliberately excludes the attempt number. Keying on the attempt would make every
+redelivery a new effect, which is exactly the duplicate the ledger exists to prevent. Three
+identities have to be kept apart by name, because they are routinely confused:
+
+```text
+physical delivery attempt   stream entry ID + consumer     new on every redelivery
+job attempt                 attemptCount + job_attempts    new on every execution
+logical effect key          job ID + operation identity    stable across both
+```
+
+Which of those an effect should key on is a decision only the handler can make, because only the
+handler knows what "the same work" means. `EffectKeys` offers both shapes and picks neither.
+
+### 10. Stale effects
+
+`STARTED` is the state that carries no information, and it is the honest centre of this release.
+
+A worker claimed the key, and then stopped. It may be mid-flight. It may have died a millisecond
+before calling the external system, or a millisecond after the external system accepted the call
+and before the acknowledgement arrived. Those are indistinguishable from here, and they always will
+be — the information does not exist in this process.
+
+So the ledger refuses to guess. A second claimer of a `STARTED` key throws rather than applying the
+effect, which hands the decision to the retry machinery. If the row is still `STARTED` past
+`stale-started-after-ms`, reconciliation reports it. The configured policy can then close it as
+`FAILED` — releasing the key for another attempt — and **never** as `COMPLETED`. Marking it
+completed would assert that an effect happened which nobody observed, and would suppress the retry
+that is the only remaining way to make it happen.
+
+Both choices are wrong in one direction. Closing it as `FAILED` risks doing the effect twice.
+Leaving it `STARTED` risks never doing it at all. v0.8 defaults to leaving it, because the default
+should be the one that requires a human rather than the one that quietly picks a side; and it
+makes the alternative one configuration flag away for systems where a duplicate is cheaper than an
+omission. `FAILED` in this ledger means "a worker observed the effect not happening", and a stale
+row closed by policy is a weaker claim than that — the audit row says so explicitly.
+
+### 11. Multi-instance reconciliation
+
+Every instance runs the sweep. There is no leader election, which is consistent with the scheduled
+promoter and for the same reason: electing a leader is a distributed-systems problem of its own,
+and the work here is cheap enough that duplication is not the concern — *conflicting* duplication
+is.
+
+Two mechanisms handle that. A run takes `pg_try_advisory_xact_lock` for its transaction, so two
+instances cannot repair the same row at the same time; the scheduled sweep skips a tick rather
+than queueing, while an operator-initiated run waits, because an operator wants an answer and a
+timer does not. And every repair is a conditional transition that is a no-op the second time — the
+second run of A7 found the same ten findings and repaired zero of them.
+
+The second mechanism matters more than the first. The lock is a courtesy that keeps logs readable;
+idempotent repairs are what makes the design correct if the lock is ever wrong.
+
+### 12. Remaining limitations
+
+- **No authentication on the admin endpoints.** `X-Admin-Reason` is a forcing function for the
+  audit trail, not authorization. Anything that can reach the port can call these.
+- **No exactly-once external effects,** and v0.8 does not claim any. See 8 and 9.
+- **Redis dedupe retention is bounded.** After `dedupe-retention-ms` the marker is gone. An event
+  that stayed terminal longer than that and is then retried has no Redis-side protection left.
+- **Terminal outbox failures require manual intervention** by design, which means
+  `outboxTerminalFailed` has to be alerted on. Nothing else will notice.
+- **A crash during an external effect is permanently ambiguous.** See 10.
+- **Reconciliation cannot prove a historical publication** once both the dedupe marker and the
+  outbox row are gone. Retention is chosen to make that window unlikely, not impossible.
+- **Reconciliation is bounded by `batch-size`.** A large backlog needs several runs;
+  `inspected == batchSize` is the signal.
+- **A Redis outage can starve the scheduler pool.** Four of the six `@Scheduled` sweeps issue Redis
+  commands, and a disconnected Lettuce client blocks each for its command timeout. Observed during
+  A3: with the pool sized exactly to the number of sweeps, the relay waited so long for a thread
+  that it made no attempt at all for the first thirty seconds of an outage — the worst sweep to
+  delay, since noticing the outage is its job. Raising the pool and shortening
+  `spring.data.redis.timeout` both fix it; the README says so.
+
 ## What v0.7 changed about the plan
 
 ### 1. Why the dual-write problem required an outbox

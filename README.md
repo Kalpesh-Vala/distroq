@@ -1,28 +1,390 @@
-# DistroQ v0.7
+# DistroQ v0.8
 
-v0.7 is the first reliability-focused release. PostgreSQL transactions now persist both business
-state and an immutable publication intent; an outbox relay publishes that intent to Redis with
-event-ID deduplication. Submission can be idempotent, one process can run multiple unique Redis
-consumers, and every execution must first obtain a renewable database lease.
+v0.8 is the operations release. v0.7 made publication durable; v0.8 makes it *legible*. The outbox
+now has an explicit lifecycle rather than one inferred from nullable columns, a terminal failure
+survives for a human to look at instead of retrying forever in silence, a reconciliation pass
+compares PostgreSQL intent against what the rest of the system actually did, every operator or
+automatic repair writes an audit row, and a side-effect ledger gives cooperating integrations an
+identity that survives redelivery.
 
 ```text
-HTTP request
+PostgreSQL transaction
     |
-PostgreSQL transaction: jobs + optional idempotency_keys + outbox_events
+    +-- business state
+    +-- outbox event                    PENDING
     |
-Outbox relay: FOR UPDATE SKIP LOCKED + short lease
+    v
+Outbox relay                            PENDING -> PUBLISHING -> PUBLISHED
+    |                                              |
+    +-- Redis publication                          +-> FAILED (terminal, waits for an operator)
+    +-- deduplication marker
     |
-Redis Stream or Sorted Set: atomic publish + event dedupe marker
+    v
+Reconciliation
     |
-XREADGROUP / XAUTOCLAIM
+    +-- detect missing publication
+    +-- detect terminal relay failure
+    +-- detect stale scheduling intent
+    +-- detect lease anomalies
+    +-- detect stale effects
     |
-conditional PostgreSQL execution claim + heartbeat
+    v
+Operator action, or a repair that the database already proves is correct
     |
-worker execution -> success / retry outbox event / DLQ
+    +-- reliability_actions (same transaction as the state change)
 ```
 
 PostgreSQL remains the source of truth. Redis remains an at-least-once delivery mechanism.
-Neither the outbox nor the execution lease makes arbitrary external side effects exactly once.
+
+> `Idempotency-Key` prevents duplicate job creation.
+> Outbox event IDs prevent duplicate Redis publication.
+> Execution leases prevent stale workers from finalizing database state.
+> Effect keys protect only integrations that participate in the effect protocol.
+> None of these alone makes arbitrary external side effects exactly once.
+
+## What changed in v0.8
+
+### The outbox lifecycle is explicit
+
+v0.7 inferred state from `published_at`, `attempt_count` and `locked_until`. That is enough for a
+relay loop and not enough for an operator: "failed" and "not tried yet" look identical unless you
+also know what `max-attempts` was set to at the time. `outbox_events.status` is now authoritative.
+
+| Status | Meaning | Claimed by the relay? | Deleted by cleanup? |
+| --- | --- | --- | --- |
+| `PENDING` | Eligible. The initial state, and the state an operator retry restores. | Yes | Never |
+| `PUBLISHING` | Claimed under a relay lease. | Only once `locked_until` has passed | Never |
+| `PUBLISHED` | Redis publication succeeded. | No | Only past retention |
+| `FAILED` | Budget exhausted. Waiting for a human. | **No** | **Never** |
+
+The nullable columns are all still there and still written — they are the audit trail now, not the
+state machine.
+
+A `PUBLISHING` row whose lease expired is picked up by the *relay*, not by reconciliation:
+
+```sql
+WHERE (status = 'PENDING' OR (status = 'PUBLISHING' AND locked_until < :now))
+  AND available_at <= :now
+```
+
+That matters more than it looks. It means the queue drains after a crash whether or not
+reconciliation is enabled, and reconciliation is a diagnostic rather than a load-bearing part of
+delivery. Reconciliation reports the same rows so the crash is visible.
+
+### Terminal failure
+
+When an event exhausts its budget it becomes `FAILED`, `terminal_failed_at` is stamped, and the
+relay stops claiming it. Nothing deletes it. Nothing quietly retries it. The log says exactly what
+to do:
+
+```text
+Outbox event 12ad91eb-... is now FAILED after 2 attempts against a ceiling of 2; the relay will
+not claim it again until an operator retries it through POST /api/admin/outbox/12ad91eb-.../retry
+```
+
+The ceiling is `max-attempts × (operator_retry_count + 1)`, not a lifetime cap. `attempt_count` is
+cumulative and is never reset, so each operator retry moves the ceiling instead of erasing the
+history: attempt 214 really is the 214th attempt, and `max-attempts` keeps meaning "tries before a
+human is asked", which is the only reading an alert can act on.
+
+### Operator retry
+
+```powershell
+$headers = @{ "X-Admin-Reason" = "Redis was restored after maintenance" }
+$body = @{ reason = "Retry terminal event after Redis recovery" } | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -Headers $headers -ContentType "application/json" -Body $body
+```
+
+`202 Accepted` — the event is back in the queue, and the publication has not happened yet and will
+not happen on that thread. Three things the endpoint deliberately does **not** do:
+
+- It does not create a second event. A new event ID would defeat the Redis deduplication marker,
+  which is the only thing standing between a repaired event and a double publication.
+- It does not publish to Redis. A controller that writes to Redis is exactly the dual write the
+  outbox exists to remove. The normal relay picks the event up on its next tick.
+- It does not reset `attempt_count`.
+
+`409` if the event is not `FAILED`, `404` if it does not exist, `400` if either reason is missing,
+blank, or over `distroq.admin.max-reason-length`. An `OUTBOX_RETRY` audit row records the before
+state, the after state, both reasons and the actor.
+
+### Reconciliation
+
+A scheduled sweep, plus `POST /api/admin/reconciliation/run`, that compares durable intent against
+observable state. It is bounded by `batch-size`, idempotent, safe on several instances at once
+(each run holds a PostgreSQL advisory lock for its transaction), and **non-destructive by
+default**.
+
+| Category | Findings |
+| --- | --- |
+| `OUTBOX` | `STALE_PENDING_OUTBOX`, `EXPIRED_OUTBOX_LOCK`, `TERMINAL_OUTBOX_FAILURE`, `INCONSISTENT_PUBLISHED_OUTBOX`, `ORPHANED_OUTBOX_EVENT`, `MALFORMED_OUTBOX_PAYLOAD` |
+| `SCHEDULED_JOBS` | `STALE_SCHEDULED_JOB`, `SCHEDULED_JOB_WITHOUT_EVENT`, `SCHEDULED_JOB_EVENT_FAILED`, `DUPLICATE_SCHEDULE_EVENT`, `UNPROMOTED_SCHEDULED_MEMBER` |
+| `RETRIES` | `STALE_RETRY_JOB`, `RETRY_JOB_WITHOUT_EVENT`, `RETRY_EVENT_FAILED`, `DUPLICATE_RETRY_EVENT` |
+| `EXECUTION_LEASES` | `EXPIRED_EXECUTION_LEASE`, `MISSING_ACTIVE_ATTEMPT`, `MULTIPLE_IN_PROGRESS_ATTEMPTS`, `ATTEMPT_OWNER_MISMATCH`, `TERMINAL_JOB_HOLDING_LEASE` |
+| `EFFECTS` | `STALE_STARTED_EFFECT` |
+
+The source of truth is the outbox and job tables, never the Streams. A stream keeps acknowledged
+entries, so "the entry is there" does not mean the work is outstanding; and trimming or an expired
+deduplication marker means "no entry" does not mean the work never published. Only rows DistroQ
+wrote inside a transaction can be reasoned about after the fact.
+
+Redis is consulted in exactly one place: the scheduled sorted set, where a member that is *due*
+and still *present* is positive evidence that promotion has stopped — something no PostgreSQL
+table can show. A Redis outage there is logged and skipped rather than turned into a finding,
+because "I could not look" is not evidence of a problem.
+
+### Safe versus unsafe repairs
+
+A finding is repaired automatically only when the database state **proves** the repair is correct,
+not when the repair merely seems likely to help. That is why most of the list is "operator".
+
+| Finding | Automatic? | Why |
+| --- | --- | --- |
+| `EXPIRED_OUTBOX_LOCK` | Yes — `OUTBOX_UNLOCK` | An expired lease is proof that nobody owns the row. |
+| `INCONSISTENT_PUBLISHED_OUTBOX` | Yes — `OUTBOX_REPUBLISH` | Only when `published_at` is set, which is proof it published. A `PUBLISHED` row with no timestamp is skipped. |
+| `SCHEDULED_JOB_WITHOUT_EVENT` | Yes — `SCHEDULED_JOB_REPAIR` | No event exists at all, so no publication can exist. |
+| `RETRY_JOB_WITHOUT_EVENT` | Yes — `RETRY_JOB_REPAIR` | Same argument. |
+| `TERMINAL_JOB_HOLDING_LEASE` | Yes — `LEASE_REPAIR` | A finished job has no live owner: every finalizing statement requires a live lease it no longer has. |
+| `STALE_STARTED_EFFECT` | Only with `effects.auto-fail-stale` — `STALE_EFFECT_REPAIR` | Closed as `FAILED`, never as `COMPLETED`. |
+| `TERMINAL_OUTBOX_FAILURE` | No, unless `reconciliation.requeue-failed-outbox` | Re-arming a terminal event is the operator decision v0.8 refuses to make on its own. |
+| `EXPIRED_EXECUTION_LEASE` | **Never** | A lease expiring proves the worker stopped renewing, not that it stopped working. Recovery belongs to `XAUTOCLAIM` plus a fresh database claim; a second claim made here would compete with the worker about to make one. |
+| `STALE_PENDING_OUTBOX` | No | The relay owns it. Repairing it here would race. |
+| Everything else | No | Ambiguous. Reported and left alone. |
+
+**Configuration is the ceiling.** A request may ask for less than `auto-repair` allows and never
+for more, so enabling repairs stays a deployment decision rather than something an HTTP body can
+do:
+
+```json
+{ "autoRepairRequested": true, "autoRepairAllowedByConfiguration": false, "autoRepairApplied": false }
+```
+
+Each finding is reported with a resolution — `REPORTED`, `REPAIRED`, `SKIPPED` or `FAILED` — and
+the response separates `inspected` (bounded by `batch-size`, so `inspected == batchSize` means
+there is probably more) from the partition of the findings themselves.
+
+### Audit records
+
+`reliability_actions` gets one row per mutation, **written in the same transaction as the state
+change it describes**, so there is no window in which the database has been repaired and nothing
+says who repaired it. `ReliabilityAuditService.record` is `@Transactional(MANDATORY)`: it refuses
+to run outside a transaction, which makes the rule a runtime failure rather than a convention.
+
+Action types: `OUTBOX_RETRY`, `OUTBOX_UNLOCK`, `OUTBOX_REPUBLISH`, `SCHEDULED_JOB_REPAIR`,
+`RETRY_JOB_REPAIR`, `LEASE_REPAIR`, `OUTBOX_CLEANUP`, `STALE_EFFECT_REPAIR`.
+
+`before_state` and `after_state` are short structural summaries — statuses, counts, timestamps —
+never payloads and never user data, so an audit table an operator reads casually does not become
+something that has to be redacted later.
+
+### Outbox retention
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/outbox/cleanup" `
+  -Headers @{ "X-Admin-Reason" = "Retention sweep after audit" }
+# -> { "deleted": 34, "batchSize": 500, "batchFull": false, "cutoff": "...", "retentionWindowDays": 30 }
+```
+
+Only `PUBLISHED` rows are ever deleted, and only when all of the following hold:
+
+1. The row is older than the retention window.
+2. No sibling event for the same job is `FAILED` or mid-publication.
+3. The job itself is not currently in a state reconciliation reports as an unresolved finding.
+
+(2) and (3) stop cleanup deleting the evidence an operator is in the middle of reading. All three
+are expressed in the SQL rather than in Java, which is where the rule cannot be forgotten, and
+`OutboxRetentionPolicyTest` asserts against the query text for exactly that reason.
+
+The retention window is **the longer of** `published-retention-days` and `dedupe-retention-ms`.
+While the deduplication marker is alive, the row and the marker are redundant with each other and
+losing either is survivable. Once the marker has expired the row is the last remaining evidence
+that the publication happened, so deleting it inside the window in which something might republish
+is how a duplicate gets made. Configuring a short retention does not shorten this — it only means
+the marker is the binding constraint.
+
+One `OUTBOX_CLEANUP` audit row is written per deleted event, bounded by `cleanup-batch-size`.
+`batchFull: true` means run it again.
+
+### Effect idempotency
+
+Four different mechanisms solve four different duplicate problems, and v0.8 exists partly to stop
+them being confused with one another:
+
+| Mechanism | Prevents | Scope |
+| --- | --- | --- |
+| `Idempotency-Key` | two jobs from one submission | HTTP request |
+| Outbox event ID + Redis marker | two publications of one intent | Redis publication |
+| Execution lease | a stale worker finalizing database state | database ownership |
+| **Effect key** | a protected side effect happening twice | one logical operation |
+
+The ledger claims a key, does the work and records the result **in one transaction**, so there is
+no instant at which the effect has happened and the ledger does not know:
+
+```sql
+INSERT INTO job_effects (effect_key, ...) VALUES (...) ON CONFLICT (effect_key) DO NOTHING
+```
+
+That is the whole mechanism. Two workers racing the same key are separated by the primary key
+rather than by timing: the loser blocks on the winner's uncommitted insert, and once the winner
+commits it reads `COMPLETED` and does nothing.
+
+Three identities that get confused with each other, kept apart by name:
+
+- **Physical delivery attempt** — a stream entry ID plus the consumer holding it. New on every
+  redelivery, including redelivery of work that already ran.
+- **Job attempt** — `attemptCount` and the `job_attempts` row. New on every execution, including
+  one that reruns work a crashed worker had already done.
+- **Logical effect key** — stable for the operation being protected, across both of the above.
+
+### `idempotent_counter`
+
+```powershell
+$body = @{ type = "idempotent_counter"; payload = "orders:daily"; priority = "NORMAL" } | ConvertTo-Json
+$j = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType "application/json" -Body $body
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs/$($j.id)" | ConvertTo-Json -Depth 8
+```
+
+```json
+"effects": [{
+  "effectKey": "c90accdb-...:counter:orders:daily",
+  "effectType": "counter",
+  "status": "COMPLETED",
+  "attemptNumber": 1,
+  "responseHash": "f3761a3292ab90c5ecc49d947389ef48997534d4ce6cd91a25551fa6a5aa22f9"
+}]
+```
+
+The key is `<job-id>:counter:<normalized-payload>` and deliberately **excludes the attempt
+number**. Keying on the attempt would make every redelivery a new effect, which is precisely the
+duplicate the ledger exists to prevent. Run the job twice — by redelivery, by reclaim, or by
+resetting it in the database and re-adding a stream entry — and you get two `job_attempts` rows,
+one `job_effects` row, one increment, and `effectDeduplicationHits` going up by one.
+
+`response_hash` is a SHA-256 of the effect identity and the observed result. It is enough to prove
+two observations of the same effect agree, and it cannot leak a response body, a token or a
+customer record into a table that outlives the job.
+
+Ledger states and what a second claimer does with them:
+
+| State | Second claimer |
+| --- | --- |
+| `COMPLETED` | Reports a deduplication hit and returns the recorded `responseHash`. |
+| `FAILED` | Reclaims the same row under the same key. `FAILED` means a worker *observed* the effect not happening. |
+| `STARTED` | Throws `EffectInProgressException` and lets the job retry. |
+
+`STARTED` is the one state carrying no information: the holder may be mid-flight, or may have died
+a millisecond after the external system accepted the call. Failing the job hands the decision to
+the retry machinery and — if the row is still `STARTED` past `stale-started-after-ms` — to
+reconciliation and then to a human.
+
+**None of this makes an arbitrary external effect exactly once.** An HTTP POST to a payment
+provider commits somewhere DistroQ has no transaction over and cannot join the one above; no
+amount of bookkeeping here changes that. The ledger protects effects that opt into the protocol.
+
+### Administrative API
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/admin/outbox` | Filters: `status`, `eventType`, `aggregateId`, `createdAfter`, `createdBefore`, `page`, `size`. **No payload.** |
+| GET | `/api/admin/outbox/{eventId}` | Full metadata plus a payload *summary* — size and SHA-256, never the bytes. |
+| POST | `/api/admin/outbox/{eventId}/retry` | `202`; `409` if not `FAILED`; `404` if unknown. |
+| POST | `/api/admin/outbox/cleanup` | Retention sweep on demand, same rules as the scheduled one. |
+| GET | `/api/admin/reconciliation` | Read-only preview. No header required — nothing changes and nothing is audited. |
+| POST | `/api/admin/reconciliation/run` | `{ "autoRepair": false, "reason": "..." }`. Configuration is the ceiling. |
+| GET | `/api/admin/reliability-actions` | Audit history. Filters: `actionType`, `targetId`, `page`, `size`. |
+
+Every **mutating** endpoint requires a non-blank `X-Admin-Reason` of at most
+`distroq.admin.max-reason-length` characters; it is stored in `reliability_actions`. An optional
+`X-Admin-Actor` names the operator and defaults to `operator`.
+
+> `X-Admin-Reason` is **not authorization and must not be read as any**. v0.8 has no
+> authentication at all: anything that can reach the port can call these endpoints. The header only
+> guarantees that whoever did left a sentence explaining themselves. It is a forcing function for
+> the audit trail. Authentication and authorization are deferred.
+
+### V7 migration
+
+`V7__reliability_reconciliation_and_effects.sql` adds `status`, `operator_retry_count`,
+`terminal_failed_at`, `last_operator_retry_at` and `last_operator_reason` to `outbox_events` with
+three supporting indexes; creates `reliability_actions`, `job_effects` and `effect_counters`. Rows
+that had already published are backfilled to `PUBLISHED`; everything else takes the `PENDING`
+default.
+
+A row that was terminal under v0.7's rules is left `PENDING` on purpose. The migration has no way
+to know what `max-attempts` was set to when it failed, so it lets the relay re-derive terminality
+from the setting actually in force. Hibernate still runs with `ddl-auto: validate`.
+
+### Metrics
+
+`GET /api/metrics` adds a reliability block. `outboxFailed` was renamed `outboxRetryableFailed`,
+because "failed" had been doing the work of two different words.
+
+| Field | Precision |
+| --- | --- |
+| `outboxPending` | exact DB count of eligible, unlocked `PENDING` rows |
+| `outboxRetryableFailed` | exact DB count of `PENDING` rows that have already failed at least once |
+| `outboxTerminalFailed` | exact DB count of `FAILED` rows — **this is the alert** |
+| `outboxOldestAgeMs` | age of the oldest unpublished row at query time |
+| `outboxPublishedTotal` | exact *retained* row count; retention makes it historical, not lifetime |
+| `outboxCleanupDeleted` | exact cumulative DB count of `OUTBOX_CLEANUP` audit rows |
+| `reconciliationFindings` | exact, recounted live from the same predicates reconciliation uses |
+| `reconciliationRepairs` | exact cumulative DB count of non-cleanup audit rows |
+| `staleScheduledJobs` | exact DB count |
+| `staleRetryJobs` | exact DB count |
+| `expiredExecutionLeases` | exact DB count |
+| `staleEffects` | exact DB count of `STARTED` rows past the threshold |
+| `effectDeduplicationHits` | **process-local** cumulative counter; resets on restart |
+| `effectApplications` | exact DB count of `COMPLETED` ledger rows |
+
+Everything except `effectDeduplicationHits` is a live database count rather than a remembered
+number. That costs a handful of indexed aggregates per call and buys two things: the values do not
+drift after a restart, and they read the same on every instance. A cached gauge from the last
+reconciliation run would have been cheaper and would have reported an outage that was already
+fixed, or missed one that started thirty seconds ago.
+
+`effectDeduplicationHits` cannot be derived from a table after the fact, because a deduplication
+hit leaves no row behind — that is its whole job.
+
+`reconciliationFindings` counts only the findings expressible as a single indexed predicate. The
+per-job event cross-checks are too expensive for a metrics scrape and appear only in the
+reconciliation report.
+
+### Operational troubleshooting
+
+**"`outboxTerminalFailed` is above zero."** Something is unpublished and no longer being retried.
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox?status=FAILED" |
+  Select-Object -ExpandProperty events | Format-Table eventId, eventType, attemptCount, ageMs
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox/$eventId"   # lastError, ceiling
+```
+
+Fix the cause, then retry the event. Check afterwards that it reached `PUBLISHED` — a second
+failure returns it to `FAILED` with `operator_retry_count` intact.
+
+**"A job is `SCHEDULED` and its time has passed."** Run the preview. If it reports
+`SCHEDULED_JOB_EVENT_FAILED`, the schedule event is terminal and the fix is an operator retry of
+that event. If it reports `SCHEDULED_JOB_WITHOUT_EVENT`, no publication can exist and a repair run
+will create one. If it reports `UNPROMOTED_SCHEDULED_MEMBER`, the member is in Redis and due, and
+the promoter has stopped — that is an application problem, not a data problem.
+
+**"A job has been `RUNNING` for hours."** `EXPIRED_EXECUTION_LEASE` says the lease lapsed;
+reconciliation will not touch it. Recovery is `XAUTOCLAIM` plus a fresh database claim, which needs
+`claim-min-idle-ms` to pass and *another live worker*. Check `XPENDING` for the entry, and check
+that a second instance is running.
+
+**"`staleEffects` is above zero."** A worker claimed an effect and never came back. The external
+effect may or may not have happened, and nothing in the database can settle it. Decide from the
+external system, then either let `effects.auto-fail-stale` release the key for a retry or close it
+by hand.
+
+**"Reconciliation reports the same findings every run."** Expected, if they are the operator kinds.
+`unresolved` is the number to watch; `repaired` going to zero on a second run is the *idempotence*
+working, not a failure.
 
 ## What changed in v0.7
 
@@ -158,7 +520,8 @@ database lease expiry independently determines when execution ownership can move
 
 ### Metrics
 
-`GET /api/metrics` adds:
+v0.7 added the following; v0.8 renames `outboxFailed` to `outboxRetryableFailed` and redefines the
+first three in terms of the explicit lifecycle rather than attempt arithmetic.
 
 | Field | Meaning and precision |
 | --- | --- |
@@ -949,6 +1312,19 @@ writes DDL.
 | `V3__dead_letters.sql` | The `dead_letters` table with its two indexes, plus the foreign key `job_attempts` never had. Contains **no** DDL for `DEAD_LETTERED` — see below. |
 | `V4__job_priority.sql` | `jobs.priority` as `varchar(255) NOT NULL DEFAULT 'NORMAL'`, plus `idx_jobs_priority`. The DB-level default backfills every pre-v0.4 row, which is the correct reading of a job submitted before priority existed. |
 | `V5__scheduled_jobs.sql` | `jobs.scheduled_at` as a **nullable** `timestamp(6) with time zone`, plus `idx_jobs_scheduled_at`. Nullable because an immediate job was never scheduled at all, and NULL is the only value that says so. |
+| `V6__outbox_idempotency_and_execution_leases.sql` | `outbox_events` and `idempotency_keys`, plus `execution_owner`, `execution_lease_until`, `active_attempt_id` and `version` on `jobs`. |
+| `V7__reliability_reconciliation_and_effects.sql` | The outbox lifecycle columns (`status`, `operator_retry_count`, `terminal_failed_at`, `last_operator_retry_at`, `last_operator_reason`) and three indexes; `reliability_actions`; `job_effects`; `effect_counters`. Backfills `PUBLISHED` for rows that already published. |
+
+**V7 adds no enum CHECK constraints,** consistent with V1–V6 and for the reason V1 documents.
+`outbox_events.status`, `job_effects.status` and `reliability_actions.action_type` are all plain
+`varchar`, so adding a lifecycle state later is a code change rather than a migration plus an
+outage.
+
+The backfill leaves a row that was terminal under v0.7's rules as `PENDING` on purpose. Terminality
+under v0.7 was `attempt_count >= max-attempts`, and the migration has no way to know what
+`max-attempts` was set to when the row failed. Letting the relay re-derive it from the setting
+actually in force is both correct and self-healing: an event that is genuinely terminal goes back
+to `FAILED` on its next tick, and one that is not simply publishes.
 
 **V5 adds no constraint tying `status` to `scheduled_at`,** consistent with V1–V4. The invariant
 "`SCHEDULED` implies a non-null `scheduled_at` in the future" is real but *time-dependent*: it
@@ -1073,7 +1449,51 @@ distroq:
   scheduling:
     poll-interval-ms: 1000       # how often the scheduled set is swept
     promote-batch-size: 100      # max scheduled jobs promoted per sweep
+  outbox:
+    poll-interval-ms: 500        # relay tick
+    batch-size: 100              # events claimed per tick
+    lock-duration-ms: 30000      # relay lease; a PUBLISHING row past this is reclaimable
+    max-attempts: 100            # budget per operator generation, NOT a lifetime cap
+    dedupe-retention-ms: 604800000   # TTL of the Redis "already published" marker
+    published-retention-days: 30 # cleanup floor; the dedupe TTL can raise it
+    failed-retention-days: 90    # documentation only - FAILED is never deleted automatically
+    cleanup-interval-ms: 3600000
+    cleanup-batch-size: 500
+    relay-enabled: true
+    fail-after-publish: false    # acceptance hook: publish, then fail before marking published
+  reconciliation:
+    enabled: true
+    poll-interval-ms: 30000
+    batch-size: 100              # bounds every query in a run; inspected == this means "look again"
+    stale-scheduled-after-ms: 60000
+    stale-outbox-after-ms: 60000
+    stale-lease-after-ms: 60000
+    auto-repair: false           # the CEILING on repairs; a request can ask for less, never more
+    requeue-failed-outbox: false # off even when auto-repair is on
+  effects:
+    enabled: true
+    stale-started-after-ms: 300000
+    auto-fail-stale: false       # a STARTED effect is ambiguous, so closing one is opt-in
+  admin:
+    max-reason-length: 500       # X-Admin-Reason and the body reason
 ```
+
+`outbox.max-attempts` is the relay budget for **one operator generation** of an event. The terminal
+ceiling is `max-attempts × (operator_retry_count + 1)`, so an operator retry hands the event a
+fresh budget without erasing the attempts it already made.
+
+`outbox.dedupe-retention-ms` is compared against `published-retention-days` before a row is
+deleted; see *Outbox retention*. Setting the marker TTL shorter than retention is the
+configuration that risks a duplicate, which is why cleanup takes the longer of the two rather than
+the configured one.
+
+`reconciliation.auto-repair` is an upper bound, not a default. `POST /api/admin/reconciliation/run`
+with `"autoRepair": true` against a deployment configured `false` runs a preview and says so in the
+response.
+
+`effects.auto-fail-stale` closes a stale `STARTED` row as `FAILED`, never as `COMPLETED`. Marking
+it completed would assert an effect happened that nobody observed, and would suppress the retry
+that is the only remaining way to make it happen.
 
 `scheduling` mirrors the `retry` block rather than reusing it. The two pollers sweep different
 sorted sets for different reasons, and tying retry-backoff resolution to user-scheduling
@@ -1100,16 +1520,22 @@ Also set, outside the `distroq` namespace:
 spring:
   task:
     scheduling:
-      pool-size: 3               # the retry, scheduled-job and recovery sweeps must not block each other
+      pool-size: 6               # one thread per @Scheduled sweep, so none can starve another
 server:
   error:
     include-message: always      # otherwise the 409 body would not name the job's actual status
 ```
 
-The scheduler pool is 3 because the recovery sweep executes reclaimed jobs on the scheduler
-thread. With Spring Boot's default pool size of 1, a reclaimed thirty-second job would stall both
-the retry sweep and the scheduled-job sweep for its whole duration. It was 2 in v0.5 and grew by
-one with the scheduled-job promoter.
+The scheduler pool was 3 in v0.6, because the recovery sweep executes reclaimed jobs on the
+scheduler thread and a reclaimed thirty-second job would otherwise stall the retry and
+scheduled-job sweeps for its whole duration. v0.8 raises it to 6 for the outbox relay,
+reconciliation and retention cleanup.
+
+That number is load-bearing during a Redis outage. Four of the six sweeps issue Redis commands, so
+a disconnected Lettuce client can leave several threads blocked on command timeouts at once — and
+the one sweep that must keep running in that situation is the relay, because it is the thing whose
+job is to notice the outage and record it. If you shorten `spring.data.redis.timeout` to make an
+outage fail fast, raise this to match.
 
 Spring Boot omits the `message` field from error bodies by default, which silently discards
 the `reason` on every `ResponseStatusException` the app throws. The cost is that unhandled
@@ -1218,6 +1644,7 @@ replayable — `POST /api/jobs/{id}/retry` returns 409.
 | `always_fail`  | ignored                          | Always throws, by design.                        |
 | `fail_n_times` | N as an integer, e.g. `"2"`      | Throws on attempts 1..N, succeeds afterwards. Defaults to 2 if null/blank/unparseable. |
 | `fail_until_flagged` | ignored                    | Throws while a Redis flag key is set; succeeds once it is cleared. |
+| `idempotent_counter` | counter name, e.g. `"orders:daily"` | v0.8. Increments a durable counter exactly once per `<job-id>:counter:<normalized-payload>`, however many times the job is delivered. Defaults to `default` if null/blank. |
 
 `fail_n_times` is stateless — it derives its behaviour from `job.getAttemptCount()`, not
 from any counter held in the executor. It is the job type that demonstrates retry
@@ -1253,12 +1680,19 @@ since that is an ordinary failure, it is retried before it becomes terminally
 | Method | Path                     | Notes                                                          |
 | ------ | ------------------------ | -------------------------------------------------------------- |
 | POST   | `/api/jobs`              | Returns **202 Accepted** — the work is accepted, not completed. `400` on an unknown `priority` or an unparseable `scheduledAt`. |
-| GET    | `/api/jobs/{id}`         | Includes the full `attempts` history and `scheduledAt`. `404` if unknown.         |
+| GET    | `/api/jobs/{id}`         | Includes the full `attempts` history, `scheduledAt`, and (v0.8) the `effects` ledger for the job. `404` if unknown.         |
 | GET    | `/api/jobs?status=&priority=` | Optional `JobStatus` (including `SCHEDULED`) and `Priority` filters, combinable; 50 most recent, newest first. Both are pushed into SQL, never filtered in memory. No attempts (avoids N+1). |
 | POST   | `/api/jobs/{id}/retry`   | Replay a dead-lettered job at its original priority, **immediately** — never on its original schedule. **202**; `409` if not `DEAD_LETTERED`, `404` if unknown. |
 | GET    | `/api/dlq`               | 50 most recent dead-letters, newest `moved_at` first. Optional `?replayed=true\|false`. Includes `priority` and `scheduledAt`. |
 | GET    | `/api/dlq/{jobId}`       | Single entry with the full attempt history, `priority` and `scheduledAt`. `404` if not dead-lettered. |
-| GET    | `/api/metrics`           | Queue, stream, delayed-set, scheduled-set and DLQ counters — see below. |
+| GET    | `/api/metrics`           | Queue, stream, delayed-set, scheduled-set, DLQ, outbox, reconciliation and effect counters — see below. |
+| GET    | `/api/admin/outbox`      | v0.8. Outbox events with `status`/`eventType`/`aggregateId`/`createdAfter`/`createdBefore` filters and pagination. Payload is not returned. |
+| GET    | `/api/admin/outbox/{eventId}` | v0.8. Full metadata plus a payload size and digest. `404` if unknown. |
+| POST   | `/api/admin/outbox/{eventId}/retry` | v0.8. Re-arm a `FAILED` event. **202**; `409` if not `FAILED`, `404` if unknown, `400` without a valid reason. Requires `X-Admin-Reason`. |
+| POST   | `/api/admin/outbox/cleanup` | v0.8. Retention sweep on demand. Requires `X-Admin-Reason`. |
+| GET    | `/api/admin/reconciliation` | v0.8. Read-only findings preview, grouped by category. |
+| POST   | `/api/admin/reconciliation/run` | v0.8. `{ "autoRepair": bool, "reason": "..." }`. Configuration is the ceiling. Requires `X-Admin-Reason`. |
+| GET    | `/api/admin/reliability-actions` | v0.8. Audit history with `actionType`/`targetId` filters and pagination. |
 
 `deadLetterCount` counts rows with `replayed = false` (currently sitting in the DLQ);
 `replayedCount` counts rows with `replayed = true` (replayed and not since re-failed).
@@ -1615,6 +2049,142 @@ docker exec distroq-redis redis-cli ZSCORE distroq:jobs:scheduled "LOW:<dead-let
 # 37. Filters
 Invoke-RestMethod -Uri "http://localhost:8080/api/jobs?status=SCHEDULED"
 Invoke-RestMethod -Uri "http://localhost:8080/api/jobs?priority=HIGH&status=SCHEDULED"
+
+# ---- v0.8 ----
+
+# 38. Terminal outbox failure. Start with a small ceiling and a fast-failing Redis client, then
+#     take Redis away and submit a job. The event exhausts its budget and stops being claimed.
+java -jar target\distroq-0.0.1-SNAPSHOT.jar `
+  --distroq.outbox.max-attempts=2 --spring.data.redis.timeout=2s `
+  --spring.task.scheduling.pool-size=12
+docker stop distroq-redis
+$t = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' -Body '{"type":"sleep","payload":"100","priority":"HIGH"}'
+Start-Sleep -Seconds 40
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT id, status, attempt_count, published_at, terminal_failed_at, left(last_error,40)
+   FROM outbox_events WHERE aggregate_id = '$($t.id)';"
+# FAILED, attempt_count 2, published_at null, terminal_failed_at set, and it stays that way
+docker start distroq-redis
+
+# 39. Operator retry validation -> 400, 400, 400, 404. Read the BODIES, not just the codes.
+$eventId = "<the id from step 38>"
+$b = @{ reason = "Retry terminal event after Redis recovery" } | ConvertTo-Json
+curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST `
+  "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -H "Content-Type: application/json" --data-binary $b                       # no header  -> 400
+curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST `
+  "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -H "X-Admin-Reason:  " -H "Content-Type: application/json" --data-binary $b   # blank   -> 400
+curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST `
+  "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -H "X-Admin-Reason: $('x' * 501)" -H "Content-Type: application/json" --data-binary $b  # -> 400
+curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST `
+  "http://localhost:8080/api/admin/outbox/00000000-0000-0000-0000-000000000000/retry" `
+  -H "X-Admin-Reason: valid" -H "Content-Type: application/json" --data-binary $b         # -> 404
+
+# 40. Operator retry succeeds -> 202, same event ID, operatorRetryCount 1, then PUBLISHED
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -Headers @{ "X-Admin-Reason" = "Redis was restored after maintenance"; "X-Admin-Actor" = "alice" } `
+  -ContentType "application/json" -Body $b
+Start-Sleep -Seconds 4
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox/$eventId" | ConvertTo-Json -Depth 5
+# and exactly one Redis publication, guarded by the surviving dedupe marker:
+docker exec distroq-redis redis-cli KEYS "distroq:outbox:published:$eventId"
+
+# 41. Retrying it again now that it is PUBLISHED -> 409 naming the status
+curl.exe -s -o - -w "`nHTTP %{http_code}`n" -X POST `
+  "http://localhost:8080/api/admin/outbox/$eventId/retry" `
+  -H "X-Admin-Reason: valid" -H "Content-Type: application/json" --data-binary $b
+
+# 42. Reconciliation preview changes nothing. Seed an inconsistency the application cannot make -
+#     here, a RUNNING job whose lease lapsed - then look, and check the audit table is untouched.
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "INSERT INTO jobs (id, type, payload, status, priority, attempt_count, max_attempts, created_at,
+     updated_at, started_at, execution_owner, execution_lease_until, version)
+   VALUES ('00000000-0000-0000-0000-0000000000d1','sleep','60000','RUNNING','NORMAL',1,3,
+     now()-interval '20 minutes', now()-interval '20 minutes', now()-interval '20 minutes',
+     'worker-ghost', now()-interval '10 minutes', 0);"
+$before = docker exec distroq-postgres psql -U distroq -d distroq -tAc `
+  "SELECT count(*) FROM reliability_actions;"
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/reconciliation/run" `
+  -Headers @{ "X-Admin-Reason" = "Manual reconciliation preview" } -ContentType "application/json" `
+  -Body (@{ autoRepair = $false; reason = "Inspect reliability findings" } | ConvertTo-Json) |
+  ConvertTo-Json -Depth 8
+docker exec distroq-postgres psql -U distroq -d distroq -tAc `
+  "SELECT count(*) FROM reliability_actions;"     # unchanged from $before
+
+# 43. A request cannot enable repairs that configuration forbids
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/reconciliation/run" `
+  -Headers @{ "X-Admin-Reason" = "Confirm configuration is the ceiling" } `
+  -ContentType "application/json" `
+  -Body (@{ autoRepair = $true; reason = "Ask for more than configuration allows" } | ConvertTo-Json) |
+  Select-Object autoRepairRequested, autoRepairAllowedByConfiguration, autoRepairApplied
+# True / False / False, and a WARN in the log
+
+# 44. Repairs, with configuration permitting them. Run twice: the second run repairs nothing.
+java -jar target\distroq-0.0.1-SNAPSHOT.jar --distroq.reconciliation.auto-repair=true
+$hdr = @{ "X-Admin-Reason" = "Repair post-maintenance reliability findings"; "X-Admin-Actor" = "alice" }
+$rb = @{ autoRepair = $true; reason = "Repair post-maintenance reliability findings" } | ConvertTo-Json
+1..2 | ForEach-Object {
+  Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/reconciliation/run" `
+    -Headers $hdr -ContentType "application/json" -Body $rb |
+    Select-Object inspected, findings, repaired, skipped, failed
+}
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT action_type, target_id, actor, before_state, after_state FROM reliability_actions
+   ORDER BY created_at;"
+# EXPIRED_EXECUTION_LEASE stays SKIPPED in both runs. It is never repaired automatically.
+
+# 45. Retention. Age the published rows, then sweep - PENDING and FAILED survive, and so does a
+#     published row whose job still has a FAILED sibling event or an unresolved finding.
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "UPDATE outbox_events SET published_at = now() - interval '400 days' WHERE status = 'PUBLISHED';"
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/admin/outbox/cleanup" `
+  -Headers @{ "X-Admin-Reason" = "Retention sweep after audit" }
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT status, count(*) FROM outbox_events GROUP BY status;"
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT count(*) FROM reliability_actions WHERE action_type = 'OUTBOX_CLEANUP';"
+
+# 46. Idempotent effect execution -> one ledger row, one increment
+$c = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/jobs `
+  -ContentType 'application/json' `
+  -Body '{"type":"idempotent_counter","payload":"orders:daily","priority":"NORMAL"}'
+Start-Sleep -Seconds 5
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs/$($c.id)" | ConvertTo-Json -Depth 8
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT effect_key, attempt_number, status, response_hash FROM job_effects;"
+docker exec distroq-postgres psql -U distroq -d distroq -c "SELECT * FROM effect_counters;"
+
+# 47. Duplicate DELIVERY of the same logical effect. Reset the job and hand the worker a second
+#     entry: two attempts, still one effect row, still one increment.
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "UPDATE jobs SET status='QUEUED', finished_at=NULL, execution_owner=NULL,
+     execution_lease_until=NULL, active_attempt_id=NULL, version=version+1
+   WHERE id='$($c.id)';"
+docker exec distroq-redis redis-cli XADD distroq:jobs:stream:normal '*' `
+  jobId $c.id priority NORMAL enqueuedAt 1 source SUBMIT outboxEventId manual-duplicate
+Start-Sleep -Seconds 4
+Invoke-RestMethod -Uri "http://localhost:8080/api/jobs/$($c.id)" | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Uri http://localhost:8080/api/metrics |
+  Select-Object effectApplications, effectDeduplicationHits
+# attemptCount 2, one effects entry, counter unchanged, effectDeduplicationHits +1
+
+# 48. Concurrent effect claims, against the real database
+.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest" "-Ddistroq.live=true" `
+  "-DfailIfNoSpecifiedTests=false"
+
+# 49. Admin filters, redaction and audit history
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox?status=FAILED"
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox?eventType=SCHEDULE_RETRY"
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/outbox?status=PENDING&size=1&page=0"
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/reliability-actions?size=3"
+Invoke-RestMethod -Uri "http://localhost:8080/api/admin/reconciliation" | ConvertTo-Json -Depth 8
+# no `payload` field appears anywhere in the outbox list response
+
+# 50. The v0.8 metrics block
+Invoke-RestMethod -Uri http://localhost:8080/api/metrics | ConvertTo-Json -Depth 10
 ```
 
 `com.distroq` logs at `DEBUG`, so the QUEUED → RUNNING → RETRYING → SUCCEEDED/DEAD_LETTERED
@@ -1696,7 +2266,93 @@ verified against real Redis in checks 25–34 above.
 PostgreSQL and Redis. Run `docker compose up -d` and remove the `@Disabled` annotation to
 exercise it.
 
+v0.8 adds:
+
+- `OutboxEventTest` — the whole lifecycle as assertions: a new event is `PENDING`, claiming makes
+  it `PUBLISHING`, publication makes it `PUBLISHED`, the ceiling makes it `FAILED` and stamps
+  `terminal_failed_at`; an operator retry returns it to `PENDING`, preserves the event ID and the
+  cumulative attempt count, increments `operator_retry_count`, raises the ceiling, and is refused
+  on anything that is not `FAILED`.
+- `OutboxRelayStoreTest` — that the terminal verdict comes from configuration rather than a
+  constant, that publication is idempotent, and that an operator retry buys a fresh budget without
+  erasing history.
+- `OutboxOperatorServiceTest` — 404, 409 on `PENDING`, 409 on `PUBLISHED`, that a refused retry
+  writes no audit row, that both reasons and the actor reach the audit record, and that the audit
+  states do not contain the payload.
+- `OutboxRetentionPolicyTest` — assertions against the SQL itself. "`PENDING` is never deleted"
+  cannot be proved with a mocked repository, because the mock is the thing deciding what comes
+  back; the rule lives in the query, so the test reads the query.
+- `OutboxCleanupServiceTest` — batch limiting, one audit row per deleted event, payload-free audit
+  states, `batchFull` reporting, and that the retention window is the longer of the configured
+  window and the deduplication marker TTL in both directions.
+- `ReconciliationServiceTest` — each finding type detected; grouping into every category including
+  empty ones; preview mutating nothing and auditing nothing; configuration bounding the request in
+  both directions; an allowed repair being performed and audited; an expired execution lease and a
+  stale effect being skipped even when repairs are on; a second run repairing nothing; and a run
+  that cannot take the advisory lock reporting that instead of scanning.
+- `JobEffectServiceTest` — one ledger row and one increment; a repeated key not incrementing again;
+  the recorded hash coming back on a deduplicated call; payload normalisation being part of the
+  identity; a `FAILED` key being reclaimable on the same row; a `STARTED` key refusing to apply;
+  hash stability; and that nothing but a digest is stored.
+- `EffectKeysTest` — that the counter key excludes the attempt number, that normalisation folds
+  case and whitespace, and that a long payload still fits the 255-character key column.
+- `AdminReasonTest` — missing, blank and over-length reasons for both the header and the body, the
+  boundary value, trimming, and that the maximum comes from configuration.
+
+`JobEffectConcurrencyLiveTest` is the exception to "no infrastructure". The concurrent-claim
+guarantee comes from two connections colliding on a primary key — the loser blocks on the winner's
+uncommitted insert and then reads a committed `COMPLETED` row — and a stubbed repository decides
+that outcome by itself rather than demonstrating it. It is gated on a system property rather than
+`@Disabled`, so it can actually be run:
+
+```powershell
+.\mvnw.cmd test "-Dtest=JobEffectConcurrencyLiveTest" "-Ddistroq.live=true" `
+  "-DfailIfNoSpecifiedTests=false"
+```
+
+It redirects the queue keys so its worker polls its own empty streams instead of competing with a
+running instance for real work.
+
 ## Known limitations
+
+> **No authentication on the administrative endpoints.** `X-Admin-Reason` is an audit device, not
+> authorization. Anything that can reach port 8080 can retry a terminal outbox event, run a repair
+> or read the audit log. Do not expose this outside a development machine.
+
+> **Arbitrary external side effects are still not exactly once, and v0.8 does not claim otherwise.**
+> The effect ledger commits the claim and the effect in one transaction, which is why it works for
+> a counter in the same database. An HTTP call to a third party commits somewhere DistroQ has no
+> transaction over. `Idempotency-Key`, outbox event IDs, execution leases and effect keys each
+> close a different duplicate window; none of them, and not all of them together, close that one.
+
+> **A `STARTED` effect is genuinely ambiguous.** If a worker dies between calling an external
+> system and recording the result, no amount of inspection here can determine whether the call
+> landed. v0.8 refuses to guess: the row is reported, and the configured policy can only close it
+> as `FAILED` — releasing the key for another attempt — never as `COMPLETED`.
+
+> **Redis deduplication markers expire.** Once `dedupe-retention-ms` has passed, republishing an
+> old event would produce a second stream entry. Retention takes the longer of the marker TTL and
+> `published-retention-days` for exactly this reason, but an event that stays terminal for longer
+> than the marker's lifetime and is then retried by an operator has no Redis-side protection left.
+> Reconciliation cannot prove a historical publication once both the marker and the row are gone.
+
+> **Terminal outbox failures need a human.** By design — that is the difference between v0.8 and a
+> retry loop that hides the problem — but it does mean `outboxTerminalFailed` must be alerted on.
+> Nothing else will notice.
+
+> **Reconciliation is bounded and partial.** Every query is limited to `batch-size`, so a large
+> backlog needs several runs; `inspected == batchSize` in the response is the signal. The metrics
+> endpoint recounts only the findings expressible as one indexed predicate, so the per-job event
+> cross-checks appear in the report and not in `reconciliationFindings`.
+
+> **Multiple instances coordinate by advisory lock, not leader election.** Every instance runs the
+> sweep; a run that cannot take `pg_try_advisory_xact_lock` skips its tick. That prevents two
+> instances repairing the same row at once, and it is not the same as electing one of them.
+
+> **A Redis outage can starve the scheduler pool.** Four of the six `@Scheduled` sweeps issue Redis
+> commands, and a disconnected Lettuce client blocks each one for its command timeout. With the
+> pool sized exactly to the number of sweeps, the relay can wait a long time for a thread — which
+> is the worst possible sweep to delay during an outage. See *Configuration*.
 
 > **The three dual writes are unchanged.** Streams did not fix any of them, scheduling does not
 > fix any of them, and nothing in v0.6 claims to.
@@ -1769,25 +2425,37 @@ instance therefore pays for a `ZRANGEBYSCORE` per tick.
 
 ## Not implemented yet
 
-Deliberately out of scope for v0.6:
+Deliberately out of scope for v0.8:
 
-- Reconciliation for the four dual writes, stream retention, and worker leases (**v0.5.1** — see
-  *Planned for v0.5.1* in `NOTES.md`)
+- Authentication and authorization for the administrative endpoints
+- Exactly-once execution of arbitrary external side effects
+- Automatic retry of unknown external API calls
+- Automatic deletion of terminal outbox events
+- A dashboard UI and WebSockets
+- Cron and recurring jobs
+- Job cancellation, rescheduling, and priority mutation after submission
+- Bulk DLQ replay and automatic replay
+- Stream retention and `MAXLEN` trimming
+- Distributed leader election for the sweeps
+- Multi-region processing, Kafka or another broker
+- Kubernetes deployment and horizontal autoscaling
+- New priority tiers
+- A complete event-sourcing architecture
+
+Earlier lists, kept for the record:
+
 - Cancelling a scheduled job, rescheduling it, or editing `scheduledAt` after submission
-- Recurring jobs and cron expressions
 - Calendar-aware or timezone-aware scheduling (v0.6 stores normalised UTC instants only)
 - Bulk scheduling, and scheduled DLQ replay
-- Idempotency keys, exactly-once side-effect protection, and a separate multi-worker service (v0.7)
-- WebSockets and a live dashboard (v0.8)
-- Bulk DLQ replay, automatic replay, and any retention policy for `dead_letters`
-- Re-prioritising a submitted job
-- Job cancellation
-- Distributed leader election for the schedulers
-- Kubernetes deployment and horizontal autoscaling
+- Any retention policy for `dead_letters`
 
 v0.5 predicted that user scheduling would be "a small addition to `scheduleAt`". It was not. The
 mechanism was indeed already there — the same Lua promotion, reused verbatim — but reusing the
 *key* would have conflated retry state with user intent, and the real work turned out to be the
 status, the timestamp parsing and the worker's behaviour on an entry that arrives early. See
 *What v0.6 changed about the plan* in `NOTES.md`.
+
+v0.7 predicted that the outbox would close the reliability story. It closed the *write* side and
+opened an operational one: a durable intent nobody can see the state of is only half a fix. See
+*What v0.8 changed about the plan* in `NOTES.md`.
 
