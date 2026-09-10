@@ -1,0 +1,25 @@
+# Automated tests. Points at the same local containers as the local profile, but quieter and with
+# the background sweeps slowed down so a test that starts a context does not race its own fixtures.
+#
+# The admin bearer token is deliberately unset: the guard is inactive, so a test that wants to
+# exercise authentication sets distroq.admin.token itself and gets a deterministic answer.
+spring:
+  datasource:
+    url: ${DISTROQ_TEST_DB_URL:jdbc:postgresql://localhost:5433/distroq}
+    username: ${DISTROQ_TEST_DB_USER:distroq}
+    password: ${DISTROQ_TEST_DB_PASSWORD:distroq}
+  data:
+    redis:
+      host: ${DISTROQ_TEST_REDIS_HOST:localhost}
+      port: ${DISTROQ_TEST_REDIS_PORT:6379}
+
+distroq:
+  reconciliation:
+    enabled: false
+  outbox:
+    relay-enabled: false
+
+logging:
+  level:
+    root: WARN
+    com.distroq: INFO

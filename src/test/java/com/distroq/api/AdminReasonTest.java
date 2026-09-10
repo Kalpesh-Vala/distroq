@@ -60,7 +60,8 @@ class AdminReasonTest {
 
     @Test
     void theMaximumComesFromConfigurationRatherThanAConstant() {
-        AdminReason shorter = new AdminReason(TestProperties.of(new DistroqProperties.Admin(10)));
+        AdminReason shorter = new AdminReason(
+                TestProperties.of(new DistroqProperties.Admin(true, null, "admin", 10)));
 
         assertThat(shorter.maxLength()).isEqualTo(10);
         assertThatThrownBy(() -> shorter.requireHeader("x".repeat(11)))

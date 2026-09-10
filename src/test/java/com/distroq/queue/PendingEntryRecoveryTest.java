@@ -35,7 +35,11 @@ class PendingEntryRecoveryTest {
 
         PendingEntryRecovery recovery = new PendingEntryRecovery(consumer, handler,
                 new StreamKeys(TestProperties.defaults()), mock(StringRedisTemplate.class),
-                mock(WorkerMetrics.class), TestProperties.defaults());
+                mock(WorkerMetrics.class),
+                new com.distroq.metrics.DistroqMetrics(
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+                        TestProperties.defaults()),
+                new com.distroq.lifecycle.ShutdownState(), TestProperties.defaults());
         recovery.sweep();
 
         verify(consumer).claimStale(eq("worker-recovery"), eq(Priority.HIGH), any(),

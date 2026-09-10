@@ -1,12 +1,14 @@
 package com.distroq.queue;
 
 import com.distroq.config.DistroqProperties;
+import com.distroq.lifecycle.ShutdownState;
+import com.distroq.metrics.DistroqMetrics;
 import com.distroq.model.Priority;
+import com.distroq.observability.Events;
+import com.distroq.observability.LogContext;
 import com.distroq.worker.WorkerMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.event.ContextClosedEvent;
-import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.PendingMessage;
 import org.springframework.data.redis.connection.stream.PendingMessages;
@@ -18,7 +20,6 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Picks up work abandoned by a worker that never came back.
@@ -60,19 +61,24 @@ public class PendingEntryRecovery {
     private final Duration minIdle;
     private final int batchSize;
     private final WorkerMetrics workerMetrics;
-    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final DistroqMetrics metrics;
+    private final ShutdownState shutdownState;
 
     public PendingEntryRecovery(JobStreamConsumer consumer,
                                 DeliveryHandler handler,
                                 StreamKeys streamKeys,
                                 StringRedisTemplate redis,
                                 WorkerMetrics workerMetrics,
+                                DistroqMetrics metrics,
+                                ShutdownState shutdownState,
                                 DistroqProperties properties) {
         this.consumer = consumer;
         this.handler = handler;
         this.streamKeys = streamKeys;
         this.redis = redis;
         this.workerMetrics = workerMetrics;
+        this.metrics = metrics;
+        this.shutdownState = shutdownState;
         this.groupName = properties.streams().groupName();
         this.recoveryConsumerName = consumer.newConsumerName();
         this.minIdle = Duration.ofMillis(properties.streams().claimMinIdleMs());
@@ -81,7 +87,7 @@ public class PendingEntryRecovery {
 
     @Scheduled(fixedDelayString = "${distroq.streams.recovery-interval-ms:1000}")
     public void sweep() {
-        if (!running.get()) {
+        if (!shutdownState.isRunning()) {
             return;
         }
         for (Priority tier : Priority.STRICT_ORDER) {
@@ -89,7 +95,7 @@ public class PendingEntryRecovery {
                 reclaim(tier);
             } catch (Exception e) {
                 // never propagate: an escaping exception cancels all future executions of this task
-                if (!running.get()) {
+                if (!shutdownState.isRunning()) {
                     log.debug("Recovery sweep aborted during shutdown");
                     return;
                 }
@@ -102,7 +108,7 @@ public class PendingEntryRecovery {
         String streamKey = streamKeys.keyFor(tier);
         String cursor = SCAN_START;
 
-        for (int batch = 0; batch < MAX_BATCHES_PER_SWEEP && running.get(); batch++) {
+        for (int batch = 0; batch < MAX_BATCHES_PER_SWEEP && shutdownState.isRunning(); batch++) {
             // read the current owners first: XAUTOCLAIM reassigns before it answers, so afterwards
             // every entry claims to belong to us and the log could not name who lost it
             Map<String, PendingMessage> before = ownersOf(streamKey);
@@ -111,6 +117,7 @@ public class PendingEntryRecovery {
                     consumer.claimStale(recoveryConsumerName, tier, minIdle, batchSize, cursor);
             if (claimed.claimed() > 0) {
                 workerMetrics.reclaimed(claimed.claimed());
+                metrics.jobsReclaimed(tier, claimed.claimed());
                 log.warn("XAUTOCLAIM on {} took {} idle entr(ies) for {} (cursor {} -> {})",
                     streamKey, claimed.claimed(), recoveryConsumerName, cursor, claimed.nextCursor());
             }
@@ -123,13 +130,18 @@ public class PendingEntryRecovery {
                     continue;
                 }
                 PendingMessage previous = before.get(delivery.entryId());
-                log.warn("Reclaimed entry {} on {} for job {}: previous owner {}, new owner {}, "
-                                + "idle {}ms, delivery count {}",
-                        delivery.entryId(), streamKey, delivery.jobId(),
-                        previous == null ? "unknown" : previous.getConsumerName(),
-                        recoveryConsumerName,
-                        previous == null ? -1 : previous.getElapsedTimeSinceLastDelivery().toMillis(),
-                        previous == null ? -1 : previous.getTotalDeliveryCount());
+                try (LogContext ignored = LogContext.event(Events.JOB_RECLAIMED)
+                        .job(delivery.jobId()).priority(tier)
+                        .stream(streamKey, delivery.entryId())
+                        .consumer(recoveryConsumerName)) {
+                    log.warn("Reclaimed entry {} on {} for job {}: previous owner {}, new owner {}, "
+                                    + "idle {}ms, delivery count {}",
+                            delivery.entryId(), streamKey, delivery.jobId(),
+                            previous == null ? "unknown" : previous.getConsumerName(),
+                            recoveryConsumerName,
+                            previous == null ? -1 : previous.getElapsedTimeSinceLastDelivery().toMillis(),
+                            previous == null ? -1 : previous.getTotalDeliveryCount());
+                }
                 handler.handle(delivery, recoveryConsumerName);
             }
 
@@ -160,11 +172,5 @@ public class PendingEntryRecovery {
                     streamKey, e);
             return Map.of();
         }
-    }
-
-    // matches Worker and RetryScheduler: fires before bean destruction closes the connection
-    @EventListener(ContextClosedEvent.class)
-    public void onContextClosed() {
-        running.set(false);
     }
 }

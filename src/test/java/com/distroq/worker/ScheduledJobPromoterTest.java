@@ -29,12 +29,15 @@ class ScheduledJobPromoterTest {
 
     private ScheduledJobQueue scheduledJobQueue;
     private ScheduledJobPromoter promoter;
+    private com.distroq.lifecycle.ShutdownState shutdownState;
 
     @BeforeEach
     void setUp() {
         scheduledJobQueue = mock(ScheduledJobQueue.class);
         when(scheduledJobQueue.key()).thenReturn("distroq:jobs:scheduled");
-        promoter = new ScheduledJobPromoter(scheduledJobQueue, TestProperties.defaults());
+        shutdownState = new com.distroq.lifecycle.ShutdownState();
+        promoter = new ScheduledJobPromoter(scheduledJobQueue, shutdownState,
+                new com.distroq.health.SubsystemHealth(), TestProperties.defaults());
     }
 
     @Test
@@ -46,7 +49,8 @@ class ScheduledJobPromoterTest {
 
     @Test
     void theBatchSizeComesFromConfigurationRatherThanBeingHardcoded() {
-        ScheduledJobPromoter tuned = new ScheduledJobPromoter(scheduledJobQueue,
+        ScheduledJobPromoter tuned = new ScheduledJobPromoter(scheduledJobQueue, shutdownState,
+                new com.distroq.health.SubsystemHealth(),
                 TestProperties.of(new DistroqProperties.Scheduling(250L, 7)));
 
         tuned.sweep();
@@ -90,7 +94,7 @@ class ScheduledJobPromoterTest {
     void theSweepStopsTouchingRedisOnceShutdownHasBegun() {
         // matches Worker and RetryScheduler: the connection is closed during bean destruction,
         // and a tick that lands after that would log a stack trace on a clean shutdown
-        promoter.onContextClosed();
+        shutdownState.onContextClosed();
 
         promoter.sweep();
 

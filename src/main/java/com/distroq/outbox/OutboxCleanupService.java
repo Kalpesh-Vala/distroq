@@ -1,6 +1,7 @@
 package com.distroq.outbox;
 
 import com.distroq.config.DistroqProperties;
+import com.distroq.lifecycle.ShutdownState;
 import com.distroq.model.OutboxEvent;
 import com.distroq.model.ReliabilityActionType;
 import com.distroq.reliability.ReliabilityAuditService;
@@ -35,13 +36,15 @@ public class OutboxCleanupService {
 
     private final OutboxEventRepository repository;
     private final ReliabilityAuditService audit;
+    private final ShutdownState shutdownState;
     private final DistroqProperties.Outbox outbox;
     private final DistroqProperties.Reconciliation reconciliation;
 
     public OutboxCleanupService(OutboxEventRepository repository, ReliabilityAuditService audit,
-                                DistroqProperties properties) {
+                                ShutdownState shutdownState, DistroqProperties properties) {
         this.repository = repository;
         this.audit = audit;
+        this.shutdownState = shutdownState;
         this.outbox = properties.outbox();
         this.reconciliation = properties.reconciliation();
     }
@@ -49,6 +52,9 @@ public class OutboxCleanupService {
     @Scheduled(fixedDelayString = "${distroq.outbox.cleanup-interval-ms:3600000}",
             initialDelayString = "${distroq.outbox.cleanup-interval-ms:3600000}")
     public void scheduledCleanup() {
+        if (!shutdownState.isRunning()) {
+            return;
+        }
         CleanupResult result = cleanup("Scheduled outbox retention sweep",
                 ReliabilityAuditService.SYSTEM_ACTOR);
         if (result.deleted() > 0) {

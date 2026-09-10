@@ -117,7 +117,12 @@ class WorkerDeliveryTest {
 
         worker = new Worker(consumer, jobRepository, jobExecutor,
                 new BackoffPolicy(TestProperties.defaults()), new PriorityStrategy(TestProperties.defaults()),
-                claims, new WorkerMetrics(TestProperties.defaults()), TestProperties.defaults());
+                claims, new WorkerMetrics(TestProperties.defaults()),
+                new com.distroq.metrics.DistroqMetrics(
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+                        TestProperties.defaults()),
+                new com.distroq.lifecycle.ShutdownState(), new com.distroq.health.SubsystemHealth(),
+                TestProperties.defaults());
     }
 
     @Test
@@ -129,6 +134,32 @@ class WorkerDeliveryTest {
         verify(jobExecutor).execute(job);
         assertThat(job.getStatus()).isEqualTo(JobStatus.SUCCEEDED);
         verify(consumer).acknowledge(STREAM, ENTRY);
+    }
+
+    @Test
+    void noNewWorkIsClaimedOnceShutdownHasBegun() throws Exception {
+        com.distroq.lifecycle.ShutdownState shutdownState =
+                new com.distroq.lifecycle.ShutdownState();
+        Worker shuttingDown = new Worker(consumer, jobRepository, jobExecutor,
+                new BackoffPolicy(TestProperties.defaults()),
+                new PriorityStrategy(TestProperties.defaults()),
+                claims, new WorkerMetrics(TestProperties.defaults()),
+                new com.distroq.metrics.DistroqMetrics(
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+                        TestProperties.defaults()),
+                shutdownState, new com.distroq.health.SubsystemHealth(),
+                TestProperties.defaults());
+        Job job = queued(Priority.NORMAL);
+        shutdownState.begin();
+
+        shuttingDown.handle(delivery(job.getId(), Priority.NORMAL, EnqueueSource.SUBMIT));
+
+        // no lease, no attempt row, no execution - and crucially no acknowledgement either, so the
+        // entry stays in the Pending Entries List for whichever instance is still reading
+        verify(claims, never()).claim(any(), any(), any());
+        verifyNoInteractions(jobExecutor);
+        verify(consumer, never()).acknowledge(any(), any());
+        assertThat(job.getStatus()).isEqualTo(JobStatus.QUEUED);
     }
 
     @Test

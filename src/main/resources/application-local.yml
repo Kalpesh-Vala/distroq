@@ -1,0 +1,21 @@
+# Local development. Active by default (spring.profiles.default), so `mvnw spring-boot:run`
+# against `docker compose up -d` works with nothing set in the environment.
+#
+# Everything here is a throwaway credential for a container that listens on localhost. Nothing in
+# this file is a secret, and nothing in this file is used when SPRING_PROFILES_ACTIVE=production.
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5433/distroq
+    username: distroq
+    password: distroq
+  data:
+    redis:
+      # the app runs on the host, outside the compose network
+      host: localhost
+      port: 6379
+
+logging:
+  level:
+    com.distroq: DEBUG
+  # no structured format here on purpose: a developer reading a stack trace in a terminal is not
+  # helped by it being one escaped JSON string

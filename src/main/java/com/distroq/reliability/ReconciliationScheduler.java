@@ -1,6 +1,7 @@
 package com.distroq.reliability;
 
 import com.distroq.config.DistroqProperties;
+import com.distroq.lifecycle.ShutdownState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -20,23 +21,30 @@ public class ReconciliationScheduler {
     private static final Logger log = LoggerFactory.getLogger(ReconciliationScheduler.class);
 
     private final ReconciliationService service;
+    private final ShutdownState shutdownState;
     private final DistroqProperties.Reconciliation properties;
 
-    public ReconciliationScheduler(ReconciliationService service, DistroqProperties properties) {
+    public ReconciliationScheduler(ReconciliationService service, ShutdownState shutdownState,
+                                   DistroqProperties properties) {
         this.service = service;
+        this.shutdownState = shutdownState;
         this.properties = properties.reconciliation();
     }
 
     @Scheduled(fixedDelayString = "${distroq.reconciliation.poll-interval-ms:30000}",
             initialDelayString = "${distroq.reconciliation.poll-interval-ms:30000}")
     public void sweep() {
-        if (!properties.enabled()) {
+        if (!properties.enabled() || !shutdownState.isRunning()) {
             return;
         }
         try {
             service.run(properties.autoRepair(), "Scheduled reconciliation sweep",
                     ReliabilityAuditService.SYSTEM_ACTOR, false);
         } catch (Exception e) {
+            if (!shutdownState.isRunning()) {
+                log.debug("Reconciliation sweep aborted during shutdown");
+                return;
+            }
             log.error("Reconciliation sweep failed; the next tick will retry", e);
         }
     }

@@ -1,0 +1,50 @@
+# Everything the image does not need, and everything it must never contain.
+#
+# The first group is correctness: a host-built target/ or an IDE's output would shadow the layer
+# the builder stage produces. The second group is the important one - .env and any local override
+# file would otherwise be copied into an image layer, where deleting them later does not remove
+# them.
+
+target/
+**/target/
+build/
+.mvn/wrapper/maven-wrapper.jar
+
+# secrets and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+secrets/
+application-local.yml
+application-*.local.yml
+
+# analytics: it has its own Dockerfile and its own context
+analytics/
+
+# operational scratch: backups contain production data
+ops/backup/*.dump
+ops/backup/*.sql
+ops/backup/*.rdb
+ops/restore/*.dump
+
+# IDE and OS
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.settings/
+.classpath
+.project
+.DS_Store
+
+# documentation and CI do not change the binary
+*.md
+!README.md
+.github/
+docker-compose*.yml
+Dockerfile

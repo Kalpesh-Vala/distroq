@@ -1,0 +1,153 @@
+# Production-like. Not a production orchestrator.
+#
+# What this file demonstrates: pinned images, no baked or defaulted secrets, a non-root
+# application user, health checks that gate startup order, named volumes with real persistence
+# settings, resource limits, and a restart policy. What it does not provide, and what a production
+# deployment still needs from somewhere else: more than one application replica behind a load
+# balancer, rolling deployment, node failure handling, secret management with rotation, backup
+# scheduling, log shipping, and metric collection. See OPERATIONS.md.
+#
+# Usage:
+#   cp .env.example .env    # then fill in every CHANGE_ME
+#   docker compose -f docker-compose.production.yml up -d --build
+#
+# Every value below comes from .env. There are no defaults for the credentials on purpose: a
+# missing one is a compose error before anything starts, rather than a container that comes up
+# with a guessable password.
+#
+# The project name is separate from the development stack's for a reason that costs a database the
+# first time it is missed: Compose derives the project from the directory name, so two files in one
+# repository share a project, and `up` on one removes the other's containers.
+name: distroq-prod
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: distroq-redis-prod
+    # AOF with per-second fsync. Redis holds delivery and scheduling state, not business history,
+    # so the recovery target is "the queue survives a restart", not "no acknowledgement is ever
+    # replayed" - at-least-once already tolerates the replay. See OPERATIONS.md for what a Redis
+    # loss does and does not cost.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --dir /data
+      --requirepass ${DISTROQ_REDIS_PASSWORD:?DISTROQ_REDIS_PASSWORD is required}
+      --maxmemory-policy noeviction
+    # noeviction is not a tuning choice. Any eviction policy would let Redis silently delete a
+    # stream entry or a scheduled member under memory pressure, which is a lost job.
+    volumes:
+      - distroq-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$DISTROQ_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      DISTROQ_REDIS_PASSWORD: ${DISTROQ_REDIS_PASSWORD}
+    # not published to the host: only the application network reaches it
+    expose:
+      - "6379"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: distroq-postgres-prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # network connections must present a password hashed with scram-sha-256. Local socket auth
+      # is left at the image default on purpose: anyone with a shell in this container can already
+      # become the postgres user, so requiring a password there weakens nothing and would break
+      # `docker exec ... pg_dump`, which is exactly how ops/backup runs against a container.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - distroq-pgdata-prod:/var/lib/postgresql/data
+      # host directory for pg_dump output; ops/backup/backup-postgres.* writes here
+      - ./ops/backup:/backup
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    expose:
+      - "5432"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distroq:1.0.0
+    container_name: distroq-app
+    depends_on:
+      # both must be healthy, not merely started: Flyway runs during startup and a half-initialised
+      # PostgreSQL would fail it, and the relay would log a connection error every 500ms
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: production
+      DISTROQ_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      DISTROQ_DB_USER: ${DISTROQ_DB_USER:?DISTROQ_DB_USER is required}
+      DISTROQ_DB_PASSWORD: ${DISTROQ_DB_PASSWORD:?DISTROQ_DB_PASSWORD is required}
+      DISTROQ_REDIS_HOST: redis
+      DISTROQ_REDIS_PORT: "6379"
+      DISTROQ_REDIS_PASSWORD: ${DISTROQ_REDIS_PASSWORD}
+      DISTROQ_ADMIN_TOKEN: ${DISTROQ_ADMIN_TOKEN:?DISTROQ_ADMIN_TOKEN is required}
+      DISTROQ_ADMIN_ENABLED: ${DISTROQ_ADMIN_ENABLED:-true}
+      DISTROQ_WORKER_CONCURRENCY: ${DISTROQ_WORKER_CONCURRENCY:-4}
+      DISTROQ_CLAIM_MIN_IDLE_MS: ${DISTROQ_CLAIM_MIN_IDLE_MS:-60000}
+      DISTROQ_LOG_LEVEL: ${DISTROQ_LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"
+    # the image already runs as 10001; repeating it here means a `docker compose run --user root`
+    # is a visible, deliberate override rather than something the file quietly permits
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      # the JVM needs somewhere writable for perf data and temp files; nothing else does
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # SIGTERM starts the documented shutdown sequence. The grace period must exceed
+    # spring.lifecycle.timeout-per-shutdown-phase plus distroq.shutdown.worker-timeout-ms, or the
+    # container is killed mid-drain and the leases are left to expire instead.
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "2.0"
+        reservations:
+          memory: 512m
+
+volumes:
+  # named rather than bind-mounted: the lifetime is the volume's, not a host path's, and
+  # `docker compose down` without -v leaves both intact
+  distroq-pgdata-prod:
+  distroq-redis-data:

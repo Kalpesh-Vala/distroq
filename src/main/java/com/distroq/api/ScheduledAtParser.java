@@ -1,7 +1,7 @@
 package com.distroq.api;
 
-import org.springframework.http.HttpStatus;
-import org.springframework.web.server.ResponseStatusException;
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -36,7 +36,7 @@ final class ScheduledAtParser {
     /**
      * @param raw the request field: absent, JSON null, or a string
      * @return null for an immediate job, otherwise the requested instant
-     * @throws ResponseStatusException 400, naming the field, for anything unparseable
+     * @throws ApiException {@code INVALID_SCHEDULED_AT}, naming the field, for anything unparseable
      */
     static Instant parse(String raw) {
         // absent and explicit null are the same request - "run it now" - and neither is an error
@@ -59,7 +59,7 @@ final class ScheduledAtParser {
         }
     }
 
-    private static ResponseStatusException badRequest(String reason) {
-        return new ResponseStatusException(HttpStatus.BAD_REQUEST, reason);
+    private static ApiException badRequest(String reason) {
+        return new ApiException(ErrorCode.INVALID_SCHEDULED_AT, reason);
     }
 }

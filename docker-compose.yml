@@ -1,12 +1,34 @@
+# Local development. The application runs on the host and talks to these two containers.
+#
+# The credentials below are throwaway values for a container bound to localhost. The
+# production-like arrangement, where nothing has a default and the application runs in a container
+# of its own, is docker-compose.production.yml.
+#
+# The project name is explicit so the two files cannot collide. Without it Compose derives the name
+# from the directory, both files land in the same project, and bringing one up removes the other's
+# containers as orphans - which is a very quick way to lose a development database.
+name: distroq
+
 services:
   redis:
-    image: redis:7-alpine
+    # pinned to a patch line rather than `latest`, so `docker compose pull` cannot change the
+    # Redis version underneath a running dataset
+    image: redis:7.4-alpine
     container_name: distroq-redis
     ports:
       - "6379:6379"
+    # local development deliberately keeps Redis in-memory only: an empty Redis after a restart is
+    # a useful thing for a developer to see, because it is what a production Redis loss looks like
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.4-alpine
     container_name: distroq-postgres
     environment:
       POSTGRES_DB: distroq
@@ -17,6 +39,15 @@ services:
       - "5433:5432"
     volumes:
       - distroq-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d matter: the default `pg_isready` succeeds against a server that is up but has
+      # not yet created the database, and Flyway would then fail on a connection it was told was fine
+      test: ["CMD-SHELL", "pg_isready -U distroq -d distroq"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   # v0.9 batch analytics. Behind a profile so `docker compose up` still starts only the
   # two services the application needs; run it with `--profile analytics run --rm analytics`.

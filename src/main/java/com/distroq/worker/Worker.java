@@ -1,8 +1,14 @@
 package com.distroq.worker;
 
 import com.distroq.config.DistroqProperties;
+import com.distroq.health.SubsystemHealth;
+import com.distroq.lifecycle.ShutdownState;
+import com.distroq.metrics.DistroqMetrics;
 import com.distroq.model.Job;
 import com.distroq.model.Priority;
+import com.distroq.observability.Events;
+import com.distroq.observability.LogContext;
+import com.distroq.observability.LogFields;
 import com.distroq.queue.DeliveryHandler;
 import com.distroq.queue.EnqueueSource;
 import com.distroq.queue.JobStreamConsumer;
@@ -12,8 +18,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.event.ContextClosedEvent;
-import org.springframework.context.event.EventListener;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -58,12 +63,15 @@ public class Worker implements DeliveryHandler {
     private final PriorityStrategy priorityStrategy;
     private final ExecutionClaimService claims;
     private final WorkerMetrics metrics;
+    private final DistroqMetrics meters;
+    private final ShutdownState shutdownState;
+    private final SubsystemHealth subsystemHealth;
     private final List<String> consumerNames;
     private final long heartbeatIntervalMs;
+    private final long shutdownTimeoutMs;
     private final Semaphore executionPermits;
 
     private final String workerId;
-    private final AtomicBoolean running = new AtomicBoolean(true);
 
     /** Entries this process is executing right now, so the recovery sweep can leave them alone. */
     private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
@@ -78,6 +86,9 @@ public class Worker implements DeliveryHandler {
                   PriorityStrategy priorityStrategy,
                   ExecutionClaimService claims,
                   WorkerMetrics metrics,
+                  DistroqMetrics meters,
+                  ShutdownState shutdownState,
+                  SubsystemHealth subsystemHealth,
                   DistroqProperties properties) {
         this.consumer = consumer;
         this.jobRepository = jobRepository;
@@ -86,8 +97,12 @@ public class Worker implements DeliveryHandler {
         this.priorityStrategy = priorityStrategy;
         this.claims = claims;
         this.metrics = metrics;
+        this.meters = meters;
+        this.shutdownState = shutdownState;
+        this.subsystemHealth = subsystemHealth;
         int concurrency = Math.max(1, properties.worker().concurrency());
         this.heartbeatIntervalMs = Math.max(1, properties.worker().heartbeatIntervalMs());
+        this.shutdownTimeoutMs = Math.max(0, properties.shutdown().workerTimeoutMs());
         this.executionPermits = new Semaphore(concurrency);
         this.consumerNames = new ArrayList<>(concurrency);
         this.consumerNames.add(consumer.consumerName());
@@ -116,12 +131,15 @@ public class Worker implements DeliveryHandler {
             return t;
         });
         consumerNames.forEach(name -> pool.submit(() -> runLoop(name)));
+        subsystemHealth.started(SubsystemHealth.Subsystem.WORKER);
         log.info("Started {} worker loop(s) as consumers {} in group {}",
                 consumerNames.size(), consumerNames, consumer.groupName());
     }
 
     private void runLoop(String consumerName) {
-        while (running.get()) {
+        MDC.put(LogFields.WORKER_ID, workerId);
+        MDC.put(LogFields.CONSUMER_NAME, consumerName);
+        while (shutdownState.isRunning()) {
             try {
                 boolean guardDue = priorityStrategy.guardDue();
                 List<Priority> order = priorityStrategy.nextPollOrder();
@@ -137,12 +155,19 @@ public class Worker implements DeliveryHandler {
                     priorityStrategy.recordServed(delivery.streamPriority());
                     handle(delivery, consumerName);
                 }
+                // a poll that timed out with nothing to serve is still a healthy cycle: an empty
+                // queue must not read as a wedged worker
+                subsystemHealth.succeeded(SubsystemHealth.Subsystem.WORKER);
             } catch (Exception e) {
-                if (!running.get()) {
+                if (!shutdownState.isRunning()) {
                     return;
                 }
-                log.error("Worker {} loop error, backing off", consumerName, e);
+                subsystemHealth.failed(SubsystemHealth.Subsystem.WORKER, e);
+                try (LogContext ignored = LogContext.empty().errorType(e)) {
+                    log.error("Worker {} loop error, backing off", consumerName, e);
+                }
                 try {
+                    // a fixed backoff, not a tight retry: a Redis outage must not become a busy loop
                     Thread.sleep(1000L);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
@@ -300,6 +325,13 @@ public class Worker implements DeliveryHandler {
      * delivery working as designed, not a bug being tolerated quietly.
      */
     private void execute(Job job, StreamDelivery delivery, String owner) {
+        // the first of two shutdown checks: no new execution is started once the sequence begins,
+        // and the entry is simply left pending for whoever is still reading
+        if (!shutdownState.isRunning()) {
+            log.info("Shutdown in progress; leaving entry {} for job {} pending rather than "
+                    + "claiming it", delivery.entryId(), job.getId());
+            return;
+        }
         if (!executionPermits.tryAcquire()) {
             return;
         }
@@ -313,12 +345,21 @@ public class Worker implements DeliveryHandler {
         }
         ExecutionClaimService.Claim claim = won.get();
         AtomicBoolean ownershipLost = new AtomicBoolean(false);
+        // the heartbeat runs on another thread and races finalization: succeed() clears the lease,
+        // so a renew landing a millisecond later legitimately fails. Without this flag that renew
+        // reports job.execution_lease_lost for a job that just succeeded, which is a false alert
+        // on one of the event names operators are told to page on.
+        AtomicBoolean executionFinished = new AtomicBoolean(false);
         metrics.workerStarted();
+        recordStart(job, claim, delivery, owner);
         ScheduledFuture<?> heartbeat = heartbeatPool == null ? null : heartbeatPool.scheduleAtFixedRate(() -> {
             try {
-                if (!claims.renew(claim)) {
+                if (!claims.renew(claim) && !executionFinished.get()) {
                     ownershipLost.set(true);
-                    log.error("Worker {} lost the execution lease for job {}", owner, job.getId());
+                    try (LogContext ignored = LogContext.event(Events.JOB_EXECUTION_LEASE_LOST)
+                            .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)) {
+                        log.error("Worker {} lost the execution lease for job {}", owner, job.getId());
+                    }
                 }
             } catch (Exception e) {
                 log.error("Worker {} could not renew the execution lease for job {}", owner,
@@ -326,55 +367,125 @@ public class Worker implements DeliveryHandler {
             }
         }, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
         boolean finalized = false;
+        long startedAtNanos = System.nanoTime();
         try {
             jobExecutor.execute(claim.job());
+            executionFinished.set(true);
+            stopHeartbeat(heartbeat);
             finalized = !ownershipLost.get() && claims.succeed(claim);
+            if (finalized) {
+                Duration took = Duration.ofNanos(System.nanoTime() - startedAtNanos);
+                meters.jobSucceeded(job, took);
+                try (LogContext ignored = LogContext.event(Events.JOB_SUCCEEDED)
+                        .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)
+                        .priority(job.getPriority()).status("SUCCEEDED")
+                        .stream(delivery.streamKey(), delivery.entryId())
+                        .durationMs(took.toMillis())) {
+                    log.info("Job {} succeeded", job.getId());
+                }
+            }
         } catch (Exception e) {
+            executionFinished.set(true);
+            stopHeartbeat(heartbeat);
             String error = e.getMessage() == null ? e.toString() : e.getMessage();
+            meters.jobFailed(job, Duration.ofNanos(System.nanoTime() - startedAtNanos));
             if (!ownershipLost.get()) {
-                finalized = handleFailure(claim, error);
+                finalized = handleFailure(claim, error, delivery, owner, e);
             }
         } finally {
-            if (heartbeat != null) {
-                heartbeat.cancel(false);
-            }
+            stopHeartbeat(heartbeat);
             metrics.workerFinished();
             executionPermits.release();
         }
         if (finalized) {
             consumer.acknowledge(delivery.streamKey(), delivery.entryId());
         } else {
-            log.warn("Worker {} did not finalize job {}; leaving entry {} pending", owner,
-                    job.getId(), delivery.entryId());
+            // deliberately not an error state: the entry stays in the Pending Entries List and the
+            // lease expires on its own clock, which is the recovery path, not a leak
+            try (LogContext ignored = LogContext.empty().job(job.getId()).worker(owner)
+                    .stream(delivery.streamKey(), delivery.entryId())) {
+                log.warn("Worker {} did not finalize job {}; leaving entry {} pending", owner,
+                        job.getId(), delivery.entryId());
+            }
         }
     }
 
-    private boolean handleFailure(ExecutionClaimService.Claim claim, String error) {
+    private void recordStart(Job job, ExecutionClaimService.Claim claim, StreamDelivery delivery,
+                             String owner) {
+        meters.jobStarted(job);
+        meters.queueDelay(job, Duration.ofMillis(
+                Math.max(0, System.currentTimeMillis() - delivery.enqueuedAt())));
+        if (job.getScheduledAt() != null) {
+            meters.scheduleDelay(job, Duration.between(job.getScheduledAt(), Instant.now()));
+        }
+        try (LogContext ignored = LogContext.event(Events.JOB_EXECUTION_CLAIMED)
+                .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)
+                .priority(job.getPriority()).status(job.getStatus())
+                .stream(delivery.streamKey(), delivery.entryId())) {
+            log.info("Worker {} claimed the execution lease for job {}", owner, job.getId());
+        }
+        try (LogContext ignored = LogContext.event(Events.JOB_STARTED)
+                .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)
+                .priority(job.getPriority()).status("RUNNING")
+                .stream(delivery.streamKey(), delivery.entryId())) {
+            log.info("Job {} started attempt {}", job.getId(), job.getAttemptCount());
+        }
+    }
+
+    private boolean handleFailure(ExecutionClaimService.Claim claim, String error,
+                                  StreamDelivery delivery, String owner, Exception cause) {
         Job job = claim.job();
         if (!job.hasAttemptsRemaining()) {
-            return claims.deadLetter(claim, error);
+            boolean done = claims.deadLetter(claim, error);
+            if (done) {
+                meters.jobDeadLettered(job);
+                try (LogContext ignored = LogContext.event(Events.JOB_DEAD_LETTERED)
+                        .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)
+                        .priority(job.getPriority()).status("DEAD_LETTERED")
+                        .stream(delivery.streamKey(), delivery.entryId()).errorType(cause)) {
+                    log.warn("Job {} exhausted its attempt budget and was dead-lettered",
+                            job.getId());
+                }
+            }
+            return done;
         }
 
         Duration delay = backoffPolicy.delayFor(job.getAttemptCount());
         Instant dueAt = Instant.now().plus(delay);
-        return claims.retry(claim, error, dueAt);
+        boolean done = claims.retry(claim, error, dueAt);
+        if (done) {
+            try (LogContext ignored = LogContext.event(Events.JOB_RETRY_SCHEDULED)
+                    .job(job.getId()).attempt(claim.attempt().getId()).worker(owner)
+                    .priority(job.getPriority()).status("RETRYING")
+                    .stream(delivery.streamKey(), delivery.entryId())
+                    .durationMs(delay.toMillis()).errorType(cause)) {
+                log.info("Job {} will be retried at {}", job.getId(), dueAt);
+            }
+        }
+        return done;
     }
 
     private static String inFlightKey(String streamKey, String entryId) {
         return streamKey + '|' + entryId;
     }
 
-    // fires before bean destruction closes the Redis connection, so a blocking XREADGROUP
-    // aborted by shutdown is not mistaken for a genuine loop error
-    @EventListener(ContextClosedEvent.class)
-    public void onContextClosed() {
-        running.set(false);
+    /** Idempotent, and never interrupting: a renew already in flight is allowed to finish. */
+    private static void stopHeartbeat(ScheduledFuture<?> heartbeat) {
+        if (heartbeat != null) {
+            heartbeat.cancel(false);
+        }
     }
 
+    /**
+     * Bean destruction. By the time this runs {@link com.distroq.lifecycle.WorkDrainLifecycle} has
+     * already waited for active executions, so the remaining job is to stop the loops and let the
+     * pools go; anything still running here has exceeded the drain budget and is being abandoned
+     * on purpose, without its outcome being recorded.
+     */
     @PreDestroy
     public void stop() {
         log.info("Worker {} shutting down", workerId);
-        running.set(false);
+        shutdownState.begin();
         if (pool == null) {
             return;
         }
@@ -383,7 +494,7 @@ public class Worker implements DeliveryHandler {
             heartbeatPool.shutdown();
         }
         try {
-            if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
+            if (!pool.awaitTermination(shutdownTimeoutMs, TimeUnit.MILLISECONDS)) {
                 pool.shutdownNow();
             }
         } catch (InterruptedException e) {

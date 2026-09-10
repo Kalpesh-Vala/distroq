@@ -38,6 +38,26 @@ build/
 ### Logs ###
 *.log
 
+### v1.0 secrets and operational output ###
+# .env holds real credentials; .env.example holds placeholders and is committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+secrets/
+# Backups are production data. They are reproducible from the database and must never be
+# committed; the scripts that create them are.
+ops/backup/*.dump
+ops/backup/*.sql
+ops/backup/*.rdb
+ops/backup/*.aof
+ops/restore/*.dump
+!ops/backup/.gitkeep
+!ops/restore/.gitkeep
+
 ### v0.9 analytics ###
 # Local Python environments and the Spark/pytest scratch they produce.
 analytics/.venv/

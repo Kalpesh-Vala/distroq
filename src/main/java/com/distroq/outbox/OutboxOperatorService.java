@@ -1,16 +1,18 @@
 package com.distroq.outbox;
 
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 import com.distroq.model.OutboxEvent;
 import com.distroq.model.OutboxStatus;
 import com.distroq.model.ReliabilityActionType;
+import com.distroq.observability.Events;
+import com.distroq.observability.LogContext;
 import com.distroq.reliability.ReliabilityAuditService;
 import com.distroq.repository.OutboxEventRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -41,10 +43,10 @@ public class OutboxOperatorService {
     @Transactional
     public OutboxEvent retry(UUID eventId, String reason, String actor, String adminReason) {
         OutboxEvent event = repository.findById(eventId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                .orElseThrow(() -> new ApiException(ErrorCode.OUTBOX_EVENT_NOT_FOUND,
                         "No outbox event with id " + eventId));
         if (event.getStatus() != OutboxStatus.FAILED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
+            throw new ApiException(ErrorCode.OUTBOX_EVENT_NOT_FAILED,
                     "Only a FAILED outbox event can be retried; event " + eventId + " is "
                             + event.getStatus());
         }
@@ -54,8 +56,12 @@ public class OutboxOperatorService {
         audit.record(ReliabilityActionType.OUTBOX_RETRY, "OutboxEvent", eventId,
                 reason + " | X-Admin-Reason: " + adminReason, actor, before, describe(event));
 
-        log.warn("Operator {} returned outbox event {} to PENDING (operator retry {}): {}",
-                actor, eventId, event.getOperatorRetryCount(), reason);
+        try (LogContext ignored = LogContext.event(Events.OUTBOX_OPERATOR_RETRY)
+                .outboxEvent(eventId).eventType(event.getEventType())
+                .status(event.getStatus())) {
+            log.warn("Operator {} returned outbox event {} to PENDING (operator retry {}): {}",
+                    actor, eventId, event.getOperatorRetryCount(), reason);
+        }
         return event;
     }
 

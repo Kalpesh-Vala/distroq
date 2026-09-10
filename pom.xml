@@ -10,9 +10,11 @@
 	</parent>
 	<groupId>com.distroq</groupId>
 	<artifactId>distroq</artifactId>
-	<version>0.0.1-SNAPSHOT</version>
-	<name/>
-	<description/>
+	<!-- The single source of truth for the version. build-info.properties and /actuator/info
+	     are both generated from it, and analytics reads it out of this file. -->
+	<version>1.0.0</version>
+	<name>distroq</name>
+	<description>Distributed job queue with at-least-once delivery, priorities and a transactional outbox</description>
 	<url/>
 	<licenses>
 		<license/>
@@ -28,6 +30,7 @@
 	</scm>
 	<properties>
 		<java.version>21</java.version>
+		<git-commit-id-plugin.version>9.0.1</git-commit-id-plugin.version>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -36,11 +39,31 @@
 		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-validation</artifactId>
+		</dependency>
+		<!-- health, info and the Micrometer registry that /actuator/metrics reads from -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-data-jpa</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-data-redis</artifactId>
+		</dependency>
+		<!-- Lettuce connection pooling is opt-in and needs this on the classpath; the production
+		     profile enables the pool, the local profile does not -->
+		<dependency>
+			<groupId>org.apache.commons</groupId>
+			<artifactId>commons-pool2</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.flywaydb</groupId>
@@ -69,6 +92,45 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- writes target/classes/META-INF/build-info.properties, which is where
+						     /actuator/info gets version, artifact and build time -->
+						<id>build-info</id>
+						<goals>
+							<goal>build-info</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>io.github.git-commit-id</groupId>
+				<artifactId>git-commit-id-maven-plugin</artifactId>
+				<version>${git-commit-id-plugin.version}</version>
+				<executions>
+					<execution>
+						<id>get-the-git-infos</id>
+						<goals>
+							<goal>revision</goal>
+						</goals>
+						<phase>initialize</phase>
+					</execution>
+				</executions>
+				<configuration>
+					<generateGitPropertiesFile>true</generateGitPropertiesFile>
+					<generateGitPropertiesFilename>${project.build.outputDirectory}/git.properties</generateGitPropertiesFilename>
+					<!-- a source tree with no .git directory must still build; the info endpoint
+					     simply omits the git block in that case -->
+					<failOnNoGitDirectory>false</failOnNoGitDirectory>
+					<includeOnlyProperties>
+						<includeOnlyProperty>^git.branch$</includeOnlyProperty>
+						<includeOnlyProperty>^git.commit.id$</includeOnlyProperty>
+						<includeOnlyProperty>^git.commit.id.abbrev$</includeOnlyProperty>
+						<includeOnlyProperty>^git.commit.time$</includeOnlyProperty>
+						<includeOnlyProperty>^git.dirty$</includeOnlyProperty>
+						<includeOnlyProperty>^git.tags$</includeOnlyProperty>
+					</includeOnlyProperties>
+				</configuration>
 			</plugin>
 		</plugins>
 	</build>
