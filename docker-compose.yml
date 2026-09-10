@@ -18,5 +18,33 @@ services:
     volumes:
       - distroq-pgdata:/var/lib/postgresql/data
 
+  # v0.9 batch analytics. Behind a profile so `docker compose up` still starts only the
+  # two services the application needs; run it with `--profile analytics run --rm analytics`.
+  #
+  # It joins the compose network and reaches Postgres at postgres:5432 rather than the
+  # host's 5433, and it is the only consumer of that database that connects read-only.
+  analytics:
+    build:
+      context: ./analytics
+    image: distroq-analytics:0.9.0
+    profiles: ["analytics"]
+    depends_on:
+      - postgres
+    environment:
+      DISTROQ_ANALYTICS_DB_URL: jdbc:postgresql://postgres:5432/distroq
+      DISTROQ_ANALYTICS_DB_USER: ${DISTROQ_ANALYTICS_DB_USER:-distroq}
+      # Same throwaway local-development credential POSTGRES_PASSWORD already uses above.
+      # Real deployments set DISTROQ_ANALYTICS_DB_PASSWORD in the environment; nothing
+      # beyond this local default is ever committed.
+      DISTROQ_ANALYTICS_DB_PASSWORD: ${DISTROQ_ANALYTICS_DB_PASSWORD:-distroq}
+      DISTROQ_ANALYTICS_OUTPUT_DIR: /workspace/analytics/output
+      DISTROQ_ANALYTICS_SPARK_MASTER: ${DISTROQ_ANALYTICS_SPARK_MASTER:-local[*]}
+      DISTROQ_ANALYTICS_LOG_LEVEL: ${DISTROQ_ANALYTICS_LOG_LEVEL:-WARN}
+    volumes:
+      - ./analytics/src:/opt/distroq-analytics/src:ro
+      - ./analytics/tests:/opt/distroq-analytics/tests:ro
+      - ./analytics/output:/workspace/analytics/output
+      - ./pom.xml:/workspace/pom.xml:ro
+
 volumes:
   distroq-pgdata:

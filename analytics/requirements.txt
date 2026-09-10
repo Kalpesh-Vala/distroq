@@ -1,0 +1,16 @@
+# DistroQ analytics - pinned runtime dependencies.
+#
+# Python: 3.12.x. PySpark 4.0 declares >=3.9, but the Python worker process does not
+# start on 3.14/3.15 (the interpreter shipped on some dev machines), so the supported
+# range here is deliberately narrower than the wheel metadata claims. See README.md.
+#
+# Java: 17 or 21. Spark 4.0 dropped Java 8/11 and does not support Java 22+.
+# The DistroQ application already targets Java 21, so one JDK serves both.
+
+pyspark==4.0.1
+py4j==0.10.9.9
+
+# JDBC extraction needs the PostgreSQL driver on the Spark classpath. It is resolved
+# from the local Maven repository at runtime rather than vendored here; see
+# distroq_analytics.spark for how the jar is located, and README.md for the download
+# fallback. No Python package provides it.
