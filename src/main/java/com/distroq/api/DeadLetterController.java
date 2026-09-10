@@ -2,6 +2,8 @@ package com.distroq.api;
 
 import com.distroq.api.dto.DeadLetterDetailResponse;
 import com.distroq.api.dto.DeadLetterResponse;
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 import com.distroq.model.DeadLetter;
 import com.distroq.model.Job;
 import com.distroq.repository.DeadLetterRepository;
@@ -60,6 +62,7 @@ public class DeadLetterController {
                                 deadLetter, job,
                                 jobAttemptRepository.findByJobIdOrderByAttemptNumberAsc(jobId))))
                 .map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.notFound().build());
+                .orElseThrow(() -> new ApiException(ErrorCode.DEAD_LETTER_NOT_FOUND,
+                        "No dead-lettered job with id " + jobId));
     }
 }

@@ -6,6 +6,8 @@ import com.distroq.api.dto.OutboxRetryRequest;
 import com.distroq.api.dto.ReconciliationResponse;
 import com.distroq.api.dto.ReconciliationRunRequest;
 import com.distroq.api.dto.ReliabilityActionResponse;
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 import com.distroq.config.DistroqProperties;
 import com.distroq.model.OutboxEvent;
 import com.distroq.model.OutboxStatus;
@@ -47,15 +49,13 @@ import java.util.UUID;
  * back into a state the relay can act on, and then letting the relay act on it, because a
  * controller that publishes directly is the dual write the outbox was built to remove.
  *
- * <p>{@code X-Admin-Reason} is required on every mutating call. See {@link AdminReason} for why
- * that is an audit device and not a security one.
+ * <p>From v1.0 every endpoint below — read-only ones included — sits behind
+ * {@link AdminAuthenticationFilter}. {@code X-Admin-Reason} is still required on every mutating
+ * call, and is still an audit device rather than a security one; see {@link AdminReason}.
  */
 @RestController
 @RequestMapping("/api/admin")
 public class AdminController {
-
-    /** No authentication exists in v0.8, so the actor is a label rather than an identity. */
-    private static final String DEFAULT_ACTOR = "operator";
 
     private static final int MAX_PAGE_SIZE = 200;
 
@@ -115,7 +115,8 @@ public class AdminController {
         return outboxEvents.findById(eventId)
                 .map(event -> OutboxEventDetail.from(event, Instant.now(), outboxMaxAttempts))
                 .map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.notFound().build());
+                .orElseThrow(() -> new ApiException(ErrorCode.OUTBOX_EVENT_NOT_FOUND,
+                        "No outbox event with id " + eventId));
     }
 
     /**
@@ -131,7 +132,8 @@ public class AdminController {
 
         String adminHeader = adminReason.requireHeader(header);
         String reason = adminReason.requireBody(request == null ? null : request.reason());
-        OutboxEvent event = operatorService.retry(eventId, reason, actorOrDefault(actor), adminHeader);
+        OutboxEvent event = operatorService.retry(eventId, reason,
+                adminReason.actorOrDefault(actor), adminHeader);
         return ResponseEntity.accepted()
                 .body(OutboxEventDetail.from(event, Instant.now(), outboxMaxAttempts));
     }
@@ -147,7 +149,7 @@ public class AdminController {
 
         String reason = adminReason.requireHeader(header);
         OutboxCleanupService.CleanupResult result =
-                cleanupService.cleanup(reason, actorOrDefault(actor));
+                cleanupService.cleanup(reason, adminReason.actorOrDefault(actor));
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("deleted", result.deleted());
@@ -162,7 +164,7 @@ public class AdminController {
     @GetMapping("/reconciliation")
     public ReconciliationResponse reconciliation() {
         return ReconciliationResponse.from(reconciliationService.run(false,
-                "Reconciliation preview", DEFAULT_ACTOR, true));
+                "Reconciliation preview", adminReason.defaultActor(), true));
     }
 
     @PostMapping("/reconciliation/run")
@@ -175,7 +177,8 @@ public class AdminController {
         String reason = adminReason.requireBody(request == null ? null : request.reason());
         boolean requested = request != null && request.autoRepairRequested();
         return ReconciliationResponse.from(reconciliationService.run(requested,
-                reason + " | X-Admin-Reason: " + adminHeader, actorOrDefault(actor), true));
+                reason + " | X-Admin-Reason: " + adminHeader, adminReason.actorOrDefault(actor),
+                true));
     }
 
     @GetMapping("/reliability-actions")
@@ -231,13 +234,5 @@ public class AdminController {
             }
             return builder.and(predicates.toArray(jakarta.persistence.criteria.Predicate[]::new));
         };
-    }
-
-    private static String actorOrDefault(String actor) {
-        if (actor == null || actor.isBlank()) {
-            return DEFAULT_ACTOR;
-        }
-        String trimmed = actor.trim();
-        return trimmed.length() <= 255 ? trimmed : trimmed.substring(0, 255);
     }
 }

@@ -4,6 +4,8 @@ import com.distroq.api.dto.JobDetailResponse;
 import com.distroq.api.dto.IdempotencyResponse;
 import com.distroq.api.dto.JobResponse;
 import com.distroq.api.dto.SubmitJobRequest;
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 import com.distroq.config.DistroqProperties;
 import com.distroq.effects.JobEffectService;
 import com.distroq.model.AttemptOutcome;
@@ -104,7 +106,8 @@ public class JobController {
                         job, jobAttemptRepository.findByJobIdOrderByAttemptNumberAsc(job.getId()),
                         effectService.forJob(job.getId())))
                 .map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.notFound().build());
+                .orElseThrow(() -> new ApiException(ErrorCode.JOB_NOT_FOUND,
+                        "No job with id " + id));
     }
 
     @GetMapping("/jobs")
@@ -140,7 +143,8 @@ public class JobController {
             .flatMap(record -> jobRepository.findById(record.getJobId())
                 .map(job -> IdempotencyResponse.from(record, job)))
             .map(ResponseEntity::ok)
-            .orElseGet(() -> ResponseEntity.notFound().build());
+            .orElseThrow(() -> new ApiException(ErrorCode.IDEMPOTENCY_KEY_NOT_FOUND,
+                "No job was submitted with that idempotency key"));
     }
 
     /**

@@ -8,6 +8,8 @@ import com.distroq.model.JobEffect;
 import com.distroq.model.OutboxEvent;
 import com.distroq.model.OutboxStatus;
 import com.distroq.model.ReliabilityActionType;
+import com.distroq.observability.Events;
+import com.distroq.observability.LogContext;
 import com.distroq.outbox.OutboxEventType;
 import com.distroq.outbox.OutboxPayload;
 import com.distroq.outbox.OutboxService;
@@ -131,11 +133,28 @@ public class ReconciliationService {
                 requestedAutoRepair, allowed, repairing, false, context.inspected,
                 properties.batchSize(), List.copyOf(context.findings));
         if (report.findingCount() > 0) {
+            report.findings().forEach(ReconciliationService::announce);
             log.info("Reconciliation inspected {} row(s) and found {} issue(s): {} repaired, {} "
                     + "skipped, {} failed", report.inspected(), report.findingCount(),
                     report.repaired(), report.skipped(), report.failed());
         }
         return report;
+    }
+
+    /**
+     * One line per finding, so an alert can count them by type without parsing the report body.
+     * {@code detail} is structural by construction — see {@link ReliabilityFinding} — so it is
+     * safe to log; a payload or an error body never reaches it.
+     */
+    private static void announce(ReliabilityFinding finding) {
+        boolean repaired = finding.resolution() == Resolution.REPAIRED;
+        try (LogContext ignored = LogContext
+                .event(repaired ? Events.RECONCILIATION_REPAIR : Events.RECONCILIATION_FINDING)
+                .eventType(finding.type())
+                .status(finding.resolution())) {
+            log.info("Reconciliation {} {} {}: {}", finding.resolution(), finding.targetType(),
+                    finding.targetId(), finding.detail());
+        }
     }
 
     // ------------------------------------------------------------------------------- outbox

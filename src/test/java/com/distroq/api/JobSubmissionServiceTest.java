@@ -51,7 +51,11 @@ class JobSubmissionServiceTest {
                 new IdempotencyRequestHasher(
                         com.fasterxml.jackson.databind.json.JsonMapper.builder()
                                 .findAndAddModules().build()),
-                entityManager, TestProperties.defaults());
+                entityManager,
+                new com.distroq.metrics.DistroqMetrics(
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+                        TestProperties.defaults()),
+                TestProperties.defaults());
     }
 
     @Test

@@ -1,0 +1,88 @@
+# Production.
+#
+# Every value that could be a secret is an environment variable with no default. A missing one
+# fails startup with the variable named, which is the intended behaviour: a deployment that starts
+# with a placeholder password is worse than one that does not start.
+#
+# ConfigurationValidator additionally refuses this profile when the admin token is unset, when
+# ddl-auto is anything but validate/none, when the outbox failure hook is armed, or when the relay
+# is disabled. See ConfigurationValidator#checkProduction.
+spring:
+  datasource:
+    url: ${DISTROQ_DB_URL}
+    username: ${DISTROQ_DB_USER}
+    password: ${DISTROQ_DB_PASSWORD}
+    hikari:
+      maximum-pool-size: ${DISTROQ_DB_POOL_MAX:10}
+      minimum-idle: ${DISTROQ_DB_POOL_MIN:2}
+      # bounded rather than infinite: a request should fail fast with 503 when the database is
+      # gone, not hold a servlet thread until something else times out
+      connection-timeout: ${DISTROQ_DB_CONNECTION_TIMEOUT_MS:5000}
+      validation-timeout: 2000
+  data:
+    redis:
+      host: ${DISTROQ_REDIS_HOST}
+      port: ${DISTROQ_REDIS_PORT:6379}
+      password: ${DISTROQ_REDIS_PASSWORD:}
+      ssl:
+        enabled: ${DISTROQ_REDIS_SSL:false}
+      timeout: ${DISTROQ_REDIS_TIMEOUT_MS:5000}
+      lettuce:
+        pool:
+          enabled: true
+          max-active: ${DISTROQ_REDIS_POOL_MAX:16}
+          max-idle: 8
+          min-idle: 1
+  jpa:
+    hibernate:
+      # Flyway is the only schema migration mechanism. Anything else here fails validation.
+      ddl-auto: validate
+    show-sql: false
+  flyway:
+    enabled: true
+    # a production database is never baselined implicitly: an unexpected schema must be an error
+    # an operator resolves deliberately, not something a startup silently records as V1
+    baseline-on-migrate: false
+
+server:
+  shutdown: graceful
+  tomcat:
+    max-threads: ${DISTROQ_HTTP_MAX_THREADS:200}
+    accept-count: 100
+
+distroq:
+  admin:
+    enabled: ${DISTROQ_ADMIN_ENABLED:true}
+    token: ${DISTROQ_ADMIN_TOKEN}
+    default-actor: ${DISTROQ_ADMIN_DEFAULT_ACTOR:admin}
+  worker:
+    concurrency: ${DISTROQ_WORKER_CONCURRENCY:4}
+    execution-lease-ms: ${DISTROQ_WORKER_LEASE_MS:30000}
+    heartbeat-interval-ms: ${DISTROQ_WORKER_HEARTBEAT_MS:5000}
+  streams:
+    # must exceed the longest expected job duration, or a healthy slow worker looks abandoned
+    claim-min-idle-ms: ${DISTROQ_CLAIM_MIN_IDLE_MS:60000}
+  outbox:
+    relay-enabled: ${DISTROQ_OUTBOX_RELAY_ENABLED:true}
+    fail-after-publish: false
+  reconciliation:
+    enabled: ${DISTROQ_RECONCILIATION_ENABLED:true}
+    auto-repair: ${DISTROQ_RECONCILIATION_AUTO_REPAIR:false}
+    requeue-failed-outbox: false
+  shutdown:
+    worker-timeout-ms: ${DISTROQ_SHUTDOWN_WORKER_TIMEOUT_MS:30000}
+    relay-timeout-ms: ${DISTROQ_SHUTDOWN_RELAY_TIMEOUT_MS:10000}
+    scheduler-timeout-ms: ${DISTROQ_SHUTDOWN_SCHEDULER_TIMEOUT_MS:10000}
+
+logging:
+  structured:
+    format:
+      # one JSON object per line, with the field set README.md documents
+      console: com.distroq.observability.DistroqJsonLogFormatter
+  level:
+    root: ${DISTROQ_LOG_LEVEL_ROOT:INFO}
+    # DEBUG here logs delivery detail on every entry; it is a deliberate operator action, not a
+    # default, because the volume is proportional to throughput
+    com.distroq: ${DISTROQ_LOG_LEVEL:INFO}
+    org.hibernate.SQL: WARN
+    org.springframework.web: WARN

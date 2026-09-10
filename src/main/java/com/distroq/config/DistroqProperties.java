@@ -20,7 +20,9 @@ public record DistroqProperties(
         @DefaultValue Worker worker,
         @DefaultValue Reconciliation reconciliation,
         @DefaultValue Effects effects,
-        @DefaultValue Admin admin) {
+        @DefaultValue Admin admin,
+        @DefaultValue Shutdown shutdown,
+        @DefaultValue Metrics metrics) {
 
     public record Retry(
             @DefaultValue("3") int defaultMaxAttempts,
@@ -155,8 +157,72 @@ public record DistroqProperties(
             @DefaultValue("false") boolean autoFailStale) {
     }
 
-    /** v0.8 has no authentication. {@code X-Admin-Reason} is an audit trail, not authorization. */
+    /**
+     * Administrative access.
+     *
+     * <p>v0.8 had no authentication at all: {@code X-Admin-Reason} was an audit trail and nothing
+     * more. v1.0 adds a single shared bearer token, which is a release-level guard rather than an
+     * identity system — it authenticates the operator role, not the operator. See SECURITY.md.
+     *
+     * <p>{@code token} is never logged, never persisted and never exposed through actuator.
+     * Leaving it unset with {@code enabled} true fails startup in the production profile; in the
+     * local and test profiles an unset token disables the guard so a developer is not required to
+     * invent a secret to run the thing on their laptop.
+     */
     public record Admin(
+            @DefaultValue("true") boolean enabled,
+            String token,
+            @DefaultValue("admin") String defaultActor,
             @DefaultValue("500") int maxReasonLength) {
+
+        /** True when a real token is configured, which is the only state that authenticates anyone. */
+        public boolean tokenConfigured() {
+            return isConfigured(token);
+        }
+    }
+
+    /**
+     * Per-subsystem shutdown budgets.
+     *
+     * <p>These are not the same clock as {@code spring.lifecycle.timeout-per-shutdown-phase}, which
+     * bounds the whole phase. These bound each subsystem's own drain so a slow worker cannot eat
+     * the relay's and the schedulers' share of the budget as well.
+     */
+    public record Shutdown(
+            @DefaultValue("30000") long workerTimeoutMs,
+            @DefaultValue("10000") long relayTimeoutMs,
+            @DefaultValue("10000") long schedulerTimeoutMs) {
+    }
+
+    /**
+     * Metric label cardinality.
+     *
+     * <p>{@code jobTypeTag} exists because job type is the one label a caller controls, and a
+     * deployment whose submitters put identifiers in that field should be able to switch it off
+     * entirely rather than rely on the cap. {@code maxJobTypeTags} is that cap: distinct types
+     * beyond it are reported as {@code other}. See {@code BoundedTagValues}.
+     */
+    public record Metrics(
+            @DefaultValue("true") boolean jobTypeTag,
+            @DefaultValue("20") int maxJobTypeTags,
+            @DefaultValue("5000") long databaseGaugeCacheMs) {
+    }
+
+    /**
+     * Whether a value is genuinely set.
+     *
+     * <p>Blank is the obvious case. The other one is a property whose {@code ${VAR}} placeholder
+     * could not be resolved: Spring's binder ignores unresolvable placeholders, so a production
+     * deployment that forgot to export {@code DISTROQ_ADMIN_TOKEN} would otherwise come up with an
+     * administrative token whose value is the literal string {@code ${DISTROQ_ADMIN_TOKEN}} —
+     * present, non-blank, and known to everyone who has read this file. Treating that as unset is
+     * what turns a silent, guessable credential into a refusal to start.
+     */
+    public static boolean isConfigured(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String trimmed = value.trim();
+        return !(trimmed.startsWith("${") && trimmed.endsWith("}"));
     }
 }

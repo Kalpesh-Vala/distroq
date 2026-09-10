@@ -1,2 +1,7 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+# ops/*.sh runs inside a Linux container or on a Linux host. A CRLF shebang line makes the
+# interpreter path end in \r, and the script fails with "bad interpreter".
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf

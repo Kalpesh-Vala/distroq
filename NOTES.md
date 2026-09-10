@@ -3,6 +3,382 @@
 Running log of known limitations, failure modes observed, and design decisions.
 Written for my own reference and interview prep.
 
+## What v1.0 changed about the plan
+
+### 1. Why v1.0 is a hardening release
+
+Every release so far added a capability, and each one was chosen because the previous one had an
+obvious gap: v0.4 had no priorities, v0.5 had no recovery, v0.7 had a dual write, v0.8 had no way
+to see the outbox. By v0.9 the feature roadmap had stopped generating obvious gaps and started
+generating optional ones — cron scheduling, cancellation, a dashboard, Kafka. All of them are
+features. None of them was the reason this could not be run by someone other than me.
+
+The actual gaps were operational, and I had been carrying them since v0.4 without writing them
+down as debt:
+
+- No authentication on the administrative endpoints. v0.8 added endpoints that retry outbox events
+  and force reconciliation, and the only thing in front of them was a header asking the caller to
+  explain themselves. I documented that as "not authorization" and moved on, which is a way of
+  noticing a problem without fixing it.
+- No way to distinguish "this process is alive" from "this process can do work". Anything
+  monitoring the application had one signal, and the two questions have opposite correct responses
+  to a database outage.
+- Logs that were readable by a person and unqueryable by a machine, in a system whose whole value
+  proposition is what happens when something goes wrong at 3am.
+- A configuration surface with about forty knobs, several of which fail in ways that only appear
+  under load — and nothing checking any of them.
+
+Adding a feature on top of that would have been building the eleventh floor of a building with no
+fire exits. So v1.0 adds no queue mechanism, no job semantics, no persistence technology and no
+API surface beyond actuator. Everything it does is in service of one sentence: *make the existing
+behaviour safe to operate, inspect, upgrade, recover and release.*
+
+The tell that this was the right call is that the release found three real defects in code that
+had passed 289 tests and four rounds of manual acceptance — none of which is a feature bug, and
+all of which would have shown up in production. They are in sections 11, 12 and 13 below.
+
+### 2. Admin authentication is a guard, not an identity system
+
+I considered three options and picked the smallest one that actually closes the hole.
+
+**Spring Security with form login or OAuth2** would have been the "proper" answer and the wrong
+one. It brings a filter chain, a session concept, a user store and a large amount of configuration
+that has to be got exactly right, and the thing being protected is seven endpoints used by an
+operator during an incident. The failure mode of over-engineering here is that the security
+configuration itself becomes the thing that breaks the deployment.
+
+**mTLS** would push the problem to the platform, which is where it eventually belongs, but it is
+not something this repository can demonstrate or test.
+
+**A shared bearer token** is what shipped. It closes the actual hole — an unauthenticated caller
+re-arming outbox events or enumerating idempotency keys — in about a hundred lines, with a
+constant-time comparison and no state.
+
+What matters more than the choice is being explicit about what it is not, because the failure mode
+of a security feature is people assuming it does more than it does:
+
+> One token means one role, not one person. `X-Admin-Actor` is a self-declared label; anyone
+> holding the token can claim to be anyone. `reliability_actions.actor` therefore records *a claim
+> made by a token holder*, not a verified subject. It is useful for reconstructing intent and it is
+> not evidence.
+
+There is no expiry, no per-endpoint scoping, no revocation list and no rate limiting. Rotation is a
+restart. All of that is written down in `SECURITY.md` rather than implied by omission.
+
+One decision that took longer than expected: **`/api/idempotency/{key}` is behind the same guard.**
+It is not an administrative endpoint, and putting it there felt inconsistent. But the key is chosen
+by the submitter, and in every realistic deployment it is a customer, order or invoice identifier.
+An open lookup is an enumeration oracle *and* a way to read back somebody else's job. Consistency
+lost.
+
+### 3. Readiness versus liveness, and why the distinction is not pedantry
+
+The two probes answer questions that differ in one specific way: what the orchestrator does about
+a failure. A failed readiness probe removes the instance from the load-balancer pool. A failed
+liveness probe **kills the container**.
+
+So the question for each dependency is not "does the application need this?" — it needs all of
+them — but "if this is unavailable, is restarting the process a plausible fix?"
+
+For PostgreSQL and Redis the answer is no, and it is emphatically no at the fleet level. A
+thirty-second database blip that fails liveness restarts *every instance simultaneously*. Nothing
+drains gracefully, every in-flight job is abandoned at once, and the fleet then hammers the
+recovering database with a synchronised cold start. The outage that would have been thirty seconds
+becomes several minutes, and the cause is a monitoring decision rather than the database.
+
+A JVM with an unreachable database is not broken. It is waiting. So:
+
+```
+liveness  = livenessState, and nothing else
+readiness = readinessState + db + redis + flyway + outboxRelay + worker + scheduler
+```
+
+Two subtleties I got wrong on the first pass:
+
+- **A disabled subsystem is UP, not DOWN.** An operator who set `relay-enabled: false` did not
+  thereby make the instance unfit to serve traffic. The first implementation conflated "switched
+  off" with "never started", which made a freshly booted instance look identical to a
+  deliberately disabled one. That needed three states, not a boolean.
+- **An idle subsystem is healthy.** A relay tick that claims nothing is a *successful* tick. The
+  obvious implementation — "DOWN if nothing has been published recently" — takes a healthy
+  instance out of rotation the moment the backlog clears, which is exactly when it is most useful.
+
+The staleness budget is ten poll intervals with a thirty-second floor. One interval would flap on
+any single slow tick, and a readiness probe that flaps is worse than one that never fires.
+
+### 4. Graceful shutdown: the order is the whole design
+
+The sequence that matters is not "stop things" but "stop things in an order where nothing observes
+an inconsistent state":
+
+```
+readiness DOWN  →  producers stop  →  HTTP drains  →  in-flight jobs finish  →  connections close
+```
+
+Readiness has to be first. If HTTP drained first, the load balancer would still be sending
+requests to an instance that had stopped accepting them. If the producers stopped first, the
+instance would be advertising itself as ready while doing nothing.
+
+The in-flight drain has to be after HTTP and before the connection pools close, which is a
+narrower window than it sounds: a worker finalising a job needs the database, so draining after
+the pools close would guarantee the thing shutdown is supposed to prevent.
+
+**What happens when a job outruns the budget is the part worth arguing about.** The options were:
+
+1. Interrupt it and mark it FAILED. Wrong: the work may have completed and the side effect may
+   have happened. Marking it failed causes a retry and a duplicate effect.
+2. Mark it SUCCEEDED. Obviously wrong, and the worst possible answer — it records an outcome
+   nobody observed.
+3. Wait indefinitely. Turns a deployment into a hostage situation.
+4. **Let go without recording anything.** Do not fail it, do not succeed it, do not acknowledge
+   the stream entry. The lease expires on its own clock, `XAUTOCLAIM` hands the entry to another
+   consumer after `claim-min-idle-ms`, and the job is executed again by someone else.
+
+Four is what shipped, and it is the same path a hard `kill -9` takes. That is the point: the
+recovery mechanism already existed and was already tested, so exceeding the shutdown budget
+degrades to a case the system handles rather than a new one it does not. The cost is a possible
+duplicate execution, which at-least-once already permits.
+
+### 5. Dependency outages: bounded retry was mostly already there
+
+I expected to have to add backoff everywhere and found that v0.8 had already solved the hard case.
+The outbox relay does not re-attempt a failed event every 500ms, because `markFailed` pushes
+`available_at` forward and `claimable` filters on it. Over a measured 25-second PostgreSQL outage
+the affected event was attempted **once**, not fifty times.
+
+That matters more than it looks. `distroq.outbox.max-attempts` is 100; without the `available_at`
+column, a 50-second Redis outage would have burned the entire budget and terminally failed every
+pending event, converting a transient outage into an operator task. The column was added in v0.8
+for a different reason — spacing out retries of a genuinely broken event — and it turns out to be
+the thing that makes an outage survivable.
+
+The remaining loops needed nothing beyond what they had: the worker poll loop already backs off a
+second on error, the sweeps are bounded by their poll intervals, and the pools are all fixed-size.
+
+The property I actually had to verify rather than build was **no false success**. Killing
+PostgreSQL during finalisation produced exactly the right sequence: the worker logged bounded
+renew failures, did *not* log success, left the stream entry unacknowledged, and when PostgreSQL
+returned another consumer reclaimed the entry — attempt 1 `ABANDONED`, attempt 2 `SUCCESS`,
+`attempt_count` advanced to 2 rather than reset. That behaviour comes from the conditional update
+in `ExecutionClaimService` returning zero rows when the lease has moved, which is v0.7 machinery
+doing its job under a failure it was designed for but had never been tested against.
+
+### 6. Backup boundaries: two systems, two different questions
+
+The sentence that took the longest to get right, and which is now in three documents because it is
+the thing an operator most needs to have internalised before an incident rather than during one:
+
+> **PostgreSQL is the durable source of business history and outbox intent. Redis contains
+> transport state and scheduling state. Redis loss may require reconciliation and can affect
+> pending delivery recovery.**
+
+The asymmetry is deliberate and dates back to v0.7. Losing PostgreSQL loses the record of what
+happened and what was supposed to happen — that is unrecoverable and is why `pg_dump` is a
+scheduled job rather than a documented command. Losing Redis loses the *mechanism*, and the
+mechanism is reconstructable, because every stream entry and every scheduled member exists because
+a row in `outbox_events` said so.
+
+With one exception, which is the only genuinely irreplaceable thing in Redis: **the deduplication
+markers**. `distroq:outbox:published:<eventId>` is what makes republishing an already-published
+event a no-op, and PostgreSQL cannot reconstruct it — the outbox row says the event *was*
+published, but the marker is what stops a repair from publishing it a second time. This is also
+why v0.8's retention refuses to delete a published outbox row while its marker might still be
+alive: the row and the marker are redundant with each other, and deleting the survivor of a pair
+is how a duplicate gets made.
+
+`appendfsync everysec` is acceptable here for the same reason: the writes at risk are transport
+state whose intent is already committed elsewhere, and at-least-once already tolerates a replay.
+It would not be acceptable for business history, which is why business history is not in Redis.
+
+`--maxmemory-policy noeviction` is not a tuning choice. Any eviction policy lets Redis silently
+delete a stream entry under memory pressure, and a silently deleted stream entry is a lost job.
+
+### 7. Metrics and logs: bounded labels, and what "safe" means per field
+
+Two rules, both learned from other people's incidents rather than mine.
+
+**A per-request value is never a label.** Job IDs, attempt IDs, event IDs and idempotency keys are
+all unique per occurrence, and a unique label value creates a time series the registry keeps
+forever. The famous version of this failure is a service that put a user ID in a label and ran out
+of memory three weeks after release.
+
+The interesting case is **job type**, because it is genuinely useful to break metrics down by and
+genuinely chosen by the caller. A caller that puts an order number in the `type` field would
+create one series per order. So the first twenty distinct types get their own series and
+everything after that becomes `other`, with a switch to remove the label entirely.
+
+The cap is a ceiling, not an eviction policy, and that was a deliberate choice: evicting a series
+to make room would make it disappear and reappear with a gap in the middle, and every `rate()` over
+that gap would be wrong. A permanently-`other` type is honest; a flickering one is a lie.
+
+**For logs, redaction is a property of the field, not the call site.** The rule "don't log payloads"
+survives exactly as long as the person who wrote it. So the safe field set is fixed once, in
+`LogFields`, and the formatter writes the MDC it is given. Two specific decisions:
+
+- `errorType` carries the exception's **class name only**. An exception *message* routinely quotes
+  the SQL, the URL or the offending value — `Connection to jdbc:postgresql://db/x?password=...
+  refused` is a real shape of real message.
+- Full stack traces *are* logged, in their own field. A log file is an internal artefact. An HTTP
+  response body is not, and gets `{"code":"INTERNAL_ERROR"}` plus a correlation ID.
+
+The correlation ID is attacker-controlled and ends up in a log file, so it is validated: anything
+over 64 characters or outside `[A-Za-z0-9._-]` is replaced rather than rejected. A newline in that
+field could forge an entire log record. Rejecting the request would be worse than ignoring the
+header, because the header only affects observability.
+
+### 8. Why invalid production settings fail startup
+
+The alternative is a warning, and a warning in a startup log is read by nobody. Each of these fails
+in a way that is either invisible or badly delayed:
+
+| Setting | What actually happens without the check |
+|---|---|
+| `worker.concurrency: 0` | The process starts, reports itself healthy, and consumes nothing. Discovered when a queue depth alarm fires hours later |
+| `heartbeat >= lease` | The lease expires before it is ever renewed. Every job longer than the lease loses ownership of itself — under load only |
+| `dedupe-retention < stale-*-after` | A repair republishes an event whose marker has expired. Duplicate delivery, weeks later, after a Redis outage |
+| `block-timeout-ms: 0` | `XREADGROUP` blocks forever and the worker never notices shutdown |
+| `scheduler pool-size < 6` | Sweeps block each other. The symptom is scheduling latency, not an error |
+| `failed-retention < published-retention` | Evidence of failures is deleted before evidence of successes, which is backwards |
+
+The one that justifies the whole mechanism is `distroq.admin.token`, and it justifies it in a way
+I did not anticipate — see section 11.
+
+Getting the *timing* right mattered as much as the rules. The first implementation was a
+`@PostConstruct` on a component, and a bad Redis setting failed while building
+`stringRedisTemplate` — handing the operator a five-screen `UnsatisfiedDependencyException` whose
+root cause was three levels down. The whole point of failing fast is that the message is useful,
+and a message is only useful if nothing else has failed first. It is now an
+`ApplicationContextInitializer` that runs before the first bean exists, at the cost of binding the
+properties by hand.
+
+### 9. Upgrade and rollback
+
+**No `V8` migration**, and the reasoning is worth recording because "the release needs a
+migration" is an assumption rather than a requirement. The rule applied was: add a table only if a
+v1.0 requirement needs data to survive a restart and cannot be met another way. Release metadata is
+already in `/actuator/info`, generated from the build. Reconciliation repairs already write
+`reliability_actions` rows. Instance identity is already in `job_attempts.worker_id`,
+`jobs.execution_owner` and the `instanceId` on every log line. Metric snapshots were explicitly
+ruled out — every gauge is either a live count or a process-local counter, and persisting them
+would create a stale second answer to a question that already has a current one.
+
+So v1.0 runs against a v0.9 database with nothing to apply, which makes the upgrade a binary swap
+plus one required environment variable.
+
+**Rollback is where I want the honest sentence on record**, because the instinct to check out an
+older tag is strongest during an incident and the reasoning is exactly backwards then:
+
+> A forward migration is not undone by checking out an older binary. The older binary runs
+> `ddl-auto: validate` against a schema it does not recognise and either refuses to start or —
+> worse — starts and writes rows the newer schema's constraints would have rejected. Rolling back
+> across a migration means restoring the database from the backup taken *before* the upgrade, and
+> accepting the loss of everything written since.
+
+For v0.9 ↔ v1.0 specifically this does not apply; there is no migration to cross. What a rollback
+*does* cost is administrative authentication, because v0.9 has none: the moment the older binary
+runs, every admin endpoint is open. If the rollback is a response to a security incident, that is
+the wrong direction to move in without blocking the port first.
+
+### 10. Exactly-once, restated at 1.0
+
+A 1.0 is where people stop reading the fine print, so this is stated again rather than referenced:
+
+**Delivery is at-least-once. Execution is at-least-once. A job can run twice.** `XACK` after
+persistence makes a crash cost a redelivery rather than a lost job; it does not make execution
+unique. A healthy worker slower than `claim-min-idle-ms` is indistinguishable from a dead one and
+its entry will be reclaimed and executed again — Redis measures time since delivery, not liveness.
+
+The effect ledger makes **cooperative** effects idempotent: a handler that claims an effect key,
+does the work and completes the ledger row will not repeat it. That is a contract the handler opts
+into.
+
+**An arbitrary external API call is not exactly-once, and nothing in v1.0 changes that.** If the
+handler charges a card through an endpoint with no idempotency key of its own, a duplicate delivery
+charges the card twice. No configuration makes it otherwise, and the release notes say so.
+
+---
+
+The next three sections are defects the release found in code that had passed 289 tests and four
+rounds of manual acceptance. None is a feature bug. All three would have appeared in production.
+
+### 11. An unset environment variable became the admin token
+
+The one that justifies the whole exercise.
+
+`application-production.yml` has `token: ${DISTROQ_ADMIN_TOKEN}`. A deployment that forgets to
+export it should fail. Instead the application started, reported "Configuration validated for
+profile(s) [production]", and served administrative requests.
+
+Spring's `Binder` uses `PropertySourcesPlaceholdersResolver`, which is constructed with
+`ignoreUnresolvablePlaceholders = true`. An unresolvable `${VAR}` is passed through as **literal
+text**. So `distroq.admin.token` bound to the string `${DISTROQ_ADMIN_TOKEN}` — present, non-blank,
+`tokenConfigured()` true, validation passed — and the administrative bearer token for that
+deployment was a value printed in this repository and in every copy of it.
+
+This is worse than having no authentication, because no authentication is visible and a
+placeholder-valued token looks like a configured one.
+
+The fix is four lines: a value of the form `${...}` counts as unset, for the admin token, the
+datasource URL and the Redis host. The lesson is larger than the fix — **"the property is set" and
+"the property has a real value" are different assertions**, and Spring's lenient resolution makes
+the first true whenever the second is false. Anywhere a required secret is read through a
+placeholder, that gap exists.
+
+Found by acceptance test A3, which was written to check that a missing token *fails* startup. It
+did not. The test that finds a defect is the one that asserts a negative.
+
+### 12. A false `job.execution_lease_lost` after a successful job
+
+Timestamps three milliseconds apart:
+
+```
+job.succeeded             Job 7566e402 succeeded
+job.execution_lease_lost  Worker worker-7a543b48 lost the execution lease for job 7566e402
+```
+
+The lease heartbeat runs on a scheduled thread. `claims.succeed()` clears the lease as part of
+finalising the job, and a renew landing microseconds later legitimately fails — the lease really is
+gone, because the job really did finish. The heartbeat had no way to tell "someone took this from
+me" apart from "this ended normally".
+
+The job outcome was always correct. What was wrong was the **alert**: `job.execution_lease_lost` is
+one of the event names operators are told to page on, and it was firing on every successful job
+whose completion happened to coincide with a heartbeat tick. An alert that fires on success is
+worse than no alert, because it trains people to ignore it.
+
+Fixed with an `executionFinished` flag set before finalisation and checked by the heartbeat, plus
+cancelling the heartbeat before finalising rather than in the `finally` block. `cancel(false)`
+alone was not enough — it does not interrupt a renew already in flight, which is precisely the
+racing one.
+
+This bug was invisible until v1.0 gave the log line a stable event name. Instrumentation found it.
+
+### 13. The shutdown coordinator never ran
+
+`ShutdownCoordinator` was a `SmartLifecycle` at phase `Integer.MAX_VALUE`, on the reasoning that
+lifecycle beans stop in descending phase order, so the highest phase stops first — ahead of Boot's
+graceful web shutdown at `MAX_VALUE - 1024`.
+
+That reasoning is correct and irrelevant. `AbstractApplicationContext.doClose()` publishes
+`ContextClosedEvent` **before** it calls `lifecycleProcessor.onClose()`. `ShutdownState` listened
+for that event as a safety net, so by the time the coordinator's `stop()` ran, `begin()` had
+already returned false and the announcement was skipped entirely.
+
+The symptom was subtle: readiness *did* go to `REFUSING_TRAFFIC`, because Spring Boot publishes
+that itself on context close. Only `application.shutdown_started` was missing — one absent log
+line, in a system whose shutdown otherwise looked correct. I found it by grepping for the event
+name in the acceptance output rather than by anything failing.
+
+Now a `ContextClosedEvent` listener at `HIGHEST_PRECEDENCE`, with `ShutdownState`'s own listener
+demoted to `LOWEST_PRECEDENCE` so it can never win the race. The general lesson: **`ContextClosedEvent`
+is the earliest shutdown hook there is.** No `SmartLifecycle` phase, however high, runs before it.
+
+There is a fourth, smaller one worth recording: `docker-compose.production.yml` deleted the
+development containers on its first run. Compose derives a project name from the directory, both
+files landed in the project `distroq`, and bringing one up removed the other's containers as
+orphans. The named volume survived and no data was lost, but only because the volume was named.
+Both files now declare a project name explicitly.
+
 ## What v0.9 changed about the plan
 
 ### 1. Why analytics reads PostgreSQL rather than Redis

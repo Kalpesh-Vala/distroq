@@ -2656,6 +2656,369 @@ docker compose --profile analytics run --rm --entrypoint python analytics `
 flow is visible in the console. The poller logs at DEBUG when it promotes nothing and INFO
 when it does, so an idle system does not spam the console once a second.
 
+## v1.0 — release readiness
+
+v1.0 adds no queue mechanism and no job semantics. It makes the behaviour that already existed
+safe to operate: to configure, authenticate, probe, observe, shut down, upgrade and recover.
+
+Companion documents: [`OPERATIONS.md`](OPERATIONS.md) is the runbook,
+[`SECURITY.md`](SECURITY.md) is the security posture, [`UPGRADE.md`](UPGRADE.md) is the path from
+v0.9, and [`CHANGELOG.md`](CHANGELOG.md) is what changed.
+
+### 1. Production configuration
+
+Three profiles. `local` is the default, so nothing about running this on a laptop changed.
+
+| Profile | Logs | Credentials | Admin token |
+|---|---|---|---|
+| `local` (default) | Human-readable, `com.distroq` at DEBUG | Throwaway values for localhost containers | Optional |
+| `test` | Quiet | Environment with local fallbacks | Optional |
+| `production` | One JSON object per line | Environment only, **no defaults** | **Required** |
+
+```powershell
+$env:SPRING_PROFILES_ACTIVE = "production"
+```
+
+The production profile contains no default password, no hardcoded secret, no localhost assumption,
+no debug logging and no schema generation. `spring.jpa.hibernate.ddl-auto` is `validate`; Flyway
+remains the only schema migration mechanism, and anything else is refused at startup.
+
+Configuration is validated *before the first bean is created*, so a bad value produces one line
+naming the property rather than a five-screen `UnsatisfiedDependencyException` whose root cause is
+three levels down:
+
+```
+DistroQ refused to start: 1 configuration problem(s) must be fixed first.
+  1. distroq.worker.heartbeat-interval-ms must be shorter than
+     distroq.worker.execution-lease-ms, otherwise the lease expires before it is ever renewed
+     and every long job loses ownership of itself
+```
+
+### 2. Environment variables
+
+The full reference is in [`OPERATIONS.md`](OPERATIONS.md) and the fill-in-the-blanks version is
+[`.env.example`](.env.example). Required, with no default anywhere:
+
+```
+SPRING_PROFILES_ACTIVE=production
+DISTROQ_DB_URL=jdbc:postgresql://postgres:5432/distroq
+DISTROQ_DB_USER=distroq
+DISTROQ_DB_PASSWORD=...
+DISTROQ_REDIS_HOST=redis
+DISTROQ_ADMIN_TOKEN=...          # openssl rand -hex 32
+```
+
+### 3. Administrative authentication
+
+v0.8 had `X-Admin-Reason` as an audit device and no authorization at all. v1.0 puts a configurable
+shared bearer token in front of every administrative endpoint and of the idempotency lookup:
+
+```powershell
+curl.exe -i http://localhost:8080/api/admin/outbox
+# 401 {"code":"UNAUTHORIZED","message":"A valid administrative bearer token is required", ...}
+
+curl.exe -i -H "Authorization: Bearer invalid-token" http://localhost:8080/api/admin/outbox
+# 401
+
+curl.exe -i -H "Authorization: Bearer $env:DISTROQ_ADMIN_TOKEN" `
+  -H "X-Admin-Reason: v1.0 security verification" http://localhost:8080/api/admin/outbox
+# 200
+
+curl.exe -i -X POST -H "Authorization: Bearer $env:DISTROQ_ADMIN_TOKEN" `
+  http://localhost:8080/api/admin/outbox/cleanup
+# 400 {"code":"MISSING_ADMIN_REASON", ...} - the reason is still required on every mutation
+```
+
+`/api/idempotency/{key}` is protected too. The key is chosen by the submitter and is very often a
+customer or order identifier, so an open lookup was both an enumeration oracle and a way to read
+back someone else's job.
+
+**This is a release-level guard, not an identity system.** One token means one role, not one
+person; `X-Admin-Actor` remains a self-declared label. The token is compared in constant time,
+never logged, never persisted, and never reachable through actuator. Rotation is a restart with a
+new value. See [`SECURITY.md`](SECURITY.md).
+
+### 4. Health, liveness and readiness
+
+```
+GET /actuator/health            everything
+GET /actuator/health/liveness   is the JVM alive?
+GET /actuator/health/readiness  should this instance get work?
+```
+
+Liveness contains `livenessState` and nothing else — deliberately independent of PostgreSQL and
+Redis. An orchestrator *kills* a container that fails liveness, so a liveness probe that depended
+on the database would turn a thirty-second blip into a fleet-wide restart storm.
+
+Readiness aggregates `readinessState`, `db`, `redis`, `flyway`, `outboxRelay`, `workerSubsystem`
+and `schedulerSubsystem`. During a Redis outage:
+
+```
+overall=DOWN  db=UP  redis=DOWN  relay=UP  worker=UP
+{"status":"UP","components":{"livenessState":{"status":"UP"}}}     <- liveness untouched
+```
+
+Health details name PostgreSQL, its version, the Redis version and the applied schema version.
+Never a message, a connection string or a credential — an exception message routinely quotes the
+JDBC URL, and the JDBC URL routinely contains a password. Actuator itself is unauthenticated; the
+network boundary is yours to provide, and [`SECURITY.md`](SECURITY.md) says how.
+
+### 5. Structured logging
+
+One JSON object per line under the production profile; the local profile keeps the readable
+pattern, because a developer reading a stack trace in a terminal is not helped by escaped
+newlines.
+
+```json
+{"timestamp":"2026-09-10T15:45:49.016Z","level":"INFO","logger":"com.distroq.worker.Worker",
+ "thread":"distroq-worker","service":"distroq","version":"1.0.0","instanceId":"acceptance-1",
+ "message":"Job 7e2cedaa succeeded","event":"job.succeeded","workerId":"worker-dde7f7a2",
+ "consumerName":"worker-dde7f7a2","jobId":"7e2cedaa-6900-46f2-ba06-9604cc11a369",
+ "attemptId":"9aefe112-adbf-4997-b579-fba670980ede","stream":"distroq:jobs:stream:normal",
+ "streamEntryId":"1789055147965-0","priority":"NORMAL","status":"SUCCEEDED","durationMs":"1031"}
+```
+
+The `event` field is a contract; the wording of `message` is not. The names are
+`job.submitted`, `job.scheduled`, `job.started`, `job.succeeded`, `job.retry_scheduled`,
+`job.dead_lettered`, `job.replayed`, `job.reclaimed`, `job.execution_claimed`,
+`job.execution_lease_lost`, `outbox.published`, `outbox.failed`, `outbox.operator_retry`,
+`reconciliation.finding`, `reconciliation.repair`, `application.readiness_changed`,
+`application.shutdown_started`, `application.shutdown_completed` and
+`admin.authentication_failed`.
+
+Never logged: job payloads, the admin token, database or Redis passwords, raw idempotency keys,
+effect responses, and exception *messages* on `errorType` — the class name only.
+
+Every HTTP request carries a `correlationId` through its log lines and into its error body.
+`X-Correlation-Id` is honoured when it is short and alphanumeric, and replaced otherwise: the value
+ends up in a log file, and a newline in it could forge a whole log record.
+
+### 6. Metrics
+
+Micrometer through `/actuator/metrics` and `/actuator/prometheus`. `/api/metrics` is unchanged.
+
+```powershell
+curl.exe -s http://localhost:8080/actuator/prometheus | Select-String "^distroq_"
+```
+
+Counters are process-local and reset on restart: `distroq_jobs_submitted_total`,
+`_started_`, `_succeeded_`, `_failed_`, `_dead_lettered_`, `_replayed_`, `_reclaimed_`,
+`distroq_job_attempts_total`. Histograms:
+`distroq_job_execution_duration_seconds`, `distroq_job_queue_delay_seconds`,
+`distroq_job_schedule_delay_seconds`, `distroq_outbox_publish_duration_seconds`. Gauges are
+database-derived, approximate and cached: `distroq_outbox_pending`, `_retryable_failed`,
+`_terminal_failed`, `distroq_outbox_oldest_age_seconds`, `distroq_reconciliation_findings`,
+`distroq_execution_leases_active`, `_expired`. `distroq_worker_active` and
+`distroq_worker_concurrency` are process-local and exact.
+[`OPERATIONS.md`](OPERATIONS.md) states the type and provenance of every one, because reading a
+database-derived total as a process counter is how someone concludes a restart lost data.
+
+Labels are bounded by construction: priority, status, outcome and event type are enums, and job
+type — the one value a caller controls — is capped at 20 distinct values with the rest collapsed
+into `other`. **No job ID, attempt ID, outbox event ID, idempotency key, payload or token is ever
+a label.** A per-request label is an unbounded time series, which is the standard way a
+well-behaved service becomes an out-of-memory incident three weeks after release.
+
+### 7. Graceful shutdown
+
+SIGTERM, with a twenty-second job in flight:
+
+```
+16:23:17.606  application.readiness_changed   Readiness is now REFUSING_TRAFFIC
+16:23:17.608  application.shutdown_started    no new work will be claimed
+16:23:17.615  Commencing graceful shutdown. Waiting for active requests to complete
+16:23:17.619  Graceful shutdown complete
+16:23:33.058  job.succeeded                   the in-flight job was allowed to finish
+16:23:33.060  application.shutdown_completed  Redis and database connections close next
+16:23:33.090  Worker worker-c86819e8 shutting down
+16:23:33.098  Closing JPA EntityManagerFactory
+16:23:33.107  HikariPool-1 - Shutdown completed
+```
+
+Zero errors, zero stack traces, and no job claimed after the sequence began.
+
+If a job outruns `distroq.shutdown.worker-timeout-ms`, nothing is forced: it is not failed, not
+marked succeeded, and its stream entry is not acknowledged. The lease expires on its own clock and
+`XAUTOCLAIM` hands the entry to another consumer — the same path a hard kill takes. Recording an
+outcome nobody observed is the one genuinely unrecoverable thing available at that moment.
+
+### 8. Dependency failure behaviour
+
+| Scenario | Behaviour |
+|---|---|
+| Redis unavailable at startup | Starts. Readiness DOWN, liveness UP. Submissions still commit |
+| Redis lost during outbox publication | Job and event already committed; the event returns to PENDING and publishes **once** when Redis returns |
+| Redis lost during worker consumption | One error, then a one-second backoff. No busy loop |
+| PostgreSQL lost during submission | 503 `DEPENDENCY_UNAVAILABLE`. Nothing half-written |
+| PostgreSQL lost during finalisation | **No false success.** The entry stays unacknowledged; a replacement worker reclaims it and the previous attempt becomes `ABANDONED` |
+| Either reconnects | Readiness returns UP; sweeps resume on their next tick |
+
+Retries are bounded everywhere. Over a measured 25-second PostgreSQL outage: three heartbeat
+failures (one per 5s interval), one error per sweep tick, and a *single* relay attempt for the
+affected event — because a failed outbox event's `available_at` is pushed forward rather than
+re-attempted every 500ms. No unbounded thread creation: the worker and heartbeat pools are
+fixed-size and the six sweeps share one scheduler pool.
+
+### 9. Docker, production-like
+
+```powershell
+cp .env.example .env    # then fill in every CHANGE_ME
+docker compose -f docker-compose.production.yml up -d --build
+```
+
+Pinned images, health-gated startup order, named volumes, resource limits, a restart policy, a
+90-second stop grace period, and an application container that runs as uid 10001 with a read-only
+root filesystem, `cap_drop: ALL` and `no-new-privileges`. No secret is baked into any layer, and
+`.dockerignore` keeps `.env` and key material out of the build context entirely.
+
+> Compose reads **shell** environment variables in preference to `.env`. A stale
+> `DISTROQ_DB_PASSWORD` exported in your shell will win and present as an authentication failure
+> against a password you can see is correct.
+
+The two compose files declare separate project names so the development and production-like stacks
+can run side by side. Without that, Compose derives the project from the directory and bringing
+either up removes the other's containers.
+
+**This is a demonstration, not an orchestrator.** No replicas, no rolling deployment, no node
+failure handling, no secret rotation, no TLS. Those belong to a platform; v1.0 is built to run
+correctly underneath one.
+
+### 10. PostgreSQL backup and restore
+
+```powershell
+$env:PGPASSWORD = "..."
+.\ops\backup\backup-postgres.ps1 -DbHost localhost -Port 5433 -Database distroq -User distroq
+
+.\ops\restore\restore-postgres.ps1 -DumpFile ops\backup\distroq-....dump `
+  -Database distroq_restore_test -Confirm
+```
+
+The restore script refuses to run without `-Confirm`, and refuses a target named `distroq` unless
+`-AllowProductionName` is also given — the failure mode is unrecoverable and the dangerous command
+differs from the safe one by a single word. It then verifies Flyway history, prints row counts for
+comparison, and tells you to finish with the check that actually matters: starting the application
+against the restored database, where `ddl-auto: validate` fails on any mismatch.
+
+Verified during release testing: 104 jobs, 151 attempts, 44 outbox events, 8 dead letters, 41 audit
+rows, 8 effects, 25 idempotency keys, 7 Flyway rows — identical on both sides, clean start.
+
+### 11. Redis persistence and restore
+
+> **PostgreSQL is the durable source of business history and outbox intent. Redis contains
+> transport state and scheduling state. Redis loss may require reconciliation and can affect
+> pending delivery recovery.**
+
+The production compose runs Redis with `--appendonly yes --appendfsync everysec` and
+`--maxmemory-policy noeviction`. The eviction policy is not a tuning choice: any other value lets
+Redis silently delete a stream entry or a scheduled member under memory pressure, which is a lost
+job.
+
+`ops/backup/backup-redis.ps1` takes an RDB snapshot; `ops/restore/restore-redis.ps1` restores it
+into an **isolated** container on another port and reports what survived — streams, consumer
+groups, pending entries, both sorted sets and the deduplication markers. It will not overwrite a
+running DistroQ Redis, because doing so replaces streams underneath consumers that still hold
+pending entries against them.
+
+The one thing a Redis restore recovers that reconciliation cannot is the deduplication markers.
+Everything else is reconstructable from the outbox table. What a restore cannot recover: everything
+written since the snapshot, and — if persistence was disabled — everything.
+
+### 12. Upgrading from v0.9
+
+No migration; the schema stays at `V7`. The v1.0 binary starts against a v0.9 database with
+nothing to apply. The one change that will stop a deployment is the required
+`DISTROQ_ADMIN_TOKEN`. Full detail, including why no `V8` was written, is in
+[`UPGRADE.md`](UPGRADE.md).
+
+### 13. Rollback limitations
+
+Rolling back to v0.9 is a binary rollback and needs no database restore, because v1.0 adds no
+migration. What you lose immediately is administrative authentication — v0.9 has none, so every
+admin endpoint becomes open the moment the older binary runs. If the rollback is a response to an
+incident, block the port at the network *before* rolling back.
+
+The general rule, stated now because the instinct to check out an older tag is strongest during an
+incident: **a forward migration is not undone by checking out an older binary.** Once a release
+adds one, rolling back across it means restoring the database from the backup taken before the
+upgrade, and accepting the loss of everything written since.
+
+### 14. Security limitations
+
+- The bearer token authenticates a role, not a person. No per-user scoping, no expiry, no
+  revocation list, no rate limiting.
+- `X-Admin-Actor` is self-declared. The audit trail records a claim by a token holder, not a
+  verified subject.
+- Actuator is unauthenticated. Provide the network boundary.
+- No TLS. Terminate it in front.
+- PostgreSQL and Redis are trusted. Anyone who can reach them directly has everything.
+
+### 15. At-least-once, still
+
+Unchanged since v0.5 and not softened by anything in v1.0. A job can execute more than once: a
+worker that dies between finishing the work and acknowledging the entry will have its entry
+redelivered, and a healthy worker slower than `claim-min-idle-ms` is indistinguishable from a dead
+one. `XACK` makes *delivery* at-least-once; it does not make *execution* exactly-once.
+
+### 16. External effects are not exactly-once
+
+The effect ledger (v0.8) makes **cooperative** effects idempotent: a handler that claims an effect
+key, performs the work and completes the ledger row will not repeat it. That is a contract the
+handler opts into.
+
+**An arbitrary external API call is not exactly-once and v1.0 does not claim it is.** If the
+handler charges a card through an endpoint with no idempotency key of its own, a duplicate
+delivery charges the card twice. Nothing in this release changes that, and no configuration makes
+it otherwise.
+
+### 17. Release verification
+
+```powershell
+git status --short
+git diff --check
+.\mvnw.cmd clean package
+
+# health, version, admin auth
+Invoke-RestMethod http://localhost:8080/actuator/health/liveness  | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://localhost:8080/actuator/health/readiness | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://localhost:8080/actuator/info             | ConvertTo-Json -Depth 8
+curl.exe -i http://localhost:8080/api/admin/outbox                       # 401
+curl.exe -i -H "Authorization: Bearer $env:DISTROQ_ADMIN_TOKEN" `
+  http://localhost:8080/api/admin/outbox                                 # 200
+
+# error contract
+curl.exe -s -X POST -H "Content-Type: application/json" `
+  -d '{\"type\":\"x\",\"payload\":\"{}\",\"priority\":\"URGENT\"}' http://localhost:8080/api/jobs
+# {"status":400,"code":"INVALID_PRIORITY","correlationId":"...", ...}
+
+# metrics
+curl.exe -s http://localhost:8080/actuator/prometheus | Select-String "^distroq_"
+
+# migrations
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "SELECT version, description, success FROM flyway_schema_history ORDER BY installed_rank;"
+```
+
+### 18. Version metadata
+
+One source of truth: the `<version>` in `pom.xml`. `build-info.properties` and `git.properties` are
+generated at build time, `application.yml` is filtered from the same value, and every log line
+carries it.
+
+```powershell
+Invoke-RestMethod http://localhost:8080/actuator/info | ConvertTo-Json -Depth 8
+```
+
+```json
+{
+  "git":   { "branch": "v1.0-release-hardening",
+             "commit": { "id": { "abbrev": "13e6a32", "full": "13e6a32c935b..." },
+                         "time": "2026-09-10T13:07:42Z" },
+             "dirty": "true", "tags": "v0.9" },
+  "build": { "artifact": "distroq", "name": "distroq", "group": "com.distroq",
+             "version": "1.0.0", "time": "2026-09-10T15:41:36.870Z" }
+}
+```
+
 ## Tests
 
 ```powershell
@@ -2783,13 +3146,91 @@ so they can actually be run:
 Both redirect the queue keys so their workers poll their own empty streams instead of competing
 with a running instance for real work.
 
+v1.0 adds 106 tests, all of which run without infrastructure. The count is 395 Maven tests, four
+skipped — the two live tests above, which need a system property.
+
+- `ConfigurationValidatorTest` — every rule that stops a deployment starting: zero and negative
+  worker concurrency, a heartbeat not shorter than the lease it renews (including the exactly-equal
+  case), a maximum retry delay below the base, a jitter factor outside `[0, 1)`, blank and
+  duplicated Redis keys, a zero block timeout, a deduplication window shorter than the
+  reconciliation staleness window, a cleanup interval shorter than the same, failed retention below
+  published retention, a repair flag that has no effect without the broader one, a scheduler pool
+  too small for the sweeps that share it, a missing datasource URL or Redis host, and the four
+  production-only rules. Each asserts on the **property name in the message** rather than on a
+  count of problems, because the entire value of failing at startup is that the message says which
+  line to change.
+- `UnresolvedPlaceholderTest` — the defect this release found. Spring's binder passes an
+  unresolvable `${VAR}` through as literal text, so a production deployment that forgot to export
+  `DISTROQ_ADMIN_TOKEN` would have started with an administrative token whose value is printed in
+  this repository. Asserts that a placeholder-shaped value authenticates nobody and fails startup,
+  for the token, the datasource URL and the Redis host.
+- `AdminAuthenticationFilterTest` — which paths are protected and which are not (including that
+  `/api/administrators` is not a sub-path of `/api/admin`), missing, wrong, prefix and
+  case-different tokens, a case-insensitive scheme with a case-sensitive token, the disabled-surface
+  403, and the inactive guard when no token is configured. Every assertion about a rejection body
+  also asserts that it **does not contain the token or any prefix of it** — the one way this class
+  can fail catastrophically is by echoing the value it compares against.
+- `ErrorContractTest` — that every `ErrorCode` agrees with its own HTTP status, that the
+  correlation ID reaches the body, that an uncoded `ResponseStatusException` still gets a code from
+  its status, and that an unexpected failure leaks neither its message, its type, the SQL nor a
+  password. Also that `ApiError` has exactly the seven documented fields and no `trace`.
+- `CorrelationIdFilterTest` — the sanitiser, which is the security boundary: a value containing a
+  newline could forge an entire log record, and one containing JSON punctuation could break the
+  line it is embedded in. Over-long, control-character and structural values are replaced rather
+  than rejected, and the MDC is cleared even when the request throws.
+- `SubsystemHealthIndicatorTest` — the two cases that look like failures and are not: a subsystem
+  an operator switched off, and one whose queue is empty. Plus never-started versus disabled (three
+  states, not a boolean), consecutive-failure counting, and that only the exception's class name is
+  published.
+- `HealthGroupsTest` — reads the shipped `application.yml` rather than starting a context, and
+  asserts that liveness contains `livenessState` and nothing else, that readiness names all seven
+  indicators, that the readiness group's names match the health-indicator bean names, and that the
+  actuator exposure list excludes `env`, `configprops`, `beans`, `heapdump` and `threaddump`.
+  Adding `db` to liveness looks like an improvement and turns a thirty-second database blip into a
+  fleet-wide restart storm, so it fails if someone edits the file.
+- `ShutdownSequenceTest` — that the coordinator hooks `ContextClosedEvent` rather than a lifecycle
+  phase (Spring publishes that event before it stops a single `Lifecycle` bean, which is the defect
+  described in NOTES.md §13), that the drain runs after HTTP has stopped, that the shutdown is
+  announced once, and that work outrunning the budget is **abandoned rather than forced** — no
+  outcome recorded, so the lease expires and another consumer reclaims it.
+- `DistroqMetricsTest` and `BoundedTagValuesTest` — that the metric names are the documented ones,
+  that everything is namespaced, that **no job ID is ever a label**, that the only label keys are
+  `priority`, `jobType`, `outcome` and `eventType`, and that 500 distinct caller-chosen job types
+  produce at most four series. The cap is a ceiling rather than an eviction policy, because an
+  evicted series would reappear with a gap and make every rate over it wrong.
+- `StructuredLoggingTest` — that every required event name exists, that a scoped context restores
+  the fields that were there before rather than clearing them, that a null field is omitted rather
+  than written as `"null"`, that an exception contributes its type and not its message, and that a
+  formatted line is one parseable JSON object even when the message contains quotes, newlines and
+  tabs.
+- `WorkerDeliveryTest` gains one: no lease is claimed, no attempt row opened, no execution started
+  and **no acknowledgement issued** once shutdown has begun — the entry stays in the Pending
+  Entries List for whichever instance is still reading.
+
+`TestProperties` was collapsed from seven near-identical factory methods into a builder. Every
+release so far has added a component to `DistroqProperties` and forced an edit to all seven; the
+next one now costs one field.
+
 ## Known limitations
 
-> **No authentication on the administrative endpoints.** `X-Admin-Reason` is an audit device, not
-> authorization. Anything that can reach port 8080 can retry a terminal outbox event, run a repair
-> or read the audit log. Do not expose this outside a development machine.
+> **v1.0 update.** The first entry below described v0.8. Administrative endpoints now sit behind a
+> configurable bearer token, and `/api/idempotency/{key}` sits behind the same one. That closes the
+> open-port hole; it does not make this an identity system. Read the entry after it, and
+> [`SECURITY.md`](SECURITY.md).
 
-> **Arbitrary external side effects are still not exactly once, and v0.8 does not claim otherwise.**
+> **The administrative bearer token authenticates a role, not a person.** One token means one
+> operator role. `X-Admin-Actor` is self-declared, so `reliability_actions.actor` records a claim
+> made by a token holder rather than a verified subject. There is no expiry, no per-endpoint
+> scoping, no revocation list and no rate limiting; rotation is a restart with a new value.
+> Actuator is unauthenticated and needs a network boundary you provide. There is no TLS —
+> terminate it in front, or the token crosses the network in clear text.
+
+> **v0.8 and earlier had no authentication on the administrative endpoints at all.**
+> `X-Admin-Reason` is an audit device, not authorization. Anything that could reach port 8080 could
+> retry a terminal outbox event, run a repair or read the audit log. This is fixed in v1.0 and is
+> the single most important reason not to run v0.9 or earlier on a reachable network.
+
+> **Arbitrary external side effects are still not exactly once, and v1.0 does not claim otherwise.**
 > The effect ledger commits the claim and the effect in one transaction, which is why it works for
 > a counter in the same database. An HTTP call to a third party commits somewhere DistroQ has no
 > transaction over. `Idempotency-Key`, outbox event IDs, execution leases and effect keys each

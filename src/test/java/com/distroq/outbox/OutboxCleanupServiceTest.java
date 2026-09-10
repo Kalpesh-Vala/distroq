@@ -117,7 +117,8 @@ class OutboxCleanupServiceTest {
     }
 
     private OutboxCleanupService service(DistroqProperties properties) {
-        return new OutboxCleanupService(repository, audit, properties);
+        return new OutboxCleanupService(repository, audit,
+                new com.distroq.lifecycle.ShutdownState(), properties);
     }
 
     private static List<OutboxEvent> published(int count) {

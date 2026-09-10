@@ -1,11 +1,16 @@
 package com.distroq.api;
 
 import com.distroq.api.dto.SubmitJobRequest;
+import com.distroq.api.error.ApiException;
+import com.distroq.api.error.ErrorCode;
 import com.distroq.config.DistroqProperties;
+import com.distroq.metrics.DistroqMetrics;
 import com.distroq.model.IdempotencyKey;
 import com.distroq.model.Job;
 import com.distroq.model.JobStatus;
 import com.distroq.model.Priority;
+import com.distroq.observability.Events;
+import com.distroq.observability.LogContext;
 import com.distroq.outbox.OutboxEventType;
 import com.distroq.outbox.OutboxService;
 import com.distroq.queue.EnqueueSource;
@@ -13,10 +18,10 @@ import com.distroq.repository.DeadLetterRepository;
 import com.distroq.repository.IdempotencyKeyRepository;
 import com.distroq.repository.JobRepository;
 import jakarta.persistence.EntityManager;
-import org.springframework.http.HttpStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
 import java.util.Optional;
@@ -25,12 +30,15 @@ import java.util.UUID;
 @Service
 public class JobSubmissionService {
 
+    private static final Logger log = LoggerFactory.getLogger(JobSubmissionService.class);
+
     private final JobRepository jobRepository;
     private final DeadLetterRepository deadLetterRepository;
     private final IdempotencyKeyRepository idempotencyRepository;
     private final OutboxService outboxService;
     private final IdempotencyRequestHasher hasher;
     private final EntityManager entityManager;
+    private final DistroqMetrics metrics;
     private final int defaultMaxAttempts;
     private final int replayAttempts;
 
@@ -40,6 +48,7 @@ public class JobSubmissionService {
                                 OutboxService outboxService,
                                 IdempotencyRequestHasher hasher,
                                 EntityManager entityManager,
+                                DistroqMetrics metrics,
                                 DistroqProperties properties) {
         this.jobRepository = jobRepository;
         this.deadLetterRepository = deadLetterRepository;
@@ -47,6 +56,7 @@ public class JobSubmissionService {
         this.outboxService = outboxService;
         this.hasher = hasher;
         this.entityManager = entityManager;
+        this.metrics = metrics;
         this.defaultMaxAttempts = properties.retry().defaultMaxAttempts();
         this.replayAttempts = properties.dlq().replayAttempts();
     }
@@ -68,7 +78,9 @@ public class JobSubmissionService {
             if (existing.isPresent()) {
                 IdempotencyKey record = existing.get();
                 if (!record.getRequestHash().equals(requestHash)) {
-                    throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    // the key is echoed because the caller chose it and already knows it; nothing
+                    // about the earlier request's payload is disclosed
+                    throw new ApiException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
                             "Idempotency key '" + key + "' was already used for a different request");
                 }
                 Job original = jobRepository.findById(record.getJobId())
@@ -89,16 +101,24 @@ public class JobSubmissionService {
         } else {
             outboxService.create(job, OutboxEventType.ENQUEUE_SUBMIT, EnqueueSource.SUBMIT, null);
         }
+        metrics.jobSubmitted(job);
+        try (LogContext ignored = LogContext
+                .event(job.isScheduled() ? Events.JOB_SCHEDULED : Events.JOB_SUBMITTED)
+                .job(job.getId()).priority(job.getPriority()).status(job.getStatus())) {
+            // the type is a label the submitter chose; the payload never appears
+            log.info("Accepted job of type {} with a budget of {} attempt(s){}", job.getType(),
+                    maxAttempts, job.isScheduled() ? " for " + scheduledAt : "");
+        }
         return new SubmissionResult(job, false);
     }
 
     @Transactional
     public Job replay(UUID id) {
         Job job = jobRepository.findById(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                .orElseThrow(() -> new ApiException(ErrorCode.JOB_NOT_FOUND,
                         "No job with id " + id));
         if (job.getStatus() != JobStatus.DEAD_LETTERED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
+            throw new ApiException(ErrorCode.JOB_NOT_DEAD_LETTERED,
                     "Only DEAD_LETTERED jobs can be replayed; job " + id + " is " + job.getStatus());
         }
         job.prepareForReplay(replayAttempts);
@@ -107,6 +127,11 @@ public class JobSubmissionService {
             deadLetterRepository.save(deadLetter);
         });
         outboxService.create(job, OutboxEventType.ENQUEUE_REPLAY, EnqueueSource.REPLAY, null);
+        metrics.jobReplayed(job);
+        try (LogContext ignored = LogContext.event(Events.JOB_REPLAYED)
+                .job(job.getId()).priority(job.getPriority()).status(job.getStatus())) {
+            log.info("Replayed dead-lettered job with {} further attempt(s)", replayAttempts);
+        }
         return job;
     }
 
@@ -115,7 +140,7 @@ public class JobSubmissionService {
             return defaultMaxAttempts;
         }
         if (requested < 1) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+            throw new ApiException(ErrorCode.INVALID_MAX_ATTEMPTS,
                     "maxAttempts must be at least 1, got " + requested);
         }
         return requested;
@@ -123,7 +148,7 @@ public class JobSubmissionService {
 
     private Priority resolvePriority(String requested) {
         return Priority.parse(requested)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                .orElseThrow(() -> new ApiException(ErrorCode.INVALID_PRIORITY,
                         "priority must be one of " + Priority.validValues()
                                 + " (case-insensitive), got '" + requested + "'"));
     }
@@ -134,11 +159,11 @@ public class JobSubmissionService {
         }
         String key = raw.trim();
         if (key.isEmpty()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+            throw new ApiException(ErrorCode.INVALID_IDEMPOTENCY_KEY,
                     "Idempotency-Key must not be blank");
         }
         if (key.length() > 128) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+            throw new ApiException(ErrorCode.INVALID_IDEMPOTENCY_KEY,
                     "Idempotency-Key must be at most 128 characters");
         }
         return key;

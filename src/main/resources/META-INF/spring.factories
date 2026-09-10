@@ -1,0 +1,5 @@
+org.springframework.boot.env.EnvironmentPostProcessor=\
+com.distroq.config.InstanceIdEnvironmentPostProcessor
+
+org.springframework.context.ApplicationContextInitializer=\
+com.distroq.config.ConfigurationValidationInitializer

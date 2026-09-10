@@ -1,10 +1,10 @@
 spring:
   application:
     name: distroq
-  datasource:
-    url: jdbc:postgresql://localhost:5433/distroq
-    username: distroq
-    password: distroq
+  # a bare `mvnw spring-boot:run` is a developer's laptop, not a server. Production is opted into
+  # with SPRING_PROFILES_ACTIVE=production and is never arrived at by omission.
+  profiles:
+    default: local
   jpa:
     hibernate:
       # Flyway owns the schema; Hibernate only checks that the entities match it and
@@ -19,24 +19,68 @@ spring:
     baseline-on-migrate: true
     baseline-version: 1
     baseline-description: "existing schema from ddl-auto"
-  data:
-    redis:
-      # the app runs on the host, outside the compose network
-      host: localhost
-      port: 6379
   task:
     scheduling:
       # @Scheduled tasks that must not block each other: the retry sweep, the scheduled-job sweep
-      # and the recovery sweep, plus v0.8's outbox relay, reconciliation and retention cleanup
+      # and the recovery sweep, plus v0.8's outbox relay, reconciliation and retention cleanup.
+      # ConfigurationValidator refuses to start if this drops below the number of sweeps.
       pool-size: 6
+  lifecycle:
+    # the whole-phase budget. distroq.shutdown.* are the per-subsystem budgets inside it.
+    timeout-per-shutdown-phase: 30s
 
 server:
+  # in-flight requests finish, new ones are refused. Readiness has already gone DOWN by then.
+  shutdown: graceful
   error:
     # without this the `reason` on a ResponseStatusException is dropped from the body, so a 409
     # from the replay endpoint would not say which status the job is actually in
     include-message: always
+    # a stack trace in a response body names the framework versions, the package layout and often
+    # the SQL. The operator gets all of it from the log line with the matching correlationId.
+    include-stacktrace: never
+    include-exception: false
+    include-binding-errors: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # deliberately short. env, beans, configprops, threaddump and heapdump all disclose
+        # configuration values, and distroq.admin.token is a configuration value.
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      # the indicators redact their own details; see FlywayHealthIndicator and
+      # SubsystemHealthIndicator. Actuator is still an internal surface - see README.md.
+      show-details: always
+      group:
+        liveness:
+          # is the JVM up. Deliberately independent of PostgreSQL and Redis: restarting a process
+          # because its database is briefly unreachable turns an outage into a restart storm.
+          include: livenessState
+        readiness:
+          # should this instance be given work. Everything it needs in order to make progress
+          # belongs here, and nothing else does.
+          include: readinessState,db,redis,flyway,outboxRelay,workerSubsystem,schedulerSubsystem
+  info:
+    build:
+      enabled: true
+    git:
+      mode: full
+    env:
+      # would publish arbitrary info.* properties straight out of the environment
+      enabled: false
+  metrics:
+    tags:
+      application: distroq
 
 distroq:
+  service:
+    # filtered from the POM at build time, so the version is written down in exactly one place
+    version: @project.version@
   # v0.5: only the startup migration reads this key and its three tier variants
   queue-key: distroq:jobs:pending
   delayed-key: distroq:jobs:delayed
@@ -86,7 +130,8 @@ distroq:
     cleanup-interval-ms: 3600000
     cleanup-batch-size: 500
     relay-enabled: true
-    # acceptance hook: publish to Redis, then fail before PostgreSQL marks the row published
+    # acceptance hook: publish to Redis, then fail before PostgreSQL marks the row published.
+    # Refused under the production profile.
     fail-after-publish: false
   reconciliation:
     enabled: true
@@ -105,12 +150,22 @@ distroq:
     # a STARTED effect is ambiguous, so closing one automatically is opt-in - see NOTES.md
     auto-fail-stale: false
   admin:
+    enabled: true
+    # no default value anywhere. Unset means the bearer guard is inactive, which is tolerable on a
+    # laptop and refused at startup under the production profile.
+    token: ${DISTROQ_ADMIN_TOKEN:}
+    # recorded in reliability_actions when a caller declares no X-Admin-Actor
+    default-actor: admin
     max-reason-length: 500
   worker:
     concurrency: 1
     execution-lease-ms: 30000
     heartbeat-interval-ms: 5000
-
-logging:
-  level:
-    com.distroq: DEBUG
+  shutdown:
+    worker-timeout-ms: 30000
+    relay-timeout-ms: 10000
+    scheduler-timeout-ms: 10000
+  metrics:
+    job-type-tag: true
+    max-job-type-tags: 20
+    database-gauge-cache-ms: 5000
