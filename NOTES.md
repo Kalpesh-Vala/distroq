@@ -3,6 +3,322 @@
 Running log of known limitations, failure modes observed, and design decisions.
 Written for my own reference and interview prep.
 
+## What v0.9 changed about the plan
+
+### 1. Why analytics reads PostgreSQL rather than Redis
+
+The obvious place to look for "how many jobs ran last month" is the thing the jobs actually flowed
+through. That instinct is wrong here, and the reasons are specific rather than aesthetic.
+
+A Redis Stream retains entries after they are acknowledged. `XLEN` counts everything ever written
+to a tier, including work that completed successfully hours ago, so it is not backlog — v0.5 says
+so already, and the metrics endpoint reports pending-entry counts precisely because stream length
+does not answer the question people ask of it. Reading historical throughput off `XLEN` would
+produce a number that looks like a rate and is actually a cumulative total with an unstated
+retention policy attached.
+
+Deduplication markers are worse. They carry a TTL (`dedupe-retention-ms`, a week by default), so
+the absence of a marker means either "this was never published" or "this was published so long ago
+that Redis forgot", and nothing distinguishes them. An analytics pipeline that treated a missing
+marker as evidence would report unpublished events that had in fact published months earlier.
+
+Consumer-group state is transport state. Pending-entry lists describe who currently owns a delivery
+and are rewritten by every `XAUTOCLAIM`; they are a snapshot of the delivery layer, not a log of
+what happened to a job.
+
+PostgreSQL, by contrast, holds rows that were written in the same transaction as the state change
+they describe. `job_attempts` records every execution including abandoned ones, `reliability_actions`
+records every operator decision, `job_effects` records every protected side effect. That is business
+history. So the rule is: **PostgreSQL is the analytics source of truth, and any Redis-derived number
+is labelled approximate and point-in-time or it is not reported at all.** v0.9 reports none.
+
+The uncomfortable corollary is that PostgreSQL is not a *complete* history either, and v0.9 found
+out where. Outbox retention deletes published rows after 30 days. The data-quality check
+"scheduled job with no schedule event" fired 23 times on the validation database, and every one of
+them was a job whose event had been written, published, and then legitimately cleaned up. Analytics
+cannot tell that apart from an event that was never written. That is why the check is a `WARNING`
+and why the retention window is now something an operator has to know in order to read the report.
+
+### 2. Why exports are immutable
+
+A report you cannot reproduce is an anecdote. If two people run "September" a week apart and get
+different numbers, the interesting question stops being "what happened in September" and becomes
+"which run do we believe", which nobody can answer because the inputs are gone.
+
+So an export is a snapshot: the extracted rows are written to Parquet once, and every later stage —
+aggregation, data quality — reads those files rather than the database. That has three consequences
+worth naming. Re-reporting is free and puts no load on the database a queue depends on. A reporting
+bug can be fixed and rerun against the exact bytes that produced the wrong answer. And the database
+is touched once per window rather than once per question.
+
+Immutability then has to be enforced, not just intended, which is where the run ID comes in.
+
+### 3. Time-window semantics
+
+Every command takes an explicit UTC half-open interval, `[start, end)`. Two decisions inside that.
+
+**The offset is mandatory.** `2026-09-01T00:00:00` is rejected, not assumed. This is the same
+argument v0.6 made about `scheduledAt` and it is load-bearing for the same reason: a naive
+timestamp means "whatever the machine that ran this thinks midnight is", and an analytics pipeline
+whose answers depend on which laptop ran it is not an analytics pipeline. The measurement on the
+validation database: 19 of 95 jobs fall on a different calendar day under the host's zone
+(Asia/Kolkata) than under UTC. A daily report that silently used local time would be wrong for a
+fifth of the data and would look entirely plausible.
+
+**The interval is half-open.** `end` belongs to the next window. Closed intervals double-count
+their shared boundary, and `[a,b]` followed by `[b,c]` counts everything at exactly `b` twice —
+which for a system that writes timestamps at millisecond resolution under load is not a
+hypothetical. Half-open windows tile the timeline exactly once, which is what makes "if the window
+is too big, split it" a safe instruction rather than a trade-off.
+
+The third decision is which timestamp controls inclusion, and it is per dataset because there is no
+single right answer. Jobs are included by `created_at`, attempts by `started_at`, dead letters by
+`moved_at`. A job created in August and completed in September is **not** a September submission —
+it may still appear in September's attempt facts, because an attempt that started in September did
+start in September. Getting this wrong is how "submissions" and "completions" quietly become the
+same number.
+
+One consequence has to be accepted rather than solved: `job_attempts.started_at` is nullable, so a
+row with a null `started_at` can never be selected by any window. There are zero such rows today;
+the export counts them and reports the count as a warning rather than pretending the dataset is
+complete.
+
+### 4. Fact-table grain
+
+Seven fact tables, one grain each: one row per job, per attempt, per outbox event, per DLQ record,
+per reliability action, per effect, per idempotency key. Stating the grain is most of the work,
+because almost every wrong analytics number comes from a join that silently changed it.
+
+The concrete case: `dead_letter_facts` needs job type and priority, which live on `jobs`. Joining
+the DLQ extract to the *windowed* `jobs` extract would have dropped the type and priority of any
+job created before the window — which is most of them, since a job is dead-lettered after it has
+been around a while. So the join happens in the extraction SQL, against the whole `jobs` table,
+and the fact table keeps its grain of one row per DLQ record with no nulls smuggled in by the
+window. The same reasoning applies to `job_facts.replay_count`, which comes from `dead_letters`,
+and to `effect_facts.job_type`.
+
+`effect_counters` has no grain at all. It is a running total with one row per counter name and no
+history, so there is nothing to put a window on. It is captured in the export metadata as a
+point-in-time snapshot, explicitly labelled as one, rather than being dressed up as a fact table.
+
+Two grain-adjacent honesty problems the schema forced:
+
+`jobs.started_at` is overwritten by every attempt. `Job.markRunning` sets it each time, so
+`duration_ms = finished_at - started_at` measures the **final** attempt, and `queue_delay_ms`
+for a retried job silently includes its retry backoff. The specified columns are computed exactly
+as specified — deviating would have been worse — but `first_attempt_started_at` and
+`first_queue_delay_ms` are derived from `job_attempts` alongside them, so the honest number is
+available to anyone who needs admission delay rather than last-attempt delay.
+
+An effect deduplication hit is a Micrometer counter, not a row. `JobEffectService.applyCounter`
+calls `metrics.deduplicationHit()` and returns; nothing is written. It is durably *implied*,
+though, and the implication is exactly the v0.8 design: the counter effect key excludes the attempt
+number on purpose, so a `COMPLETED` effect claimed on attempt N belonging to a job that ran M
+attempts means every attempt after N found the key already complete and skipped the work. Hence
+`deduplication_hits = max(0, M - N)`. It is a lower bound and is documented as one: an effect
+completed on a job's final attempt reports zero even though the ledger is precisely what stopped a
+second increment from being possible.
+
+### 5. Aggregate semantics
+
+The words in a report have to mean one thing each.
+
+- **Submitted** is a row in `jobs` whose `created_at` is in the window. A retry is not a submission,
+  a replay is not a submission, and a redelivery is not a submission. On the validation data, 95
+  submissions produced 133 attempts, and conflating those two numbers would have inflated apparent
+  volume by 40%.
+- **Started** is a job with a non-null `started_at`. A `SCHEDULED` or `QUEUED` job has never
+  started, and counting it as started makes queue depth invisible.
+- **Succeeded / dead-lettered** come from the job's terminal status. `failed_jobs` counts the
+  legacy `FAILED` status only — the v0.2 resting state that v0.3 replaced — because exhausted
+  retries are `DEAD_LETTERED` and adding them together would double-count. Keeping the legacy
+  bucket at all is deliberate: those rows exist and are not being migrated.
+- **Retried** is `attempt_count > 1`, a property of the job. **Abandoned attempts** are counted on
+  the attempt table, because an abandoned attempt is a thing that happened to a delivery, not a
+  verdict on the job — a job with an abandoned attempt usually succeeds afterwards.
+- **Replays** stay on the job they belong to. `Job.prepareForReplay` does not touch `created_at`,
+  `scheduled_at` or `attempt_count`, so a replayed job keeps its original submission day and its
+  original scheduling metadata, and its `replay_count` comes from the DLQ row. A replay is
+  continued history, not a new job, and the aggregates say so.
+- **Outbox states** are four, not two. `pending_events` covers `PENDING` and `PUBLISHING` —
+  everything neither published nor terminal — with `publishing_events` broken out separately,
+  because a stuck relay lease and a plain backlog need different responses. A terminal `FAILED`
+  event is never counted as published, and its publication latency is null rather than zero.
+
+### 6. Percentiles
+
+Exact `percentile`, not `percentile_approx`.
+
+The approximate form is the correct default at scale: it is a sketch with a configurable error
+bound and it does not need to sort. But an error bound is a statement about large samples, and
+these groups are not large — the validation data has a day-priority bucket with three jobs in it.
+A p99 over three rows computed by a sketch is a number with no defined meaning, and it would be
+printed next to numbers that do have one. Exact percentiles are deterministic at any input size,
+which is the property that makes two runs of the same window comparable.
+
+Small-sample behaviour is defined rather than avoided. One value returns that value at every
+quantile. Two values interpolate between them. Zero non-null values returns **null**, not zero,
+because "we observed no measurable durations" and "we observed zero milliseconds" are different
+facts and only one of them is ever true.
+
+Negative durations are not excluded from percentiles. A `finished_at` before `started_at` is real
+data about a real problem; dropping it from the aggregate would hide the problem and leave a
+plausible-looking number in its place. It flows through, and `jobs_negative_duration` names it as
+an `ERROR` in the same run.
+
+Averages are rounded to three decimal places for a duller reason: floating-point addition is not
+associative, so an unrounded mean is only reproducible if partition order is, and partition order
+is not something this pipeline promises.
+
+### 7. Data quality
+
+The pipeline **reports and never repairs**, and that is a boundary rather than a limitation.
+
+Reconciliation already exists. It runs inside the application, takes an advisory lock, writes a
+`reliability_actions` row in the same transaction as every change it makes, and is bounded by
+configuration an operator controls. An analytics job that "fixed" a row would be a second writer
+with none of that: no lock, no audit, no coordination with the sweep that thinks it owns the
+problem. The two would race, and the audit log would stop being a complete account of who changed
+what.
+
+So the 19 checks produce counts, bounded sorted sample IDs, and descriptions. Every check emits a
+row **even at zero**, because a report where a check is absent is indistinguishable from one where
+the check did not run — and "we looked and found nothing" is a result worth recording.
+
+Severity is assigned by how certain the finding is, not by how much it matters. Checks that span
+two datasets are `WARNING` because a half-open window genuinely can separate a job from its
+attempts. Checks confined to one row — a negative duration, a `PUBLISHED` event with no
+`published_at` — are `ERROR` because no window can explain them.
+
+Three checks exist entirely because of a v0.1 decision. The schema carries no `CHECK` constraint
+over any enum column: `V1__initial_schema.sql` argues that the application enum is the source of
+truth and that a database constraint over an enum which gains values every other release is a
+migration burden that already caused one silent failure. That argument is still right, and its
+stated cost was "nothing at the database level stops a bad value being written by something that is
+not this application". `jobs_invalid_status`, `attempts_invalid_outcome` and `outbox_invalid_status`
+are where that cost finally gets paid: analytics validates the enums the database declines to.
+
+### 8. Read-only guarantee
+
+The pipeline never writes to `jobs`, `job_attempts`, `outbox_events`, `dead_letters`,
+`reliability_actions`, `job_effects`, `effect_counters`, `idempotency_keys` or
+`flyway_schema_history`, and never writes to Redis at all.
+
+That is enforced at three levels rather than asserted once. The JDBC connection sets
+`readOnly=true` and `readOnlyMode=always`, so the PostgreSQL driver refuses a write even if some
+future code path attempted one. Every statement issued is a `SELECT`, and nothing opens a
+transaction that could take a lock a worker cares about. And each export takes a row census of all
+eight application tables plus a Flyway fingerprint — count, checksum total, max rank — before and
+after itself, and writes both into `export_metadata.json`. The guarantee is therefore a measurement
+in the output rather than a claim in a README:
+
+```json
+"row_census_unchanged": true,
+"flyway_unchanged": true
+```
+
+`ApplicationName=distroq-analytics` is set so that an analytics connection is identifiable in
+`pg_stat_activity` while it is running.
+
+### 9. Rerun behaviour
+
+The run ID is derived from the window — `20260101T000000Z__20270101T000000Z` — and not from a clock
+or a UUID. This is the part that makes immutability enforceable. With a random ID, a second run of
+the same window would create a second directory, succeed, and leave two snapshots with no
+indication which one anyone was reading; "never overwrite silently" would be unenforceable because
+nothing would ever collide. With a window-derived ID the second run lands on the first one's
+directory, finds it occupied, and refuses with exit code 7 until told otherwise. `--overwrite`
+removes exactly the directory it was pointed at and no sibling.
+
+Reproducibility was measured rather than assumed. Two exports of the same window four minutes apart
+produced byte-identical CSVs for `daily_job_summary`, `job_type_summary`, `priority_summary`,
+`reliability_summary`, `effect_summary` and `data_quality_summary`. `outbox_summary` differed in
+exactly one cell: `oldest_unpublished_age_ms`, by 240,068 ms — the elapsed time between the runs.
+
+That column is the single deliberate exception. `age_at_export_ms` measures how long an unpublished
+event has been waiting *as of the export*, which is the only useful definition; an unpublished event
+genuinely does get older, and freezing the number to make a diff clean would answer the wrong
+question. Everything downstream of it is stable, and `report` and `quality` take "now" from the
+export metadata rather than the wall clock, so re-reporting an old export tomorrow produces the
+numbers it produced the day it was taken.
+
+### 10. Credential handling
+
+No credential is committed. The database password is read from `DISTROQ_ANALYTICS_DB_PASSWORD` or
+passed as an argument, and the argument form is documented as the worse of the two because it is
+visible in the process list to every user on the host.
+
+The password is never written into the JDBC URL — it travels as a connection property — so the URL
+can be logged. `AnalyticsConfig.__repr__` prints `***`. `source_identifier` strips any embedded
+credentials before the URL reaches metadata. Every error message that could originate in the driver
+is passed through `scrub()` first, because "password authentication failed for user X" is exactly
+the kind of message that ends up in a log with the attempted password in it.
+
+The one existing local-development credential — `distroq`, already in `docker-compose.yml` and
+`application.yml` since v0.1 — is referenced by the compose service as a default rather than
+duplicated as a new secret.
+
+Job payloads and outbox payloads are never selected. The raw `Idempotency-Key` is hashed to SHA-256
+*inside PostgreSQL*, so the client-supplied token never reaches Spark's memory, let alone a file.
+Error text and operator reasons are truncated to 500 characters at the source rather than after
+extraction, so an unbounded blob never crosses the wire.
+
+### 11. Scaling limitations
+
+The pipeline was validated against 95 jobs, 133 attempts and 30 outbox events: extraction 10.2s,
+transformation 11.1s, 186 KiB of output. That is a correctness result. It supports no claim
+whatsoever about production scale, and the temptation to present it as a performance number is
+exactly what this section exists to resist.
+
+The real limits, in the order they will be hit:
+
+**JDBC extraction is single-partition.** Each table is one `SELECT` over one connection, so
+extraction is serial and bounded by one PostgreSQL backend. That is the right shape for tens of
+thousands of rows and the wrong shape for tens of millions. `spark.read.jdbc` supports partitioned
+reads over a numeric or timestamp column; adding `partitionColumn`/`lowerBound`/`upperBound`/
+`numPartitions` is the first change to make, and it is deliberately not made now because tuning
+partition counts against a dataset this size would be guessing.
+
+**Output is `coalesce(1)`.** A single file per dataset keeps a rerun comparable and keeps the
+directory readable, which is worth more than parallel writes at this size and worth nothing above
+roughly a gigabyte per dataset.
+
+**`local[*]` is one JVM.** Driver memory is the ceiling for every shuffle and every `collect`.
+Nothing in the pipeline collects a fact table to the driver, but the aggregates and the data-quality
+samples do come back, and a pathological window with millions of findings would notice.
+
+**The window is the only backpressure.** There is no incremental mode: every run re-extracts its
+whole window. Splitting a window that does not fit is safe precisely because consecutive half-open
+intervals tile the timeline exactly once — which is the practical payoff of the interval decision
+in section 3.
+
+A fifth limit is environmental rather than architectural. Spark writes Parquet through Hadoop's
+local filesystem, which on Windows requires `winutils.exe` and `hadoop.dll` from a Hadoop binary
+distribution. Both symptoms were reproduced during development: the Python worker fails to start on
+Python 3.14/3.15 despite the wheel claiming `>=3.9`, and every Parquet write fails with
+`HADOOP_HOME and hadoop.home.dir are unset`. Installing unsigned native binaries from a third-party
+mirror to fix the second one is not a dependency worth taking, so the pipeline is containerised and
+runs on Linux, which the prompt's own list of environment options allows and which the repository
+already had Docker for.
+
+### 12. The exactly-once limitation is unchanged
+
+An analytics export is repeatable. Running it twice produces the same facts and the same
+aggregates, and running it zero times or a hundred times has the same effect on the application:
+none.
+
+That says nothing about job execution. DistroQ is still at-least-once. A job can still run more
+than once after a crash, or whenever an execution outlasts `claim-min-idle-ms` and Redis cannot
+distinguish a slow worker from a dead one. The effect ledger still protects only effects that
+commit in the same transaction as their claim, and an HTTP call to a third party still commits
+somewhere DistroQ has no transaction over.
+
+v0.9 adds a way to *count* duplicate execution — abandoned attempts, retry rates, deduplication
+hits are all now visible per job type and per day — and counting is not preventing. The idempotent
+rerun property belongs to the analytics pipeline. It does not propagate backwards into the system
+being analysed, and reporting that it did would be the exact category of claim the previous eight
+versions of this file have refused to make.
+
 ## What v0.8 changed about the plan
 
 ### 1. Why implicit outbox state was insufficient

@@ -1,7 +1,387 @@
-# DistroQ v0.8
+# DistroQ v0.9
 
-v0.8 is the operations release. v0.7 made publication durable; v0.8 makes it *legible*. The outbox
-now has an explicit lifecycle rather than one inferred from nullable columns, a terminal failure
+v0.9 is the analytics release. Everything through v0.8 was about making the *present* correct and
+legible: what is queued, what is running, what failed, what an operator did about it. v0.9 asks a
+different question — what happened *last month* — and answers it without touching a single row of
+the system that has to keep working.
+
+```text
+Application tables
+    |
+    | read-only JDBC extraction        readOnlyMode=always
+    v
+Immutable Parquet facts                analytics/output/<run-id>/
+    |
+    v
+PySpark transformations
+    |
+    +-- fact tables                    one row per job, attempt, event, action, effect, key
+    +-- aggregate reports              daily, per job type, per priority, per event type
+    +-- data-quality report            19 checks that report and never repair
+    |
+    v
+Optional read-only API                 NOT IMPLEMENTED in v0.9 - batch analytics only
+```
+
+PostgreSQL is the analytics source of truth. Redis is not, and the reason is not a preference:
+Streams retain acknowledged entries, stream length is not executable backlog, and deduplication
+markers expire. Redis knows what is being delivered right now. It does not know what happened.
+
+> The pipeline never writes to `jobs`, `job_attempts`, `outbox_events`, `dead_letters`,
+> `reliability_actions`, `job_effects`, `effect_counters`, `idempotency_keys` or
+> `flyway_schema_history`. It never writes to Redis. It never starts a scheduler or a worker.
+> Every export records a row census and a Flyway fingerprint taken before and after itself, so
+> the guarantee is a measurement in the output rather than a claim in this file.
+
+## What changed in v0.9
+
+### Analytics is a separate program, not a feature of the application
+
+The pipeline lives in `analytics/` as a Python project with its own pinned dependencies. No Spark
+dependency was added to the Maven build, no analytics code runs in the application JVM, and no
+scheduled task was added to the worker path. The two systems share exactly one thing: a database
+that one of them is only allowed to read.
+
+That separation is the whole design. An analytics query that goes wrong should cost a report, not
+a queue.
+
+### Exports are immutable snapshots with a deterministic identity
+
+A run directory is named after its window:
+
+```text
+analytics/output/20260101T000000Z__20270101T000000Z/
+```
+
+Not a random ID and not a timestamp. Rerunning the same window has to *collide* with its own
+previous output, otherwise "don't overwrite silently" is unenforceable — you would simply get a
+second copy under a new name and never know which one anyone was reading.
+
+```text
+error [OUTPUT_EXISTS]: export run directory already exists at ... and is not empty.
+Analytics exports are immutable snapshots, so this is refused rather than merged.
+Pass --overwrite to replace this directory, or choose a different --output.
+```
+
+`--overwrite` removes exactly the directory it was pointed at. Sibling runs are untouched.
+
+### Every window is a UTC half-open interval
+
+```text
+2026-09-01T00:00:00Z <= timestamp < 2026-10-01T00:00:00Z
+```
+
+An offset is mandatory. A naive timestamp is *rejected*, not assumed:
+
+```powershell
+python -m distroq_analytics.cli export --start 2026-09-01T00:00:00 --end 2026-10-01T00:00:00Z
+# error [INVALID_WINDOW]: start '2026-09-01T00:00:00' has no UTC offset. Naive timestamps are
+# rejected because the result would depend on the timezone of whichever machine ran the export.
+```
+
+This is the same argument v0.6 made about `scheduledAt` and it is load-bearing for the same
+reason. On the machine v0.9 was validated on, 19 of 95 jobs fall on a different calendar day under
+the host's local zone than under UTC. A daily report that silently used local time would be wrong
+for a fifth of the data and would look completely plausible.
+
+Which timestamp decides inclusion is documented per dataset, because it is not obvious and it is
+not the same one everywhere:
+
+| Dataset | Inclusion timestamp |
+|---|---|
+| Jobs | `created_at` |
+| Attempts | `started_at` |
+| Outbox events | `created_at` |
+| Dead letters | `moved_at` |
+| Reliability actions | `created_at` |
+| Effects | `created_at` |
+| Idempotency keys | `created_at` |
+
+A job created in August and completed in September is **not** a September submission. It may still
+appear in September's `attempt_facts`, because that dataset is keyed on when an attempt started.
+
+### Seven fact tables, each with one grain
+
+`job_facts`, `attempt_facts`, `outbox_facts`, `dead_letter_facts`, `reliability_action_facts`,
+`effect_facts`, `idempotency_facts` — one row per job, attempt, event, action, effect, and
+submission key respectively.
+
+Three rules decide every derived column:
+
+1. **Null in, null out.** Nothing invents a timestamp. A `RUNNING` job has no `duration_ms`,
+   and it does not get one by substituting `now()`.
+2. **Negative durations survive.** A `finished_at` before `started_at` is evidence of a clock or
+   ordering problem. Clamping it to zero would delete the evidence and leave a plausible number in
+   its place; instead it flows through to the aggregates *and* gets named by a data-quality check.
+3. **Queue delay and schedule delay are mutually exclusive.** A scheduled job did not wait in a
+   queue, it waited for a time a user picked. Averaging the two together would make a user's own
+   choice look like system latency.
+
+Two things the schema forces the analytics to be honest about:
+
+- `jobs.started_at` is overwritten by every attempt (`Job.markRunning`), so `duration_ms` measures
+  the **final** attempt and `queue_delay_ms` includes retry backoff for a retried job. The
+  spec-required columns are computed exactly as specified; `first_attempt_started_at` and
+  `first_queue_delay_ms` are derived from `job_attempts` alongside them for the cases where true
+  admission delay is what is wanted.
+- An effect deduplication hit is a Micrometer counter, not a row, so it cannot be extracted. It is
+  durably *implied*: the counter effect key deliberately excludes the attempt number, so a
+  `COMPLETED` effect claimed on attempt N belonging to a job that ran M attempts means every
+  attempt after N found the key already complete. `deduplication_hits = max(0, M - N)` is a lower
+  bound, and is documented as one.
+
+### Payloads never leave the database
+
+Job payloads and outbox payloads are not selected. Error text and operator reasons are truncated
+to 500 characters in SQL. The raw `Idempotency-Key` is hashed to SHA-256 *inside PostgreSQL*:
+
+```sql
+encode(sha256(convert_to(k.idempotency_key, 'UTF8')), 'hex') AS idempotency_key_hash
+```
+
+so the client-supplied token is never in Spark's memory, never in a Parquet file, and never in a
+report.
+
+### Data quality reports and never repairs
+
+19 checks run over the extracted facts. Every check emits a row **even when it finds nothing** — a
+report where a check is absent is indistinguishable from one where the check did not run.
+
+```text
+   jobs_negative_duration                           ERROR         0
+   dead_lettered_jobs_without_dlq_row               ERROR         0
+   multiple_in_progress_attempts                    ERROR         0
+ ! scheduled_jobs_missing_schedule_event            WARNING      23  0a8e49b5-..., 0b4ef385-...
+ ! duplicate_idempotency_hashes_for_different_jobs  WARNING       2   629534ae..., 9c16e7e7...
+```
+
+Reconciliation already exists and is the only thing allowed to change application state. An
+analytics job that "fixed" a row would be a second, unaudited writer racing it.
+
+Three of the checks exist specifically because the schema carries **no CHECK constraint** over its
+enum columns, a decision `V1__initial_schema.sql` argues for at length. The application enum is the
+source of truth; v0.9 validates rather than assumes.
+
+### Percentiles are exact, not approximate
+
+`percentile`, not `percentile_approx`. The approximate form is the right choice at scale and is
+defined by an error bound — and an error bound over four rows is not a number to put in an
+operational report. Exact percentiles are deterministic at any input size, which is what makes two
+runs of the same window comparable.
+
+A group with no measurable durations reports a **null** percentile, and a success rate over zero
+submissions is **null**, not `0.0`. A dashboard that renders an undefined rate as 0% is lying about
+a quiet day.
+
+### The pipeline runs in a container
+
+`analytics/Dockerfile` pins Python 3.12, PySpark 4.0.1, a JRE, and a SHA-256-verified PostgreSQL
+JDBC driver. `docker compose` gains an `analytics` service behind a profile, so a plain
+`docker compose up` still starts only Redis and PostgreSQL.
+
+On Windows the container is not a convenience, it is the only supported path: Spark writes Parquet
+through Hadoop's local filesystem, which needs `winutils.exe` and `hadoop.dll` from a Hadoop binary
+distribution, and installing unsigned native binaries from a third-party mirror is not a dependency
+this project is willing to take.
+
+## v0.9 analytics
+
+### Setup
+
+```powershell
+docker compose --profile analytics build analytics
+docker compose --profile analytics run --rm analytics --help
+```
+
+The service joins the compose network and reaches PostgreSQL at `postgres:5432` rather than the
+host's `5433`. Output lands in `analytics/output/` on the host.
+
+### Configuration
+
+| Variable | Flag | Default |
+|---|---|---|
+| `DISTROQ_ANALYTICS_DB_URL` | `--jdbc-url` | `jdbc:postgresql://localhost:5433/distroq` |
+| `DISTROQ_ANALYTICS_DB_USER` | `--db-user` | unset |
+| `DISTROQ_ANALYTICS_DB_PASSWORD` | `--db-password` | unset |
+| `DISTROQ_ANALYTICS_OUTPUT_DIR` | `--output` | `analytics/output` |
+| `DISTROQ_ANALYTICS_SPARK_MASTER` | `--spark-master` | `local[*]` |
+| `DISTROQ_ANALYTICS_LOG_LEVEL` | `--log-level` | `WARN` |
+
+No credential is committed. The password is never written into the JDBC URL, never printed, and
+stripped from any driver error text before it reaches a log. Prefer the environment variable over
+`--db-password`, which is visible in the process list to every user on the host.
+
+### Commands
+
+```powershell
+# extract - the only stage that touches the database
+docker compose --profile analytics run --rm analytics export `
+  --start 2026-01-01T00:00:00Z `
+  --end   2027-01-01T00:00:00Z
+
+# aggregate - reads the Parquet the export wrote, never the database
+docker compose --profile analytics run --rm analytics report `
+  --input /workspace/analytics/output/20260101T000000Z__20270101T000000Z
+
+# data quality - same input, same rule
+docker compose --profile analytics run --rm analytics quality `
+  --input /workspace/analytics/output/20260101T000000Z__20270101T000000Z
+```
+
+Running locally instead of in the container, the CLI is the same program:
+
+```powershell
+python -m distroq_analytics.cli export `
+  --start 2026-01-01T00:00:00Z `
+  --end 2027-01-01T00:00:00Z `
+  --output analytics/output `
+  --jdbc-url "jdbc:postgresql://localhost:5433/distroq" `
+  --db-user distroq
+```
+
+### Output directory
+
+```text
+analytics/output/<run-id>/
+  jobs/  job_attempts/  outbox_events/  dead_letters/
+  reliability_actions/  job_effects/  idempotency_keys/    raw extracts
+  facts/                                                   seven fact tables
+  metadata/export_metadata.json
+  reports/                                                 six aggregates + data quality + CSV
+  quality/                                                 data quality on its own
+```
+
+### Exit codes
+
+| Code | Name | Meaning |
+|---|---|---|
+| 0 | OK | |
+| 1 | USAGE | bad arguments, non-PostgreSQL JDBC URL |
+| 2 | INVALID_WINDOW | naive timestamp, unparseable instant, `start >= end` |
+| 3 | DB_CONNECTION | could not connect or read the catalogue |
+| 4 | MISSING_TABLE | a required source table is absent |
+| 5 | EXTRACTION_FAILED | a source extract failed |
+| 6 | TRANSFORM_FAILED | fact or aggregate construction failed |
+| 7 | OUTPUT_EXISTS | destination exists and `--overwrite` was not given |
+| 8 | QUALITY_FATAL | findings reached the `--fail-on` severity |
+| 9 | MISSING_INPUT | `--input` is not an export run directory |
+
+The window is validated before Spark starts and before any connection is attempted, so a bad
+window and an unreachable database can never be confused for one another.
+
+### Example reports
+
+`daily_job_summary` — UTC day and priority:
+
+```text
+day,priority,submitted_jobs,started_jobs,succeeded_jobs,failed_jobs,dead_lettered_jobs,scheduled_jobs,retried_jobs,abandoned_attempts,average_duration_ms,p50_duration_ms,p95_duration_ms,p99_duration_ms,average_queue_delay_ms,p95_queue_delay_ms,average_schedule_delay_ms
+2026-09-07,HIGH,11,11,11,0,0,7,2,0,871.182,122,4014,4016,1369.25,3571,1351.0
+2026-09-08,HIGH,18,18,18,0,0,0,3,1,5238.333,1524,21517,28315,23424.611,138313,
+2026-09-08,LOW,3,2,1,0,1,2,1,0,155.0,155,274,284,8338.0,8338,86246.0
+2026-09-09,NORMAL,8,5,4,0,1,1,1,0,53.6,55,81,84,11143.0,36865,905.0
+```
+
+`job_type_summary` — note `success_rate` and the deduplication hit:
+
+```text
+job_type,submitted_jobs,succeeded_jobs,dead_lettered_jobs,success_rate,average_attempts,average_duration_ms,p95_duration_ms,effect_deduplication_hits
+always_fail,6,0,6,0.0,4.667,19.5,26,0
+fail_n_times,8,7,1,0.875,3.625,18.625,28,0
+idempotent_counter,8,5,0,0.625,0.75,45.2,73,1
+sleep,73,67,0,0.917808,0.959,3018.985,18542,0
+```
+
+`priority_summary` — LOW pays for the tiers, exactly as v0.4 said it would:
+
+```text
+priority,submitted_jobs,succeeded_jobs,dead_lettered_jobs,success_rate,average_queue_delay_ms,p95_queue_delay_ms,average_schedule_delay_ms,p95_schedule_delay_ms
+HIGH,32,31,0,0.96875,17830.083,104233,1351.0,4248
+LOW,21,13,4,0.619048,528165.154,2722456,28150.25,76921
+NORMAL,42,35,3,0.833333,261659.0,185524,2487809.818,8920215
+```
+
+`outbox_summary` — an empty latency column is a null, not a zero:
+
+```text
+day,event_type,total_events,published_events,pending_events,publishing_events,terminal_failed_events,operator_retries,average_publication_latency_ms,p95_publication_latency_ms,oldest_unpublished_age_ms
+2026-09-08,SCHEDULE_USER_JOB,1,1,0,0,0,0,81.0,81,
+2026-09-09,ENQUEUE_SUBMIT,10,6,3,0,1,1,372.833,648,591177
+```
+
+The terminal event is counted in `terminal_failed_events` and **not** in `published_events`; its
+`publication_latency_ms` is null because it never published; the operator retry that re-armed a
+different event shows in `operator_retries`; and `oldest_unpublished_age_ms` is measured from the
+export, not from the window.
+
+### Rerun and overwrite
+
+Two exports of the same window, four minutes apart, produced byte-identical CSVs for
+`daily_job_summary`, `job_type_summary`, `priority_summary`, `reliability_summary`,
+`effect_summary` and `data_quality_summary`. `outbox_summary` differed in exactly one cell:
+
+```text
+run 1:  2026-09-09,ENQUEUE_SUBMIT,10,6,3,0,1,1,372.833,648,591177
+run 2:  2026-09-09,ENQUEUE_SUBMIT,10,6,3,0,1,1,372.833,648,831245
+```
+
+`oldest_unpublished_age_ms` moved by 240,068 ms — the elapsed time between the two exports. An
+unpublished event genuinely does get older. That is the one column in the whole pipeline that is
+defined relative to export time, and it is documented rather than frozen, because freezing it
+would make it useless for the question it exists to answer.
+
+### Read-only guarantee
+
+Every export writes its own proof into `export_metadata.json`:
+
+```json
+"read_only": {
+  "jdbc_read_only_mode": "always",
+  "row_census_before": { "jobs": 95, "job_attempts": 133, "outbox_events": 30, "...": 0 },
+  "row_census_after":  { "jobs": 95, "job_attempts": 133, "outbox_events": 30, "...": 0 },
+  "row_census_unchanged": true,
+  "flyway_before": { "migrations": 7, "checksum_total": 4346192880, "max_rank": 7 },
+  "flyway_after":  { "migrations": 7, "checksum_total": 4346192880, "max_rank": 7 },
+  "flyway_unchanged": true
+}
+```
+
+The census covers all eight application tables plus `flyway_schema_history`, and is taken by the
+same connection that did the extraction, before and after it.
+
+### Performance and its limits
+
+Measured on 95 jobs, 133 attempts, 30 outbox events, 41 reliability actions:
+
+| | |
+|---|---|
+| Extraction | 10.2s (7 tables, single-partition JDBC) |
+| Transformation | 11.1s |
+| Total export | 25.2s |
+| Report | 31.1s |
+| Quality | 22s |
+| Output | 186 KiB across 99 files |
+
+**This is a correctness result, not a performance result.** Nothing here justifies a claim about
+production scale. The known limits are single-partition JDBC extraction, `coalesce(1)` output, and
+a single-JVM `local[*]` master; the mitigation available today is a smaller window, which is safe
+because consecutive half-open windows tile the timeline exactly once.
+
+### Analytics HTTP API
+
+```text
+Batch analytics only; no analytics HTTP API implemented in v0.9.
+```
+
+It was scoped as optional and declined. Serving `GET /api/analytics/summary` from the application
+would mean the application process reading Parquet from a directory the batch job owns, which
+introduces a coupling — a deploy that moves the output directory breaks an HTTP endpoint — for no
+capability the files do not already provide. The aggregates are on disk and readable by anything
+that reads Parquet.
+
+## What changed in v0.8
+
+v0.8 is the operations release. v0.7 made publication durable; v0.8 made it *legible*. The outbox
+has an explicit lifecycle rather than one inferred from nullable columns, a terminal failure
 survives for a human to look at instead of retrying forever in silence, a reconciliation pass
 compares PostgreSQL intent against what the rest of the system actually did, every operator or
 automatic repair writes an audit row, and a side-effect ledger gives cooperating integrations an
@@ -41,8 +421,6 @@ PostgreSQL remains the source of truth. Redis remains an at-least-once delivery 
 > Execution leases prevent stale workers from finalizing database state.
 > Effect keys protect only integrations that participate in the effect protocol.
 > None of these alone makes arbitrary external side effects exactly once.
-
-## What changed in v0.8
 
 ### The outbox lifecycle is explicit
 
@@ -2185,6 +2563,75 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/admin/reconciliation" | Conver
 
 # 50. The v0.8 metrics block
 Invoke-RestMethod -Uri http://localhost:8080/api/metrics | ConvertTo-Json -Depth 10
+
+# ---- v0.9 ----
+# The analytics pipeline runs in its own container and never needs the application running.
+
+# 51. Build the image and confirm the environment is the pinned one
+docker compose --profile analytics build analytics
+docker compose --profile analytics run --rm --entrypoint python analytics `
+  -c "import sys, pyspark; print(sys.version); print(pyspark.__version__)"
+# 3.12.x and 4.0.1
+
+# 52. A naive timestamp is rejected before Spark or JDBC is touched
+docker compose --profile analytics run --rm analytics export `
+  --start 2026-01-01T00:00:00 --end 2027-01-01T00:00:00Z
+echo $LASTEXITCODE   # 2, and the message says why an offset is required
+
+# 53. start >= end is rejected
+docker compose --profile analytics run --rm analytics export `
+  --start 2027-01-01T00:00:00Z --end 2026-01-01T00:00:00Z
+echo $LASTEXITCODE   # 2
+
+# 54. Export a window, then inspect the metadata the export wrote about itself
+docker compose --profile analytics run --rm analytics export `
+  --start 2026-01-01T00:00:00Z --end 2027-01-01T00:00:00Z
+$run = "analytics/output/20260101T000000Z__20270101T000000Z"
+Get-Content "$run/metadata/export_metadata.json" | ConvertFrom-Json |
+  Select-Object -ExpandProperty read_only | ConvertTo-Json -Depth 5
+# row_census_unchanged: true, flyway_unchanged: true, jdbc_read_only_mode: always
+
+# 55. The same window again is refused, not merged
+docker compose --profile analytics run --rm analytics export `
+  --start 2026-01-01T00:00:00Z --end 2027-01-01T00:00:00Z
+echo $LASTEXITCODE   # 7, OUTPUT_EXISTS
+
+# 56. Aggregates and data quality, neither of which opens a database connection
+docker compose --profile analytics run --rm analytics report --input "/workspace/$run"
+docker compose --profile analytics run --rm analytics quality --input "/workspace/$run"
+Get-Content "$run/reports/priority_summary.csv"
+Get-Content "$run/quality/data_quality_summary.csv"
+
+# 57. UTC grouping is real, not incidental. Compare the report against the database's own
+#     UTC buckets, and against what the host's local zone would have produced.
+Get-Content "$run/reports/daily_job_summary.csv"
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "select (created_at at time zone 'UTC')::date day, priority, count(*) from jobs group by 1,2 order by 1,2;"
+docker exec distroq-postgres psql -U distroq -d distroq -c `
+  "select count(*) from jobs where (created_at at time zone 'UTC')::date <> (created_at at time zone 'Asia/Kolkata')::date;"
+# the report matches the UTC grouping exactly; the second query shows how many rows a
+# local-time report would have moved to a different day
+
+# 58. Rerun determinism. Only the export-time-relative column may move.
+Copy-Item -Recurse -Force "$run/reports" "$env:TEMP/reports-run1"
+docker compose --profile analytics run --rm analytics export `
+  --start 2026-01-01T00:00:00Z --end 2027-01-01T00:00:00Z --overwrite
+docker compose --profile analytics run --rm analytics report --input "/workspace/$run" --overwrite
+Get-ChildItem "$env:TEMP/reports-run1/*.csv" | ForEach-Object {
+  $a = (Get-FileHash $_.FullName).Hash
+  $b = (Get-FileHash "$run/reports/$($_.Name)").Hash
+  "{0,-28} {1}" -f $_.Name, $(if ($a -eq $b) { "IDENTICAL" } else { "DIFFERENT" })
+}
+# every file IDENTICAL except outbox_summary.csv, which differs only in
+# oldest_unpublished_age_ms, by the elapsed time between the two exports
+
+# 59. Credentials never reach the output
+Select-String -Path "$run/metadata/export_metadata.json" -Pattern 'password'
+# no matches; source_database is host/port/database only
+
+# 60. The Python suite
+docker compose --profile analytics run --rm --entrypoint python analytics `
+  -m pytest /opt/distroq-analytics/tests -q
 ```
 
 `com.distroq` logs at `DEBUG`, so the QUEUED → RUNNING → RETRYING → SUCCEEDED/DEAD_LETTERED
@@ -2428,9 +2875,51 @@ The scheduled-job promoter runs in **every** instance. That is safe — the Lua 
 decides ownership, so a member cannot be promoted twice — but it is not leader-elected, and every
 instance therefore pays for a `ZRANGEBYSCORE` per tick.
 
+### v0.9 analytics limitations
+
+> **Local validation is not a performance result.** The pipeline was exercised against 95 jobs and
+> 133 attempts. It says nothing about a million. Extraction is single-partition JDBC, output is
+> `coalesce(1)`, and the master is `local[*]`; all three are correct at this size and wrong at
+> scale. The available mitigation today is a smaller window.
+
+> **Outbox retention erases analytics history.** `published-retention-days` deletes published
+> outbox rows, and the analytics `scheduled_jobs_missing_schedule_event` check cannot distinguish
+> "the event was never written" from "the event was written, published, and later cleaned up". On
+> the validation database this produced 23 warnings for jobs whose schedule events had been
+> legitimately deleted. The check is a `WARNING` for exactly this reason, and an operator reading
+> it must know the retention window.
+
+> **Window edges cut across relationships.** A job created just before `end` may have its attempts,
+> or its retry event, in the *next* window. Checks that span two datasets are therefore `WARNING`
+> rather than `ERROR`. This is a property of half-open windows, not a defect, and it is why
+> consecutive windows tile exactly.
+
+> **Deduplication hits are a lower bound.** They are inferred from `job.attempt_count` minus the
+> effect's claiming attempt, because the application counts them in Micrometer and not in a row.
+> An effect completed on a job's final attempt reports zero hits even though the ledger is exactly
+> what made a second increment impossible.
+
+> **`age_at_export_ms` is not reproducible, on purpose.** Every other number in the pipeline is
+> byte-identical across reruns of the same window. This one moves with the clock, because the age
+> of an unpublished event is a live fact and freezing it would answer the wrong question.
+
+> **Analytics reruns do not change execution semantics.** The pipeline is repeatable; the
+> application is still at-least-once, and a job may still execute more than once. Nothing in v0.9
+> makes an arbitrary external side effect exactly once, and nothing in v0.9 tries to.
+
 ## Not implemented yet
 
-Deliberately out of scope for v0.8:
+Deliberately out of scope for v0.9:
+
+- An analytics HTTP API (`GET /api/analytics/*`); v0.9 is batch analytics only
+- A dashboard UI, WebSockets, and live streaming analytics
+- Kafka or another event broker
+- Incremental or append-only analytics; every run re-extracts its whole window
+- Automatic scheduling of exports
+- Machine-learning predictions and anomaly detection
+- Analytics-driven repair of any kind
+
+Still out of scope, from v0.8:
 
 - Authentication and authorization for the administrative endpoints
 - Exactly-once execution of arbitrary external side effects
@@ -2463,4 +2952,10 @@ status, the timestamp parsing and the worker's behaviour on an entry that arrive
 v0.7 predicted that the outbox would close the reliability story. It closed the *write* side and
 opened an operational one: a durable intent nobody can see the state of is only half a fix. See
 *What v0.8 changed about the plan* in `NOTES.md`.
+
+v0.8 assumed that the operational state it had made legible was also the historical record. It is
+not. Redis Streams retain acknowledged entries, deduplication markers expire, and outbox retention
+deletes the published rows that prove a scheduling intent was ever honoured — so the system that
+answers "what is happening now" cannot answer "what happened last month". See *What v0.9 changed
+about the plan* in `NOTES.md`.
 
