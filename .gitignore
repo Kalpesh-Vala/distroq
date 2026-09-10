@@ -37,3 +37,17 @@ build/
 
 ### Logs ###
 *.log
+
+### v0.9 analytics ###
+# Local Python environments and the Spark/pytest scratch they produce.
+analytics/.venv/
+analytics/.bootstrap/
+analytics/.tmp/
+analytics/**/__pycache__/
+analytics/.pytest_cache/
+analytics/*.egg-info/
+analytics/src/*.egg-info/
+# Export runs are data, not source. They contain operational history and are
+# reproducible from the database by rerunning the same window.
+analytics/output/*
+!analytics/output/.gitkeep
