@@ -33,11 +33,13 @@ history. So the rule is: **PostgreSQL is the analytics source of truth, and any 
 is labelled approximate and point-in-time or it is not reported at all.** v0.9 reports none.
 
 The uncomfortable corollary is that PostgreSQL is not a *complete* history either, and v0.9 found
-out where. Outbox retention deletes published rows after 30 days. The data-quality check
-"scheduled job with no schedule event" fired 23 times on the validation database, and every one of
-them was a job whose event had been written, published, and then legitimately cleaned up. Analytics
-cannot tell that apart from an event that was never written. That is why the check is a `WARNING`
-and why the retention window is now something an operator has to know in order to read the report.
+out where. The outbox is not retroactive: jobs submitted before the outbox existed have no events
+at all, and `published-retention-days` deletes the events of jobs that do. Either way a
+`SCHEDULE_USER_JOB` row can be absent for a job that was legitimately scheduled, and no query can
+tell that apart from an intent that was never recorded. On the validation database 18 scheduled
+jobs have no outbox row of any kind, every one of them created before the earliest surviving outbox
+event. What analytics *can* do is separate the ambiguous population from the unambiguous one — see
+section 7 — rather than reporting a single number that means two different things.
 
 ### 2. Why exports are immutable
 
@@ -181,7 +183,7 @@ with none of that: no lock, no audit, no coordination with the sweep that thinks
 problem. The two would race, and the audit log would stop being a complete account of who changed
 what.
 
-So the 19 checks produce counts, bounded sorted sample IDs, and descriptions. Every check emits a
+So the 20 checks produce counts, bounded sorted sample IDs, and descriptions. Every check emits a
 row **even at zero**, because a report where a check is absent is indistinguishable from one where
 the check did not run — and "we looked and found nothing" is a result worth recording.
 
@@ -190,10 +192,28 @@ two datasets are `WARNING` because a half-open window genuinely can separate a j
 attempts. Checks confined to one row — a negative duration, a `PUBLISHED` event with no
 `published_at` — are `ERROR` because no window can explain them.
 
-Three checks exist entirely because of a v0.1 decision. The schema carries no `CHECK` constraint
-over any enum column: `V1__initial_schema.sql` argues that the application enum is the source of
-truth and that a database constraint over an enum which gains values every other release is a
-migration burden that already caused one silent failure. That argument is still right, and its
+The schedule-event check is where that principle earned its keep, and it took two corrections to
+get right. The first version asked "does every job with `scheduled_at` set have a
+`SCHEDULE_USER_JOB` event", which is the wrong question: `JobSubmissionService` writes that event
+only when `scheduledAt` is still in the future, and a past timestamp is submitted immediately as
+`ENQUEUE_SUBMIT` while the column is still stored. Five jobs were flagged for missing an event the
+application was never supposed to write. The predicate is now `scheduled_at > created_at`, which is
+the faithful reconstruction of the branch the application actually took.
+
+The second correction is about what remains. Of the 18 jobs still flagged, all predate the earliest
+surviving outbox event, so the honest reading is "the outbox was not writing events for this job
+yet" rather than "the durable intent was lost". But that is an inference about *this* database, not
+a general one, and hard-coding it would be a rule that quietly stops being true. What generalises
+is a different question: does the job have any other outbox row? If it does, the outbox was
+demonstrably writing events for it, and neither age nor retention explains a missing schedule
+event. That is now a second check at `ERROR`, and it reports zero. Two numbers where there was one,
+because the single number was answering two questions at once and an operator had no way to know
+which.
+
+Three further checks exist entirely because of a v0.1 decision. The schema carries no `CHECK`
+constraint over any enum column: `V1__initial_schema.sql` argues that the application enum is the
+source of truth and that a database constraint over an enum which gains values every other release
+is a migration burden that already caused one silent failure. That argument is still right, and its
 stated cost was "nothing at the database level stops a bad value being written by something that is
 not this application". `jobs_invalid_status`, `attempts_invalid_outcome` and `outbox_invalid_status`
 are where that cost finally gets paid: analytics validates the enums the database declines to.
@@ -241,6 +261,21 @@ genuinely does get older, and freezing the number to make a diff clean would ans
 question. Everything downstream of it is stable, and `report` and `quality` take "now" from the
 export metadata rather than the wall clock, so re-reporting an old export tomorrow produces the
 numbers it produced the day it was taken.
+
+It is worth being precise about where that non-determinism lives, because the obvious reading of
+"one CSV differed" is that the aggregation is unstable, and it is not. The age is computed once, at
+extraction, and written into the export's Parquet. `report` reads it already frozen. Two report
+runs over the *same* export therefore produce all seven CSVs byte-identical, `outbox_summary.csv`
+included, with rows in the same order — verified, and now asserted by a test that compares raw
+bytes rather than sorted row sets. The difference only appears between two *exports*, which are two
+different observations of a live system and are supposed to differ in exactly that one column.
+
+One thing that is deliberately *not* claimed: byte-stable Parquet. Two writes of identical data
+differ by around twenty bytes, all of them Thrift field-header transpositions in the footer —
+parquet-mr does not emit metadata fields in a fixed order. Nothing in application code can control
+that, and no Parquet writer offers it. So the determinism guarantee is stated at the level it can
+actually be held: same rows, same order, same values, byte-identical CSV. Anyone verifying
+reproducibility should hash the CSVs or compare the rows, not the container.
 
 ### 10. Credential handling
 

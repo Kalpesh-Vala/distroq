@@ -17,7 +17,7 @@ PySpark transformations
     |
     +-- fact tables                    one row per job, attempt, event, action, effect, key
     +-- aggregate reports              daily, per job type, per priority, per event type
-    +-- data-quality report            19 checks that report and never repair
+    +-- data-quality report            20 checks that report and never repair
     |
     v
 Optional read-only API                 NOT IMPLEMENTED in v0.9 - batch analytics only
@@ -144,16 +144,24 @@ report.
 
 ### Data quality reports and never repairs
 
-19 checks run over the extracted facts. Every check emits a row **even when it finds nothing** — a
+20 checks run over the extracted facts. Every check emits a row **even when it finds nothing** — a
 report where a check is absent is indistinguishable from one where the check did not run.
 
 ```text
-   jobs_negative_duration                           ERROR         0
-   dead_lettered_jobs_without_dlq_row               ERROR         0
-   multiple_in_progress_attempts                    ERROR         0
- ! scheduled_jobs_missing_schedule_event            WARNING      23  0a8e49b5-..., 0b4ef385-...
- ! duplicate_idempotency_hashes_for_different_jobs  WARNING       2   629534ae..., 9c16e7e7...
+   jobs_negative_duration                                       ERROR     0
+   dead_lettered_jobs_without_dlq_row                           ERROR     0
+   multiple_in_progress_attempts                                ERROR     0
+   scheduled_jobs_missing_schedule_event_despite_other_events   ERROR     0
+ ! scheduled_jobs_missing_schedule_event                        WARNING  18
+ ! duplicate_idempotency_hashes_for_different_jobs              WARNING   2
 ```
+
+The two checks about schedule events are the same question asked at two confidence levels. A job
+scheduled into the future with no `SCHEDULE_USER_JOB` event may simply predate the outbox, or its
+event may have been deleted by retention — the broad `WARNING`. A job that has *other* outbox rows
+but no schedule event cannot be explained that way, because the outbox was demonstrably writing
+events for it — the narrow `ERROR`. Reporting only the broad number would have buried the second
+case inside the first.
 
 Reconciliation already exists and is the only thing allowed to change application state. An
 analytics job that "fixed" a row would be a second, unaudited writer racing it.
@@ -328,6 +336,16 @@ run 2:  2026-09-09,ENQUEUE_SUBMIT,10,6,3,0,1,1,372.833,648,831245
 unpublished event genuinely does get older. That is the one column in the whole pipeline that is
 defined relative to export time, and it is documented rather than frozen, because freezing it
 would make it useless for the question it exists to answer.
+
+Note where the non-determinism lives: it is in the **export**, not in the aggregation. `report` and
+`quality` read `age_at_export_ms` already frozen in the export's Parquet, so re-running them over
+one export is fully deterministic — two report runs over the same run directory produce all seven
+CSVs byte-identical, `outbox_summary.csv` included, with rows in the same order. Both properties
+are regression-tested.
+
+The Parquet files themselves are not byte-stable even when their contents are: parquet-mr emits
+Thrift footer metadata fields in a non-fixed order, so two writes of identical data differ by
+around twenty bytes in the footer. Compare rows or CSVs, not container bytes.
 
 ### Read-only guarantee
 
@@ -2882,12 +2900,16 @@ instance therefore pays for a `ZRANGEBYSCORE` per tick.
 > `coalesce(1)`, and the master is `local[*]`; all three are correct at this size and wrong at
 > scale. The available mitigation today is a smaller window.
 
-> **Outbox retention erases analytics history.** `published-retention-days` deletes published
-> outbox rows, and the analytics `scheduled_jobs_missing_schedule_event` check cannot distinguish
-> "the event was never written" from "the event was written, published, and later cleaned up". On
-> the validation database this produced 23 warnings for jobs whose schedule events had been
-> legitimately deleted. The check is a `WARNING` for exactly this reason, and an operator reading
-> it must know the retention window.
+> **A missing schedule event has three possible causes and analytics can only rule out one.**
+> A job scheduled into the future should have a `SCHEDULE_USER_JOB` outbox event. If it does not,
+> the cause is either that the job predates the outbox, or that its event was deleted by
+> `published-retention-days` cleanup, or that the durable intent was genuinely never written. The
+> first two are indistinguishable from each other in the data. What *is* distinguishable is
+> whether the job has any other outbox row at all: if it does, the outbox was demonstrably
+> writing events for that job and neither age nor retention explains the gap. That case is a
+> separate `ERROR` check; the broad one stays a `WARNING`. On the validation database the broad
+> check reports 18 jobs, all created before the earliest surviving outbox event, and the narrow
+> check reports zero.
 
 > **Window edges cut across relationships.** A job created just before `end` may have its attempts,
 > or its retry event, in the *next* window. Checks that span two datasets are therefore `WARNING`
@@ -2899,9 +2921,15 @@ instance therefore pays for a `ZRANGEBYSCORE` per tick.
 > An effect completed on a job's final attempt reports zero hits even though the ledger is exactly
 > what made a second increment impossible.
 
+> **Parquet files are not byte-stable; their contents are.** Two report runs over the same export
+> produce identical rows in identical order and byte-identical CSV copies, but the Parquet files
+> differ by around twenty bytes in the footer, because parquet-mr does not emit Thrift metadata
+> fields in a fixed order. Compare the data or the CSVs, not the container bytes.
+
 > **`age_at_export_ms` is not reproducible, on purpose.** Every other number in the pipeline is
 > byte-identical across reruns of the same window. This one moves with the clock, because the age
-> of an unpublished event is a live fact and freezing it would answer the wrong question.
+> of an unpublished event is a live fact and freezing it would answer the wrong question. It is
+> frozen *within* an export, so re-reporting one export is fully deterministic.
 
 > **Analytics reruns do not change execution semantics.** The pipeline is repeatable; the
 > application is still at-least-once, and a job may still execute more than once. Nothing in v0.9

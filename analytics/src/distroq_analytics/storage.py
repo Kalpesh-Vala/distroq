@@ -93,27 +93,19 @@ def read_json(path: Path) -> dict:
 
 
 def write_csv_preview(df: DataFrame, directory: Path, name: str, limit: int = 5_000) -> Path:
-    """Optional human-readable diagnostic output. Never the analytics interchange format."""
+    """Optional human-readable diagnostic output. Never the analytics interchange format.
+
+    Written by hand rather than through pandas so that the bytes depend only on the
+    rows: a pandas round-trip would reformat floats and nulls according to whichever
+    pandas version happened to be installed, and these files are compared byte for byte
+    to demonstrate that a rerun is reproducible.
+    """
     target = Path(directory) / f"{name}.csv"
-    rows = df.limit(limit).toPandas() if _has_pandas() else None
-    if rows is None:
-        collected = df.limit(limit).collect()
-        header = ",".join(df.columns)
-        lines = [header]
-        for row in collected:
-            lines.append(",".join(_csv_cell(row[column]) for column in df.columns))
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        rows.to_csv(target, index=False)
+    lines = [",".join(df.columns)]
+    for row in df.limit(limit).collect():
+        lines.append(",".join(_csv_cell(row[column]) for column in df.columns))
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return target
-
-
-def _has_pandas() -> bool:
-    try:
-        import pandas  # noqa: F401
-    except ImportError:
-        return False
-    return True
 
 
 def _csv_cell(value) -> str:

@@ -68,6 +68,15 @@ def _normalise(frame):
                   for row in frame.collect())
 
 
+def _file_order(frame):
+    """Rows as written, unsorted.
+
+    Stronger than `_normalise`: it catches a reordering that set comparison would miss,
+    which is what makes the CSV copies byte-comparable.
+    """
+    return [json.dumps(row.asDict(), sort_keys=True, default=str) for row in frame.collect()]
+
+
 class TestOverwriteRules:
     def test_existing_non_empty_directory_is_refused(self, tmp_path):
         target = tmp_path / "run"
@@ -129,6 +138,19 @@ class TestReportRerun:
             b = spark.read.parquet(str((tmp_path / "reports-2" / name).as_posix()))
             assert a.schema == b.schema
             assert _normalise(a) == _normalise(b)
+            # Row order too, not just row content: an aggregate written in a different
+            # order is still a different file to anything that diffs or hashes it.
+            assert _file_order(a) == _file_order(b), name
+
+    def test_csv_copies_are_byte_identical_across_report_runs(self, spark, tmp_path):
+        run_dir = _write_run(spark, tmp_path)
+        pipeline.run_report(spark, run_dir, tmp_path / "csv-1", csv_preview=True)
+        pipeline.run_report(spark, run_dir, tmp_path / "csv-2", csv_preview=True)
+
+        for name in (*report.AGGREGATE_DATASETS, "data_quality_summary"):
+            a = (tmp_path / "csv-1" / f"{name}.csv").read_bytes()
+            b = (tmp_path / "csv-2" / f"{name}.csv").read_bytes()
+            assert a == b, name
 
     def test_report_refuses_an_existing_output_directory(self, spark, tmp_path):
         run_dir = _write_run(spark, tmp_path)

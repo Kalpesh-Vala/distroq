@@ -132,23 +132,57 @@ def _expired_execution_lease(facts, now):
     )
 
 
-def _missing_event(facts, job_predicate, event_type: str) -> DataFrame:
-    events = (
+def _scheduled_ahead():
+    """The job was scheduled into the *future* at submission time.
+
+    ``JobSubmissionService`` emits ``SCHEDULE_USER_JOB`` only when ``scheduledAt`` is
+    still ahead of now; a past timestamp is submitted immediately as ``ENQUEUE_SUBMIT``
+    while ``scheduled_at`` is still stored on the row. Keying this check on
+    ``scheduled_at IS NOT NULL`` therefore demands an event the application was never
+    supposed to write, and did so five times on the validation database.
+    """
+    return F.col("scheduled_at").isNotNull() & (F.col("scheduled_at") > F.col("created_at"))
+
+
+def _events_of_type(facts, event_type: str) -> DataFrame:
+    return (
         facts["outbox_facts"]
         .filter(F.col("event_type") == event_type)
         .select(F.col("aggregate_id").alias("job_id"))
         .distinct()
     )
+
+
+def _missing_event(facts, job_predicate, event_type: str) -> DataFrame:
     return _ids(
         facts["job_facts"]
         .filter(job_predicate)
-        .join(events, on="job_id", how="left_anti"),
+        .join(_events_of_type(facts, event_type), on="job_id", how="left_anti"),
         "job_id",
     )
 
 
 def _scheduled_missing_schedule_event(facts, _now):
-    return _missing_event(facts, F.col("is_scheduled"), "SCHEDULE_USER_JOB")
+    return _missing_event(facts, _scheduled_ahead(), "SCHEDULE_USER_JOB")
+
+
+def _scheduled_missing_schedule_event_despite_other_events(facts, _now):
+    """The narrow, unambiguous case.
+
+    If the job has *any* outbox row, the outbox was demonstrably writing events for it,
+    so a missing schedule event is a real gap rather than a job that predates the
+    outbox or whose event was deleted by retention.
+    """
+    any_event = (
+        facts["outbox_facts"].select(F.col("aggregate_id").alias("job_id")).distinct()
+    )
+    return _ids(
+        facts["job_facts"]
+        .filter(_scheduled_ahead())
+        .join(_events_of_type(facts, "SCHEDULE_USER_JOB"), on="job_id", how="left_anti")
+        .join(any_event, on="job_id", how="left_semi"),
+        "job_id",
+    )
 
 
 def _retrying_missing_retry_event(facts, _now):
@@ -241,9 +275,16 @@ CHECKS: tuple[Check, ...] = (
           "Job still carries an execution lease whose deadline passed before the export ran.",
           _expired_execution_lease),
     Check("scheduled_jobs_missing_schedule_event", SEVERITY_WARNING,
-          "A job with scheduled_at set has no SCHEDULE_USER_JOB outbox event in this window. "
-          "This is the durable-intent gap reconciliation exists to find.",
+          "A job scheduled into the future has no SCHEDULE_USER_JOB outbox event in this "
+          "window. Ambiguous on its own: the job may predate the outbox, or its event may have "
+          "been deleted by published-retention cleanup. See "
+          "scheduled_jobs_missing_schedule_event_despite_other_events for the unambiguous case.",
           _scheduled_missing_schedule_event),
+    Check("scheduled_jobs_missing_schedule_event_despite_other_events", SEVERITY_ERROR,
+          "A job scheduled into the future has other outbox events but no SCHEDULE_USER_JOB. "
+          "The outbox was writing events for this job, so neither age nor retention explains "
+          "the gap; this is the durable-intent failure reconciliation exists to find.",
+          _scheduled_missing_schedule_event_despite_other_events),
     Check("retry_jobs_missing_retry_event", SEVERITY_WARNING,
           "A RETRYING job has no SCHEDULE_RETRY outbox event in this window.",
           _retrying_missing_retry_event),

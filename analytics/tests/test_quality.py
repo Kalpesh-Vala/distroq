@@ -171,6 +171,49 @@ class TestChecksDetectBadFixtures:
         }])["scheduled_jobs_missing_schedule_event"]
         assert found.count == 1
 
+    def test_past_dated_scheduled_at_is_not_expected_to_have_a_schedule_event(self, spark):
+        # scheduledAt behind created_at means the application submitted the job immediately
+        # as ENQUEUE_SUBMIT and never wrote a SCHEDULE_USER_JOB event for it.
+        found = findings_by_name(spark, jobs=[{
+            "job_id": "immediate", "status": "SUCCEEDED",
+            "created_at": ts("2026-09-01T10:00:00Z"),
+            "scheduled_at": ts("2026-08-01T10:00:00Z"),
+            "started_at": ts("2026-09-01T10:00:01Z"),
+            "finished_at": ts("2026-09-01T10:00:02Z"),
+        }])
+        assert found["scheduled_jobs_missing_schedule_event"].count == 0
+        assert found["scheduled_jobs_missing_schedule_event_despite_other_events"].count == 0
+
+    def test_job_with_no_outbox_rows_is_only_the_ambiguous_warning(self, spark):
+        found = findings_by_name(spark, jobs=[{
+            "job_id": "pre-outbox", "status": "SCHEDULED",
+            "created_at": ts("2026-09-01T10:00:00Z"),
+            "scheduled_at": ts("2026-09-05T10:00:00Z"),
+            "started_at": None, "finished_at": None,
+        }])
+        assert found["scheduled_jobs_missing_schedule_event"].count == 1
+        assert found["scheduled_jobs_missing_schedule_event_despite_other_events"].count == 0
+
+    def test_job_with_other_events_but_no_schedule_event_escalates_to_error(self, spark):
+        found = findings_by_name(
+            spark,
+            jobs=[{"job_id": "gap", "status": "SCHEDULED",
+                   "created_at": ts("2026-09-01T10:00:00Z"),
+                   "scheduled_at": ts("2026-09-05T10:00:00Z"),
+                   "started_at": None, "finished_at": None}],
+            outbox_events=[{
+                "event_id": "e1", "aggregate_id": "gap",
+                "event_type": "ENQUEUE_SUBMIT", "status": "PUBLISHED",
+                "created_at": ts("2026-09-01T10:00:00Z"),
+                "available_at": ts("2026-09-01T10:00:00Z"),
+                "published_at": ts("2026-09-01T10:00:00.100Z"),
+            }],
+        )
+        narrow = found["scheduled_jobs_missing_schedule_event_despite_other_events"]
+        assert found["scheduled_jobs_missing_schedule_event"].count == 1
+        assert narrow.count == 1
+        assert narrow.severity == quality.SEVERITY_ERROR
+
     def test_scheduled_job_with_its_event_is_clean(self, spark):
         found = findings_by_name(
             spark,

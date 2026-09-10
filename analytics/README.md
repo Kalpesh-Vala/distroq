@@ -205,6 +205,16 @@ Pass --overwrite to replace this directory, or choose a different --output.
 get older between two exports. Every count, latency and percentile is byte-identical
 across reruns; that one column moves by the elapsed time and nothing else.
 
+The age is frozen *inside* an export, so the instability belongs to `export` alone. Two
+`report` runs over the same run directory produce all seven CSVs byte-identical,
+`outbox_summary.csv` included, with rows in the same order. Both properties are
+regression-tested.
+
+Parquet files are not byte-stable even when their contents are: parquet-mr emits Thrift
+footer metadata fields in a non-fixed order, so two writes of identical data differ by
+around twenty bytes in the footer. Verify reproducibility by hashing the CSVs or
+comparing rows, not the container bytes.
+
 `report` and `quality` take "now" from `export_metadata.json` rather than the wall
 clock, so re-reporting last month's export tomorrow produces the numbers it produced
 the day it was taken.
@@ -277,7 +287,7 @@ source.
 
 ## Data quality
 
-19 checks, each emitting a row **even at zero** — a report where a check is absent is
+20 checks, each emitting a row **even at zero** — a report where a check is absent is
 indistinguishable from one where the check did not run.
 
 Each finding carries `check_name`, `severity`, `count`, `sample_ids`, `description`.
@@ -287,6 +297,17 @@ identical samples.
 Severity is `ERROR`, `WARNING` or `INFO`. Checks that are sensitive to the window edge —
 a job created just before `end` whose attempts fall in the next window — are `WARNING`
 by construction, not because they matter less.
+
+Two checks ask the same question at different confidence levels. A job scheduled into the
+future with no `SCHEDULE_USER_JOB` event is a `WARNING`, because the job may predate the
+outbox or its event may have been deleted by `published-retention-days` cleanup, and
+nothing in the data distinguishes those. The same job with *other* outbox rows is an
+`ERROR`: the outbox was demonstrably writing events for it, so neither age nor retention
+explains the gap.
+
+A job whose `scheduled_at` is *behind* its `created_at` is not checked at all. The
+application submits it immediately as `ENQUEUE_SUBMIT` and never writes a schedule event,
+so demanding one is a false positive.
 
 Three checks exist because the schema deliberately carries **no CHECK constraint** over
 its enum columns (see `V1__initial_schema.sql`): `jobs_invalid_status`,
@@ -326,7 +347,7 @@ docker compose --profile analytics run --rm --entrypoint python analytics `
   -m pytest /opt/distroq-analytics/tests -q
 ```
 
-159 tests covering window semantics, fact transformations, aggregations, percentiles,
+163 tests covering window semantics, fact transformations, aggregations, percentiles,
 data-quality detection, rerun behaviour, exit codes and credential handling. The suite
 takes several minutes: it exercises real Spark jobs rather than mocks, and Spark's
 per-query overhead dominates at this data size.
