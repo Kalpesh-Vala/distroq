@@ -1,4 +1,72 @@
-# DistroQ v0.9
+# DistroQ v1.1
+
+v1.1 adds a read-only operations dashboard over the queue, worker, outbox, reconciliation, job,
+DLQ, analytics, and runtime state that DistroQ already owns. The UI is served at `/dashboard/`;
+its backend-for-frontend is under `/api/dashboard/**` and requires the same administrative bearer
+token as `/api/admin/**`.
+
+The dashboard is deliberately not an administrative console. Its API has GET routes only, a
+servlet filter rejects every other HTTP method with `405 Method Not Allowed`, and its browser
+bundle contains no retry, replay, repair, cleanup, or other mutation call. Those actions remain on
+the audited administrative API, where `X-Admin-Reason` and `reliability_actions` still apply.
+
+## Dashboard
+
+The available views are Overview, Queues, Workers, Outbox, Reconciliation, Jobs, Job Detail, DLQ,
+Analytics, and System. Each independently loaded section reports one of `AVAILABLE`,
+`UNAVAILABLE`, or `NOT_CONFIGURED`; a PostgreSQL, Redis, health, or analytics failure therefore
+does not turn unknown data into zero or blank the rest of the page. Previously loaded data remains
+visible and marked stale while polling backs off.
+
+The browser prompts for the administrative token at runtime, keeps it in `sessionStorage`, and
+sends it only as `Authorization: Bearer ...` to `/api/dashboard/**`. The static bundle is public
+and contains no token or environment-derived credential. `sessionStorage` limits persistence, but
+it does not protect a token from script executing in the same origin. Production deployments
+should put the dashboard behind an identity-aware proxy or SSO and restrict who can reach it; see
+`SECURITY.md`.
+
+### Build and run
+
+The frontend and backend are intentionally separate builds. Maven does not download Node or run
+npm, and Vite does not package the Java application.
+
+```powershell
+cd dashboard
+npm ci
+npm test
+npm run build
+cd ..
+
+.\mvnw.cmd clean package
+java -jar target\distroq-1.1.0.jar
+```
+
+By default Spring serves `dashboard/dist` at `/dashboard/`, including SPA fallbacks such as
+`/dashboard/jobs`. For a deployment that keeps the bundle elsewhere, set
+`DISTROQ_DASHBOARD_STATIC_PATH` to the directory containing `index.html`. To ship the UI inside the
+fat jar, copy the built files to `src/main/resources/static/dashboard/` before running Maven.
+
+The dashboard API routes are:
+
+```text
+GET /api/dashboard/overview       GET /api/dashboard/queues
+GET /api/dashboard/workers        GET /api/dashboard/outbox
+GET /api/dashboard/reconciliation GET /api/dashboard/jobs
+GET /api/dashboard/jobs/{jobId}   GET /api/dashboard/dlq
+GET /api/dashboard/analytics      GET /api/dashboard/system
+GET /api/dashboard/activity
+```
+
+Analytics is not recomputed by the application. The Analytics view reads existing v0.9 export
+reports beneath `distroq.dashboard.analytics-directory` (default `analytics/output`) and identifies
+the selected run and UTC window. With no export, it reports `NOT_CONFIGURED`; it never invents an
+empty report and never starts Spark or writes analytics output.
+
+The polling, page-size, cache, recent-window, analytics-directory, and static-path budgets are
+under `distroq.dashboard` in `application.yml`. Requested table pages are capped server-side at
+`max-page-size`.
+
+## Historical: v0.9 analytics
 
 v0.9 is the analytics release. Everything through v0.8 was about making the *present* correct and
 legible: what is queued, what is running, what failed, what an operator did about it. v0.9 asks a
@@ -3381,7 +3449,7 @@ instance therefore pays for a `ZRANGEBYSCORE` per tick.
 Deliberately out of scope for v0.9:
 
 - An analytics HTTP API (`GET /api/analytics/*`); v0.9 is batch analytics only
-- A dashboard UI, WebSockets, and live streaming analytics
+- WebSockets and live streaming analytics; v1.1 reads completed v0.9 exports
 - Kafka or another event broker
 - Incremental or append-only analytics; every run re-extracts its whole window
 - Automatic scheduling of exports
@@ -3390,11 +3458,10 @@ Deliberately out of scope for v0.9:
 
 Still out of scope, from v0.8:
 
-- Authentication and authorization for the administrative endpoints
 - Exactly-once execution of arbitrary external side effects
 - Automatic retry of unknown external API calls
 - Automatic deletion of terminal outbox events
-- A dashboard UI and WebSockets
+- WebSockets
 - Cron and recurring jobs
 - Job cancellation, rescheduling, and priority mutation after submission
 - Bulk DLQ replay and automatic replay

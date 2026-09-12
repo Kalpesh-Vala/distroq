@@ -49,9 +49,16 @@ public class AdminAuthenticationFilter extends OncePerRequestFilter {
      * {@code /api/idempotency} is in here with the admin endpoints on purpose. A key is chosen by
      * the submitter and is often a customer or order identifier, so an open lookup is both an
      * enumeration oracle and a way to read back someone else's job.
+     *
+     * <p>{@code /api/dashboard} joined the list in v1.1. It is read-only, but it is read-only
+     * across the whole system at once — queue depths, lease owners, outbox failures and
+     * reconciliation findings in one place — and an aggregate of otherwise-scattered operational
+     * detail is exactly the thing that should not be anonymous. The static bundle at
+     * {@code /dashboard/} is deliberately not protected: it contains no data and no credentials,
+     * and every byte it renders comes from a call that is.
      */
     private static final List<String> PROTECTED_PREFIXES =
-            List.of("/api/admin", "/api/idempotency");
+            List.of("/api/admin", "/api/idempotency", "/api/dashboard");
 
     private final ApiErrors errors;
     private final boolean enabled;

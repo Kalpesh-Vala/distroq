@@ -1,6 +1,6 @@
 # Security notes
 
-What DistroQ v1.0 protects, what it does not, and what an operator has to provide from outside.
+What DistroQ v1.1 protects, what it does not, and what an operator has to provide from outside.
 
 This document is deliberately explicit about the gaps. A release that describes its own security
 posture vaguely is one that gets deployed on the assumption it has more of it than it does.
@@ -31,6 +31,24 @@ It does **not** defend against:
 ---
 
 ## Administrative authentication
+
+The same bearer token also guards every GET endpoint under `/api/dashboard/**`. The dashboard API
+is separately constrained to read methods: POST, PUT, PATCH, and DELETE are rejected with 405, and
+all audited mutations remain under `/api/admin/**`.
+
+The `/dashboard/**` HTML, CSS, and JavaScript files are public static resources. The bundle contains
+no token. An operator enters the token at runtime, and the UI stores it in `sessionStorage` for the
+tab and sends it only in the Authorization header. This avoids a persistent local credential and
+prevents build-time publication, but it does not protect against same-origin script execution or a
+compromised browser. Put the dashboard behind an identity-aware proxy or SSO, terminate TLS, and
+limit it to an operations network. Do not supply an admin token through a `VITE_*` variable: Vite
+substitutes those values into public JavaScript.
+
+Where supported, let the identity-aware proxy retain the application credential server-side and
+authenticate the browser with an HttpOnly, Secure session cookie, appropriate SameSite policy,
+and CSRF protection. This is deployment guidance, not a session mechanism implemented by DistroQ.
+Never put bearer tokens in URLs or `localStorage`. The current `sessionStorage` fallback is for
+local development and does not prevent the browser user or a compromised session from reading it.
 
 ### What it is
 

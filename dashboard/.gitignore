@@ -1,0 +1,14 @@
+# Build output. Reproducible from source with `npm ci && npm run build`, and committing it would
+# put generated JavaScript in every diff.
+dist/
+node_modules/
+
+# Vite and Vitest scratch
+.vite/
+coverage/
+*.local
+
+# Never. A .env here would be substituted into the bundle at build time, which is how a token
+# becomes public. See README.md.
+.env
+.env.*

@@ -3,6 +3,108 @@
 Running log of known limitations, failure modes observed, and design decisions.
 Written for my own reference and interview prep.
 
+## What v1.1 changed about the plan
+
+### 1. The dashboard is an observer, not another control plane
+
+The tempting version of an operations dashboard puts a Retry button beside a failed row. DistroQ
+already has a place for retry, replay, repair, and cleanup: `/api/admin/**`, with a required reason
+and a durable `reliability_actions` record. Reimplementing those calls in a browser would create a
+second mutation surface and make a page that polls every five seconds capable of changing the
+system it measures.
+
+v1.1 therefore exposes GET routes only under `/api/dashboard/**`, and a servlet filter enforces the
+boundary even if a mutating controller annotation is added later. The UI contains no generic HTTP
+client and no mutation affordance. It can describe what an operator may need to do; it cannot do
+it for them.
+
+### 2. Unknown is not zero
+
+The dashboard joins facts from PostgreSQL, Redis, health probes, runtime metadata, and completed
+analytics exports. Those dependencies do not fail together. Every panel is consequently a
+`Section<T>` with `AVAILABLE`, `UNAVAILABLE`, or `NOT_CONFIGURED`, rather than one all-or-nothing
+response and rather than nullable fields that the UI might render as zero.
+
+The distinction matters most for Redis. Stream length is retained history, pending entries are
+delivered but unacknowledged work, and executable backlog is group lag plus pending work. Redis
+consumer ownership is also not PostgreSQL lease ownership. The UI labels and reports these as
+separate facts instead of collapsing convenient numbers into a false queue depth or worker count.
+
+### 3. A runtime token is still a browser credential
+
+Putting `DISTROQ_ADMIN_TOKEN` in a Vite variable would publish it in JavaScript. v1.1 prompts at
+runtime and stores the token in `sessionStorage`, so it disappears with the tab and never enters
+the bundle. That improves accidental persistence; it does not make browser storage a vault. Any
+script running on the same origin can read it.
+
+The production answer is an identity-aware proxy or SSO boundary in front of the dashboard, with
+the application token handled outside browser code where the platform permits. The shared bearer
+token remains a role credential, not verified operator identity.
+
+### 4. Historical analytics stays historical
+
+The Analytics view reads the report files v0.9 already produced. It does not start Spark, schedule
+exports, query raw analytics facts in the request path, or write output. A missing export is
+`NOT_CONFIGURED`; a broken export is `UNAVAILABLE`; an empty measured window remains valid data.
+Those are three different operational statements and the UI preserves all three.
+
+### 5. Live acceptance on 2026-09-11: not ready for review
+
+The packaged `distroq-1.1.0.jar` started with the production profile against the local Compose
+PostgreSQL and Redis services. Both dependencies were healthy. These measurements are from a
+small, idle development dataset, not a load test or proof for active workloads.
+
+- Missing bearer token: `GET /api/dashboard/overview` returned 401. With the acceptance token,
+  all ten top-level dashboard API routes and an existing job detail returned 200.
+- HTTP success alone hid a defect: default Jobs and Outbox requests returned their primary
+  sections as `UNAVAILABLE`. Supplying `?sort=createdAt` made both `AVAILABLE`. Their immutable
+  sort allowlists call `contains(null)` when the optional sort is omitted; the default path needs
+  a null-safe fallback and regression coverage.
+- Spring returned 404 for `/dashboard/`, but 200 for `/dashboard/index.html` and `/dashboard/jobs`.
+  The root static-resource route needs a regression test and a fix. Vite preview did not expose
+  this deployment-specific defect.
+- Using `/dashboard/index.html`, Playwright visited and reloaded Overview, Queues, Workers,
+  Outbox, Reconciliation, Jobs, DLQ, Analytics, System, and an existing Job Detail page. All
+  page-specific API responses returned 200; the list UIs supplied explicit sort values.
+- An authenticated POST to `/api/dashboard/overview` returned 405 with the standard error body
+  and `Allow: GET, HEAD, OPTIONS`.
+
+The seven table counts below, and fingerprints of every complete row in those tables, matched
+before and after dashboard use and again after dependency recovery:
+
+| Table | Before | After |
+|---|---:|---:|
+| jobs | 104 | 104 |
+| job_attempts | 151 | 151 |
+| outbox_events | 44 | 44 |
+| dead_letters | 8 | 8 |
+| reliability_actions | 41 | 41 |
+| job_effects | 8 | 8 |
+| idempotency_keys | 25 | 25 |
+
+Redis retained the same three non-expiring stream keys. Every stream remained length zero, with
+zero pending entries, last-delivered ID `0-0`, zero lag, and ten consumers. Serialized stream
+fingerprints changed while live workers polled; these fingerprints include consumer metadata and
+are not evidence that the dashboard mutated transport state. No pending-entry acknowledgement
+was observed, but the pending lists were empty: a non-empty pending-list test remains necessary.
+
+Partial-failure checks used the live Workers API:
+
+- Redis paused: HTTP 200 in about 5 seconds; totals and leases stayed `AVAILABLE`, consumers and
+  pending entries became `UNAVAILABLE`. Redis was unpaused without losing its in-memory data.
+- PostgreSQL stopped: HTTP 200 in about 10 seconds; totals and leases became `UNAVAILABLE`,
+  consumers and pending entries stayed `AVAILABLE`. PostgreSQL was restarted with its volume intact.
+- After recovery, all four sections returned `AVAILABLE` and both containers were healthy.
+
+Browser outage rendering was not verified because the shared browser page became unavailable.
+The production database-outage response also approaches the frontend's request budget; an API
+partial response is not by itself proof that the browser displays it successfully.
+
+The preview listener on 4173 was stopped. `git diff --check` passed. The current branch was
+`v1.1-dashboard` with uncommitted implementation files; HEAD remained the existing `v1.0.0` commit
+`c309bef`. No v1.1 commit, merge, or tag was created. The root-route and default-sort defects,
+remaining browser/pending-entry checks, and dirty worktree block the milestone from review.
+
 ## What v1.0 changed about the plan
 
 ### 1. Why v1.0 is a hardening release

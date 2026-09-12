@@ -169,3 +169,24 @@ distroq:
     job-type-tag: true
     max-job-type-tags: 20
     database-gauge-cache-ms: 5000
+  # v1.1 read-only operations dashboard. None of these change queue, worker, retry or
+  # reconciliation behaviour - they are the dashboard's own budgets.
+  dashboard:
+    enabled: true
+    # advertised to the browser; the user can slow it down but the server does not poll itself
+    refresh-interval-ms: 5000
+    default-page-size: 50
+    # a hard ceiling applied after the requested size, so no caller can ask for the whole table
+    max-page-size: 200
+    max-activity-events: 100
+    # how far back "recent throughput" looks
+    recent-window-ms: 86400000
+    # a reconciliation preview takes an advisory lock and scans five categories; a browser
+    # polling every five seconds must not turn that into a per-poll cost
+    reconciliation-cache-ms: 30000
+    analytics-cache-ms: 60000
+    # v0.9 export output, read only. Never written to by this application.
+    analytics-directory: analytics/output
+    # a built frontend bundle to serve at /dashboard/, or blank to serve none
+    static-path: ${DISTROQ_DASHBOARD_STATIC_PATH:dashboard/dist}
+    lease-warning-ms: 5000

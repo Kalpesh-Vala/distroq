@@ -43,6 +43,20 @@ class AdminAuthenticationFilterTest {
     }
 
     @Test
+    void theReadOnlyDashboardApiIsProtectedToo() {
+        // read-only, but read-only across the whole system at once; see the class comment
+        assertThat(AdminAuthenticationFilter.isProtected("/api/dashboard")).isTrue();
+        assertThat(AdminAuthenticationFilter.isProtected("/api/dashboard/overview")).isTrue();
+        assertThat(AdminAuthenticationFilter.isProtected("/api/dashboard/jobs/abc")).isTrue();
+    }
+
+    @Test
+    void theDashboardBundleItselfIsNotProtectedBecauseItHoldsNoData() {
+        assertThat(AdminAuthenticationFilter.isProtected("/dashboard/")).isFalse();
+        assertThat(AdminAuthenticationFilter.isProtected("/dashboard/assets/index.js")).isFalse();
+    }
+
+    @Test
     void ordinaryJobEndpointsAreNotProtected() {
         assertThat(AdminAuthenticationFilter.isProtected("/api/jobs")).isFalse();
         assertThat(AdminAuthenticationFilter.isProtected("/api/dlq")).isFalse();
