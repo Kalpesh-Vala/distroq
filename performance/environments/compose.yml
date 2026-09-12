@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: benchmark
+      POSTGRES_USER: benchmark
+      POSTGRES_PASSWORD: ${BENCH_DB_PASSWORD:?Run Start-Isolated.ps1}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U benchmark -d benchmark']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDISCLI_AUTH: ${BENCH_REDIS_PASSWORD:?Run Start-Isolated.ps1}
+    command: [sh, -c, 'exec redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --requirepass "$$REDISCLI_AUTH"']
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1g
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: distroq-benchmark:4f31ada
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: production
+      DISTROQ_DB_URL: jdbc:postgresql://postgres:5432/benchmark
+      DISTROQ_DB_USER: benchmark
+      DISTROQ_DB_PASSWORD: ${BENCH_DB_PASSWORD:?Run Start-Isolated.ps1}
+      DISTROQ_REDIS_HOST: redis
+      DISTROQ_REDIS_PASSWORD: ${BENCH_REDIS_PASSWORD:?Run Start-Isolated.ps1}
+      DISTROQ_ADMIN_TOKEN: ${BENCH_ADMIN_TOKEN:?Run Start-Isolated.ps1}
+      DISTROQ_WORKER_CONCURRENCY: ${BENCH_WORKERS:-1}
+    ports:
+      - '127.0.0.1:${BENCH_PORT:-18080}:8080'
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    stop_grace_period: 90s
+    mem_limit: 1g
+    cpus: 2
+volumes:
+  pgdata:
+  redisdata:

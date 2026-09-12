@@ -1,0 +1,8 @@
+{
+  "name": "distroq-performance-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test scripts/capacity-analysis.test.mjs" },
+  "dependencies": { "csv-parse": "6.1.0" }
+}
