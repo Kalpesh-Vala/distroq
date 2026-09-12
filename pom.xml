@@ -12,7 +12,7 @@
 	<artifactId>distroq</artifactId>
 	<!-- The single source of truth for the version. build-info.properties and /actuator/info
 	     are both generated from it, and analytics reads it out of this file. -->
-	<version>1.0.0</version>
+	<version>1.1.0</version>
 	<name>distroq</name>
 	<description>Distributed job queue with at-least-once delivery, priorities and a transactional outbox</description>
 	<url/>

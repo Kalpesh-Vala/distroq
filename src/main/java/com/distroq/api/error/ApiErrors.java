@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.Map;
 
 /**
  * Builds the standard error body, and writes it straight to the response for the callers that
@@ -36,6 +37,16 @@ public class ApiErrors {
 
     public void write(HttpServletRequest request, HttpServletResponse response, ErrorCode code,
                       String message) throws IOException {
+        write(request, response, code, message, Map.of());
+    }
+
+    /**
+     * @param headers headers the response must carry, applied after the reset. {@code reset()}
+     *                clears everything already set, so a caller that needs {@code Allow} on a 405
+     *                has to hand it over rather than set it beforehand and hope.
+     */
+    public void write(HttpServletRequest request, HttpServletResponse response, ErrorCode code,
+                      String message, Map<String, String> headers) throws IOException {
         if (response.isCommitted()) {
             return;
         }
@@ -43,6 +54,7 @@ public class ApiErrors {
         response.setStatus(code.status().value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding("UTF-8");
+        headers.forEach(response::setHeader);
         if (code == ErrorCode.UNAUTHORIZED) {
             // RFC 9110: a 401 must say how to authenticate. The realm carries no secret.
             response.setHeader("WWW-Authenticate", "Bearer realm=\"distroq-admin\"");

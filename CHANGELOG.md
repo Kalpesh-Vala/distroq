@@ -8,6 +8,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from v1.0.0 o
 
 ---
 
+## [1.1.0] — unreleased
+
+A read-only operations dashboard for inspecting DistroQ without creating a second control plane.
+Queue and worker transport state comes from Redis, durable job and reliability state comes from
+PostgreSQL, analytics comes from completed v0.9 exports, and dependency failures remain visible as
+unavailable sections rather than misleading zeroes.
+
+### Added
+
+- A React/TypeScript dashboard at `/dashboard/` with Overview, Queues, Workers, Outbox,
+  Reconciliation, Jobs, Job Detail, DLQ, Analytics, and System views.
+- Eleven GET-only endpoints under `/api/dashboard/**`, protected by the existing administrative
+  bearer token and backed by bounded queries and explicit `AVAILABLE`, `UNAVAILABLE`, and
+  `NOT_CONFIGURED` section states.
+- Non-overlapping polling with cancellation, timeout, exponential backoff, manual refresh, and
+  stale-data retention.
+- Safe runtime, health, queue, lease, throughput, activity, and completed analytics-export views.
+  DTOs omit job and outbox payloads by construction, and health failures do not expose raw errors.
+- V8 read indexes for the timestamp and outcome queries used by polling views.
+
+### Security
+
+- The browser bundle contains no administrative token or build-time credential. Operators enter
+  the token at runtime; it is held in `sessionStorage` and sent only in the Authorization header.
+- A read-only filter rejects POST, PUT, PATCH, and DELETE below `/api/dashboard/**` with 405. Retry,
+  replay, repair, and cleanup remain on the reason-bearing, audited `/api/admin/**` surface.
+- The static `/dashboard/**` bundle is public. Deployments should restrict it with an
+  identity-aware proxy or SSO because same-origin script execution can read session storage.
+
+### Database
+
+V8 adds six indexes and no tables, columns, or data changes. Ordinary Flyway index creation can
+block writes while each index is built; large production tables should prebuild the indexes with
+`CREATE INDEX CONCURRENTLY IF NOT EXISTS` before deploying. See `UPGRADE.md`.
+
+### Limitations
+
+- The dashboard polls; it does not use WebSockets or provide a live event stream.
+- Analytics displays completed v0.9 exports and does not run or schedule the analytics pipeline.
+- The shared bearer token is still a role credential, not a user identity.
+
 ## [1.0.0] — unreleased
 
 The first release intended to be operated rather than demonstrated. No new queue mechanism, no new

@@ -1,3 +1,70 @@
+# Upgrading to v1.1
+
+From v1.0. Earlier versions should first follow the v1.0 procedure below.
+
+**Summary: no API break, one additive index migration, and an optional separately built browser
+bundle.** Existing job, worker, outbox, reconciliation, and administrative behavior is unchanged.
+
+## Build and deployment
+
+Build the dashboard before starting the application if this deployment will serve it from the
+working tree:
+
+```powershell
+cd dashboard
+npm ci
+npm test
+npm run build
+cd ..
+
+.\mvnw.cmd clean package
+java -jar target\distroq-1.1.0.jar
+```
+
+Maven and npm remain independent. The default external bundle path is `dashboard/dist`; override
+it with `DISTROQ_DASHBOARD_STATIC_PATH`. A bundle copied to
+`src/main/resources/static/dashboard/` before `mvn package` is included in the jar instead.
+
+The static `/dashboard/**` route is public, while every `/api/dashboard/**` request requires the
+existing administrative bearer token. No new credential is required. Operators enter that token
+in the browser at runtime; it is not a Vite environment variable and must not be embedded during
+the build. See `SECURITY.md` before exposing the dashboard beyond a trusted operations network.
+
+## Database: V8 read indexes
+
+V8 adds six indexes used by dashboard polling and changes no table, column, or row. On small and
+moderate databases, let Flyway apply `V8__dashboard_read_indexes.sql` normally.
+
+PostgreSQL's ordinary `CREATE INDEX` blocks writes to the indexed table while it runs. On large
+production tables, create the indexes concurrently before deploying v1.1:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_updated_at ON jobs (updated_at DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_started_at ON jobs (started_at DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_finished_at ON jobs (finished_at DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_job_attempts_outcome_finished
+    ON job_attempts (outcome, finished_at DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_outbox_published_at
+    ON outbox_events (published_at DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_outbox_created_at
+    ON outbox_events (created_at DESC);
+```
+
+Run each statement outside a transaction and verify every index is valid. Flyway's later
+`CREATE INDEX IF NOT EXISTS` statements then become no-ops and record V8 normally.
+
+## Dashboard behavior
+
+- Only GET is accepted under `/api/dashboard/**`; other methods return 405.
+- Missing PostgreSQL, Redis, health, or analytics inputs affect their own sections without making
+  available sections disappear.
+- Analytics reads completed v0.9 exports from `distroq.dashboard.analytics-directory`; no export
+  appears as `NOT_CONFIGURED`, and the application never runs or writes the pipeline.
+- Retry, replay, repair, cleanup, cancellation, rescheduling, and priority mutation are not
+  dashboard features. Existing audited administrative endpoints remain the mutation boundary.
+
+---
+
 # Upgrading to v1.0
 
 From v0.9. Earlier versions should be upgraded through each intermediate release, because each one
