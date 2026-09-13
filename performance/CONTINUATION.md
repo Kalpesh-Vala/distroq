@@ -1,5 +1,59 @@
 # Resume Only the Missing Calibration Repeats
 
+## One Authorized Replacement C1
+
+The first C1-repeat `20260913T073143534Z-CAL-C1-repeat-73706008` is immutable and INVALID from
+authoritative host-total contention. A single explicitly authorized replacement is now permitted.
+Use this command instead of the older continuation command below:
+
+```powershell
+Set-Location D:\github\distroq; .\performance\scripts\Continue-TelemetryCalibration.ps1 -Project distroq-bench-20260912123428-f8051a -AuthorizeReplacementC1 -ExclusiveHostConfirmed
+```
+
+`-ExclusiveHostConfirmed` explicitly confirms ALL of: AC connected; sleep and hibernation disabled;
+VS Code, browsers and Task Manager closed; no dashboard clients; no unrelated load generator; and
+ordinary Defender/indexing activity allowed to settle naturally. No security service, indexing,
+SmartScreen, updates or OS protection may be disabled to pass this test. The flags do not waive
+measured CPU, power, attribution, lifecycle, no-job-state or evidence gates.
+
+The command without `-AuthorizeReplacementC1` continues to refuse a C1 rerun. Both flags are
+required for live launch; use `-AuthorizeReplacementC1 -CheckOnly` for the read-only preflight.
+The descriptor pins the exact invalid C1 manifest, its historical continuation review, the prior
+descriptor and old tooling commit. The new descriptor's commit becomes the required tooling pin.
+The migration accepts only that known prior state and writes it into a sealed correction review
+before atomically updating the ignored progress file. The old invalid attempt remains in
+`priorC1Attempts` and is never deleted or reclassified.
+
+Progress adds `invalidC1RepeatRunId`, `replacementAuthorized`, `replacementAttempted`,
+`replacementRunId`, `replacementVerdict`, `c2RepeatAttempted`, `c2RepeatRunId` and
+`finalAuthorization`. The replacement-attempted flag is flushed BEFORE a new capture directory is
+created. Its new run label is C1-replacement, not C1-repeat. An attempted invalid/incomplete/reserved
+replacement refuses another automatic local attempt. A completed valid replacement may resume
+the still-missing C2 once, retaining the consumed replacement budget.
+
+Budgets are reset once for this explicit authorization only: at most three references before the
+replacement, one replacement C1, three references before C2, one C2. All failed references remain
+listed. References use the same limits and 60-second cooldown. C1 must pass capture validity AND
+the approved mean/p95/gap comparison against original C1 before C2 can start. C2 uses the same
+comparison against original C2. A valid raw capture with failed repeatability remains recorded as
+such; the continuation evaluation is INVALID, without rewriting its raw capture verdict.
+
+Host contention now yields `P1_BLOCKED_UNSTABLE_HOST` for an invalid repeat, rather than the earlier
+generic incomplete-telemetry classification. Telemetry errors retain their separate category;
+failed repeatability yields `P1_BLOCKED_NO_REPEATABLE_COLLECTOR`. If this replacement fails from
+host contention, the local replacement budget is exhausted: move the performance campaign to a
+dedicated VM or separate machine. No further local replacement is authorized automatically.
+
+A superseding compact review states: "Required telemetry was complete. The run failed the
+authoritative host-total mean CPU gate. Therefore the correct category is unstable host, not
+incomplete telemetry." It includes original IDs, evidence, original/corrected values, timestamp,
+tooling commit and explicit non-rewrite statement. The original review remains byte-for-byte intact.
+
+The same exit codes below apply (21 invalid replacement C1, 23 invalid C2, 43 already attempted).
+Cause-aware P1 status in final JSON provides the distinction. No original C1/C2/C3 or invalid repeat
+is rerun; no P1/P2 starts. First replacement execution remains an operator-run, standalone runtime
+validation after review, not an execution performed inside an active Copilot session.
+
 This launcher reuses the immutable campaign named in environments/continuation.json. It cannot
 execute original C1, C2 or C3 labels and never starts P1/P2. It is prepared and unit/static-tested;
 the first standalone execution remains runtime validation, not guaranteed success.

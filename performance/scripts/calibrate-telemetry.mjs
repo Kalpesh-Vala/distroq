@@ -176,7 +176,7 @@ export async function reference(context, options={}){
   console.log(JSON.stringify(result));return result;
 }
 export async function capture(context,label,referenceRun, options={}){
-  if(options.continuationOnly&&!['C1-repeat','C2-repeat'].includes(label))throw new Error('Continuation refuses original capture labels');
+  if(options.continuationOnly&&!['C1-repeat','C1-replacement','C2-repeat'].includes(label))throw new Error('Continuation refuses original capture labels');
   const id=runId(`CAL-${label}`);const directory=path.join(root,'results',id);
   if(options.allocated)await options.allocated(id);
   await mkdir(directory);

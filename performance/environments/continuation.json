@@ -16,5 +16,20 @@
   "nextRequiredPhase": "C1-repeat",
   "c1RepeatCompleted": false,
   "c2RepeatCompleted": false,
-  "finalCalibrationVerdict": "PENDING"
+  "finalCalibrationVerdict": "PENDING",
+  "replacement": {
+    "replacementAuthorized": true,
+    "invalidC1RepeatRunId": "20260913T073143534Z-CAL-C1-repeat-73706008",
+    "invalidC1ManifestSha256": "194F166FD7B064B36F455C6F25162704D5BF0A1C2C61B15393C4485CBB95607F",
+    "originalContinuationReviewId": "20260913T073710999Z-CONTINUATION-REVIEW-6c9cf168",
+    "originalReviewManifestSha256": "6ADB501C392C5CFCAB9BE0B5236766368DB2D90F3A912EF78335C7E5B903C360",
+    "previousToolingCommit": "847d3d85ec8daadf35cd59a74123def1e9a03b0c",
+    "previousDescriptorSha256": "959E3D78913D3B13C419FD63F348EF17FB9886881261BB41E6B16D0CB72B9EAF",
+    "replacementAttempted": false,
+    "replacementRunId": null,
+    "replacementVerdict": "PENDING",
+    "c2RepeatAttempted": false,
+    "c2RepeatRunId": null,
+    "finalAuthorization": "P1_BLOCKED_UNSTABLE_HOST"
+  }
 }

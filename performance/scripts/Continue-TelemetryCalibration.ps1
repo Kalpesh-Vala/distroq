@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][ValidatePattern('^distroq-bench-[0-9]{14}-[a-f0-9]{6}$')][string]$Project,
     [switch]$ExclusiveHostConfirmed,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$AuthorizeReplacementC1
 )
 $ErrorActionPreference='Stop'
 if(-not $CheckOnly -and (-not $ExclusiveHostConfirmed -or $env:TERM_PROGRAM -eq 'vscode')) {
@@ -11,5 +12,6 @@ if(-not $CheckOnly -and (-not $ExclusiveHostConfirmed -or $env:TERM_PROGRAM -eq 
 $arguments=@((Join-Path $PSScriptRoot 'continue-calibration.mjs'),$Project)
 if($CheckOnly){$arguments+='--check-only'}
 if($ExclusiveHostConfirmed){$arguments+='--exclusive-host-confirmed'}
+if($AuthorizeReplacementC1){$arguments+='--authorize-replacement-c1'}
 & node @arguments
 exit $LASTEXITCODE

@@ -8,7 +8,8 @@ import { parse } from 'csv-parse/sync';
 import { connect, seal } from './capacity-runner.mjs';
 import { reference, capture, interruptCalibration, calibrationInterrupted, transportIdentity } from './calibrate-telemetry.mjs';
 import { candidateRepeatability, REPEATABILITY_LIMITS } from './calibration-analysis.mjs';
-import { EXIT, ContinuationError, assertPreconditions, assertManifestHash, continueMissingRepeats, authorizationForExit } from './continuation-policy.mjs';
+import { EXIT, ContinuationError, assertPreconditions, assertManifestHash, continueMissingRepeats, authorizationForExit,
+  authorizeReplacement, classificationCorrection, failureAuthorization } from './continuation-policy.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repo = path.dirname(root);
@@ -70,6 +71,30 @@ export async function verifyOriginals(descriptor) {
     originals[name] = verdict;
   }
   return originals;
+}
+
+export async function writeSupersedingCorrection(descriptor, toolingCommit, previousState = null) {
+  const policy=descriptor.replacement;
+  await verifyRun(policy.invalidC1RepeatRunId,policy.invalidC1ManifestSha256);
+  await verifyRun(policy.originalContinuationReviewId,policy.originalReviewManifestSha256);
+  const failed=await readJson(path.join(location(policy.invalidC1RepeatRunId),'validity.json'));
+  const prior=await readJson(path.join(location(policy.originalContinuationReviewId),'verdict.json'));
+  const correction=classificationCorrection(policy.originalContinuationReviewId,failed,prior,new Date().toISOString(),toolingCommit);
+  const directory=location(newId('CLASSIFICATION-CORRECTION'));
+  await mkdir(directory);
+  await writeFile(path.join(directory,'correction.json'),JSON.stringify(correction,null,2),{flag:'wx'});
+  if(previousState)await writeFile(path.join(directory,'previous-continuation-state.json'),JSON.stringify(previousState,null,2),{flag:'wx'});
+  await seal(directory);await verifyRun(path.basename(directory));
+  return {runId:path.basename(directory),...correction};
+}
+
+export function evaluatedRepeat(result, phase, originals) {
+  const collector=phase==='C1-repeat'?'runner':'independent';
+  const original=phase==='C1-repeat'?originals.C1:originals.C2;
+  const repeatability=candidateRepeatability(original[collector],result[collector]);
+  return {runId:result.runId,status:result.status==='VALID'&&repeatability.eligible?'VALID':result.status==='INCOMPLETE'?'INCOMPLETE':'INVALID',
+    captureStatus:result.status,repeatability,reasons:[...(result.reasons||[]),
+      ...(result.status==='VALID'&&!repeatability.eligible?['Approved original-versus-repeat mean/p95/gap limits failed']:[])]};
 }
 
 export async function verifyEnvironment(descriptor, state) {
@@ -180,6 +205,7 @@ async function main() {
   process.chdir(repo);
   const args=process.argv.slice(2),checkOnly=args.includes('--check-only');
   const descriptor=await readJson(descriptorPath);
+  const replacementFlag=args.includes('--authorize-replacement-c1');
   const project=args.find(value=>/^distroq-bench-\d{14}-[a-f0-9]{6}$/.test(value));
   if(project!==descriptor.project)fail(EXIT.CONTAINERS,'Project differs from approved descriptor');
   if(!checkOnly&&(!args.includes('--exclusive-host-confirmed')||process.env.TERM_PROGRAM==='vscode'))fail(EXIT.TOOLING,'Use reserved standalone PowerShell with dashboard/editor closed');
@@ -192,13 +218,25 @@ async function main() {
   if(git(['branch','--show-current'])!=='benchmark-v1.1')fail(EXIT.TOOLING,'Wrong branch');
   const originals=await verifyOriginals(descriptor);
   let state=existsSync(statePath)?await readJson(statePath):null;
-  if(state&&(state.toolingCommit!==head||state.descriptorSha256!==digest(await readFile(descriptorPath))))fail(EXIT.TOOLING,'Continuation state pin differs from committed tooling');
+  const descriptorHash=digest(await readFile(descriptorPath));
+  const migration=!!(replacementFlag&&state&&!state.replacementAuthorized);
+  if(descriptor.replacement&&!replacementFlag)fail(EXIT.ALREADY_RUN,'Explicit -AuthorizeReplacementC1 is required; prior command may not repeat C1');
+  if(!state&&descriptor.replacement)fail(EXIT.EVIDENCE,'Prior continuation state required for the one authorized replacement');
+  if(migration){
+    if(state.descriptorSha256!==descriptor.replacement.previousDescriptorSha256)fail(EXIT.TOOLING,'Prior state descriptor pin differs');
+    authorizeReplacement(state,descriptor.replacement);
+    await verifyRun(descriptor.replacement.invalidC1RepeatRunId,descriptor.replacement.invalidC1ManifestSha256);
+    await verifyRun(descriptor.replacement.originalContinuationReviewId,descriptor.replacement.originalReviewManifestSha256);
+  } else if(state&&(state.toolingCommit!==head||state.descriptorSha256!==descriptorHash))fail(EXIT.TOOLING,'Continuation state pin differs from committed tooling');
+  if(state?.replacementAttempted&&state.replacementVerdict!=='VALID')fail(EXIT.ALREADY_RUN,'Replacement C1 already attempted; no further local replacement authorized');
   if(state?.nextRequiredPhase==='DONE')fail(EXIT.ALREADY_RUN,'Calibration already completed; inspect immutable review');
   const {context,fingerprints}=await verifyEnvironment(descriptor,state);
   const expectedLimits=REPEATABILITY_LIMITS;
   if(descriptor.limits.meanDifferencePercentagePoints!==expectedLimits.meanDifferencePercentagePoints||descriptor.limits.p95DifferencePercentagePoints!==expectedLimits.p95DifferencePercentagePoints
     ||descriptor.limits.maximumSampleGapSeconds!==expectedLimits.maximumSampleGapSeconds)fail(EXIT.TOOLING,'Approved limits differ');
-  const plan={project,toolingCommit:head,mode:'CONTINUATION_ONLY',nextRequiredPhase:state?.nextRequiredPhase||descriptor.nextRequiredPhase,
+  const plan={project,toolingCommit:head,mode:replacementFlag?'ONE_AUTHORIZED_REPLACEMENT':'CONTINUATION_ONLY',nextRequiredPhase:state?.nextRequiredPhase||descriptor.nextRequiredPhase,
+    replacementAuthorized:replacementFlag,invalidC1RepeatRunId:descriptor.replacement?.invalidC1RepeatRunId,
+    operatorAttestation:'AC connected; sleep/hibernation disabled; VS Code, browsers and Task Manager closed; no dashboard/unrelated generator; ordinary Defender/indexing activity allowed to settle naturally. No protection disabled.',
     phases:['C1-repeat','C2-repeat'],originalsRerun:false,p1:false,p2:false,limits:descriptor.limits,cooldownSeconds:descriptor.cooldownSeconds,
     maximumConsecutiveFailedReferences:descriptor.maximumConsecutiveFailedReferences,statePath};
   console.log(JSON.stringify(plan,null,2));
@@ -209,6 +247,12 @@ async function main() {
   const persist=async value=>{
     value.c1RepeatCompleted=value.repeats['C1-repeat']?.status==='VALID';
     value.c2RepeatCompleted=value.repeats['C2-repeat']?.status==='VALID';
+    if(value.replacementAuthorized){
+      const c1=value.repeats['C1-repeat'];
+      if(c1){value.replacementAttempted=true;value.replacementRunId=c1.runId;value.replacementVerdict=c1.status;}
+      const c2=value.repeats['C2-repeat'];
+      if(c2){value.c2RepeatAttempted=true;value.c2RepeatRunId=c2.runId;}
+    }
     await atomicJson(statePath,value);
   };
   const signal=()=>interruptCalibration();
@@ -216,22 +260,30 @@ async function main() {
   try {
     await lock.writeFile(JSON.stringify({pid:process.pid,project,toolingCommit:head,statePath}));await lock.sync();
     execFileSync('node',[path.join(root,'scripts','audit-tooling.mjs'),'--verify-only'],{cwd:repo,stdio:'inherit'});
+    if(migration){
+      const correction=await writeSupersedingCorrection(descriptor,head,state);
+      state=authorizeReplacement(state,descriptor.replacement);
+      state.previousToolingCommit=state.toolingCommit;state.toolingCommit=head;state.descriptorSha256=descriptorHash;
+      state.classificationCorrectionRunId=correction.runId;
+      await persist(state);
+    }
     state ||= {...descriptor,toolingCommit:head,descriptorSha256:digest(await readFile(descriptorPath)),containerFingerprints:fingerprints,
       repeats:{},references:[],failedReferences:{'C1-repeat':0,'C2-repeat':0},inFlight:null,cooldownUntilMs:null,finalCalibrationVerdict:'PENDING'};
     if(state.inFlight){
       const reserved=state.inFlight;
       await verifyRun(reserved.runId);
       const result=await readJson(path.join(location(reserved.runId),'validity.json'));
-      const entry={runId:result.runId,status:result.status,manifestSha256:await verifyRun(result.runId)};
+      const entry={...(reserved.kind==='capture'&&state.replacementAuthorized?evaluatedRepeat(result,reserved.phase,originals):{runId:result.runId,status:result.status}),manifestSha256:await verifyRun(result.runId)};
       if(reserved.kind==='capture')state.repeats[reserved.phase]=entry;
       else {state.references.push({...entry,phase:reserved.phase,recovered:true});if(result.status!=='VALID')state.failedReferences[reserved.phase]++;}
       state.inFlight=null;await persist(state);
-      if(result.status!=='VALID')fail(EXIT.INTERRUPTION,'Prior interrupted attempt preserved; manual review required');
+      if(entry.status!=='VALID')fail(EXIT.INTERRUPTION,'Prior interrupted attempt preserved; manual review required');
     }
     for(const phase of ['C1-repeat','C2-repeat']){
       if(state.repeats[phase])await verifyRun(state.repeats[phase].runId,state.repeats[phase].manifestSha256);
       else for(const directory of await readdir(path.join(root,'results'))){
-        if(directory.includes(`-CAL-${phase}-`))fail(EXIT.ALREADY_RUN,`Unrecorded ${phase} evidence exists; do not duplicate it`);
+        const label=state.replacementAuthorized&&phase==='C1-repeat'?'C1-replacement':phase;
+        if(directory.includes(`-CAL-${label}-`))fail(EXIT.ALREADY_RUN,`Unrecorded ${label} evidence exists; do not duplicate it`);
       }
     }
     await persist(state);
@@ -256,9 +308,10 @@ async function main() {
       },
       capture:async(phase,ref)=>{
         await verifyEnvironment(descriptor,state);checkInterrupted();
-        const result=await capture(context,phase,ref,{continuationOnly:true,allocated:id=>allocate('capture',phase,id)});
+        const label=state.replacementAuthorized&&phase==='C1-repeat'?'C1-replacement':phase;
+        const result=await capture(context,label,ref,{continuationOnly:true,allocated:id=>allocate('capture',phase,id)});
         checkInterrupted();
-        return {runId:result.runId,status:result.status,reasons:result.reasons,manifestSha256:await verifyRun(result.runId)};
+        return {...(state.replacementAuthorized?evaluatedRepeat(result,phase,originals):{runId:result.runId,status:result.status,reasons:result.reasons}),manifestSha256:await verifyRun(result.runId)};
       },
     });
     await verifyOriginals(descriptor);await verifyEnvironment(descriptor,state);
@@ -268,19 +321,22 @@ async function main() {
   } catch(error){code=calibrationInterrupted()?EXIT.INTERRUPTION:Number.isInteger(error.code)?error.code:EXIT.ARTIFACT;reason=error.message;report=null;}
   finally {
     try {
+      const invalidRepeat=[state?.repeats?.['C1-repeat'],state?.repeats?.['C2-repeat']].find(entry=>entry?.status==='INVALID');
+      const finalAuthorization=[EXIT.C1_INVALID,EXIT.C2_INVALID].includes(code)&&invalidRepeat?failureAuthorization(invalidRepeat):authorizationForExit(code);
       const verdict={...(report||{}),status:code===EXIT.INTERRUPTION?'INCOMPLETE':report?.status||'BLOCKED',exitCode:code,reason,
-        toolingCommit:head,p1Authorization:authorizationForExit(code),p1Executed:false,p2Executed:false,
+        toolingCommit:head,p1Authorization:finalAuthorization,p1Executed:false,p2Executed:false,
+        recommendation:state?.replacementAttempted&&finalAuthorization==='P1_BLOCKED_UNSTABLE_HOST'?'Local replacement budget exhausted. Move performance campaign to a dedicated VM or separate machine; no additional local replacement authorized.':null,
         originals:descriptor.originals,continuationProgress:state||null};
       reviewDirectory=location(newId('CONTINUATION-REVIEW'));await mkdir(reviewDirectory);
       await writeFile(path.join(reviewDirectory,'verdict.json'),JSON.stringify(verdict,null,2),{flag:'wx'});
       const index=await readJson(path.join(root,'reports','EVIDENCE_INDEX.json'));
-      const additions=[...(state?.references||[]),...Object.values(state?.repeats||{})].filter(entry=>entry.manifestSha256);
+      const additions=[...(state?.references||[]),...(state?.priorC1Attempts||[]),...Object.values(state?.repeats||{})].filter(entry=>entry.manifestSha256);
       const indexed=new Map(index.runs.map(entry=>[entry.runId,entry]));
       for(const entry of additions)indexed.set(entry.runId,{...indexed.get(entry.runId),runId:entry.runId,relativeLocation:`results/${entry.runId}`,manifestSha256:entry.manifestSha256});
       await writeFile(path.join(reviewDirectory,'evidence-index.json'),JSON.stringify({...index,runs:[...indexed.values()],
         note:'Continuation index candidate; promote to tracked reports/EVIDENCE_INDEX.json only after review.'},null,2),{flag:'wx'});
       await seal(reviewDirectory);await verifyRun(path.basename(reviewDirectory));verdictWritten=true;
-      if(state){state.finalCalibrationVerdict=verdict.p1Authorization;state.lastReviewRunId=path.basename(reviewDirectory);await persist(state);}
+      if(state){state.finalCalibrationVerdict=verdict.p1Authorization;state.finalAuthorization=verdict.p1Authorization;state.lastReviewRunId=path.basename(reviewDirectory);await persist(state);}
       console.log(JSON.stringify({reviewDirectory,...verdict},null,2));
     } finally {
       process.removeListener('SIGINT',signal);process.removeListener('SIGTERM',signal);process.removeListener('SIGHUP',signal);
