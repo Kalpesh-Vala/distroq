@@ -1,5 +1,10 @@
 # Unattended Qualification Only
 
+The completed qualification exposed a collector disagreement. Use [CALIBRATION.md](CALIBRATION.md)
+before any P1 measurements; do not rerun qualification as a substitute for C1/C2/C3 calibration.
+For the partially completed preserved calibration campaign, use [CONTINUATION.md](CONTINUATION.md)
+instead of restarting the full sequence.
+
 This workflow is prepared for a standalone Windows PowerShell 5.1 terminal. No qualification,
 P1 or P2 load was executed while preparing it. Unit tests and check-only preflight are not runtime
 qualification. The first unattended launch may still expose a collector/platform incompatibility;

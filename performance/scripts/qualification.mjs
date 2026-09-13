@@ -8,6 +8,11 @@ import { connect, runPoint, seal } from './capacity-runner.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const repo=path.dirname(root);
 
+export async function prepareCampaign(actions) {
+  await actions.audit();
+  await actions.create();
+}
+
 export async function qualificationFlow(actions) {
   const idle=await actions.idle();
   if(!idle.valid)return {status:'INVALID',stoppedAt:'idle',idle};
@@ -64,7 +69,7 @@ async function main() {
   const lockPath=path.join(root,'state','qualification.lock');
   const lock=await open(lockPath,'wx');
   const campaign=path.join(root,'results',`${new Date().toISOString().replace(/[-:.]/g,'')}-QUALIFICATION-CAMPAIGN-${randomUUID().slice(0,8)}`);
-  await mkdir(campaign);
+  let campaignCreated=false;
   let result={status:'INCONCLUSIVE'};
   const capture=async(name,seconds,load)=>{
     const current=await connect(project);
@@ -83,19 +88,25 @@ async function main() {
   };
   try {
     await lock.writeFile(JSON.stringify({pid:process.pid,project,campaign}));
+    await prepareCampaign({
+      audit:()=>execFileSync('node',[path.join(root,'scripts','audit-tooling.mjs'),'--verify-only'],{cwd:repo,stdio:'inherit'}),
+      create:async()=>{await mkdir(campaign);campaignCreated=true;},
+    });
     await writeFile(path.join(campaign,'plan.json'),JSON.stringify(plan,null,2),{flag:'wx'});
-    execFileSync('node',[path.join(root,'scripts','audit-tooling.mjs'),'--verify-only'],{cwd:repo,stdio:'inherit'});
     result=await qualificationFlow({
       idle:()=>capture('idle',300),
       warmup:()=>capture('warmup',120,()=>runPoint(context,{phase:'WARMUP',workload:'W1',rate:1,seconds:120,workers:1,hostReservation:true})),
       measured:warmupRun=>capture('measured',300,()=>runPoint(context,{phase:'QUALIFICATION',workload:'W1',rate:1,seconds:300,workers:1,warmupRun,hostReservation:true})),
     });
   } catch(error){result={status:'INCONCLUSIVE',error:error.message};} finally {
-    await writeFile(path.join(campaign,'qualification.json'),JSON.stringify(result,null,2),{flag:'wx'});
-    await seal(campaign);
-    await lock.close();await unlink(lockPath);
+    try {
+      if(campaignCreated){
+        await writeFile(path.join(campaign,'qualification.json'),JSON.stringify(result,null,2),{flag:'wx'});
+        await seal(campaign);
+      }
+    } finally {await lock.close();await unlink(lockPath);}
   }
-  console.log(JSON.stringify({campaign,...result},null,2));
+  console.log(JSON.stringify({campaign:campaignCreated?campaign:null,...result},null,2));
   if(result.status!=='VALID')process.exitCode=2;
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(error=>{console.error(error.message);process.exitCode=2;});

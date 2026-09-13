@@ -104,5 +104,16 @@ if(!args.includes('--verify-only')){
   await writeFile(path.join(directory,'inventory.json'),JSON.stringify(report,null,2),{flag:'wx'});
   console.log(`Full path inventory: ${directory}`);
   if(args.includes('--write-index'))await writeFile(path.join(root,'reports','EVIDENCE_INDEX.json'),JSON.stringify(index,null,2)+'\n',{flag:'wx'});
+  if(args.includes('--refresh-index')){
+    const filename=path.join(root,'reports','EVIDENCE_INDEX.json');
+    const previous=decode(await readFile(filename));
+    const oldRuns=new Map(previous.runs.map(run=>[run.runId,run]));
+    for(const run of runs){
+      const old=oldRuns.get(run.runId);
+      if(old&&old.manifestSha256!==run.manifestSha256)throw new Error('Historical index manifest hash changed');
+      if(!old)oldRuns.set(run.runId,run);
+    }
+    await writeFile(filename,JSON.stringify({...previous,runs:[...oldRuns.values()]},null,2)+'\n');
+  }
 }
 console.log(JSON.stringify({...report,inventory:undefined},null,2));

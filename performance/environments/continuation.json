@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "project": "distroq-bench-20260912123428-f8051a",
+  "toolingVersionPolicy": "HEAD must equal the commit introducing this descriptor; runtime state stores that full commit",
+  "applicationCommit": "4f31ada742846859cf67d76e72b8813f90877ac2",
+  "originals": {
+    "review": {"runId": "20260912T162818671Z-CALIBRATION-REVIEW-f50d2f1e", "manifestSha256": "16B58CF2DF64BB3D6121FF881F92E035A8A74F8B955AC73F68D9B8985B365ABC", "verdictFile": "comparison.json", "expectedStatus": "BLOCKED"},
+    "C1": {"runId": "20260912T160755606Z-CAL-C1-46013ec0", "manifestSha256": "EC40FBE48265F0975F050C27C8897BC154278C1773DD756803D7B11D153167B4", "verdictFile": "validity.json", "expectedStatus": "VALID"},
+    "C2": {"runId": "20260912T161428506Z-CAL-C2-146fcbbc", "manifestSha256": "AAACE14468D4DF002F6884124C3F3832628D3AEC3A6323674398EE7E518A9A50", "verdictFile": "validity.json", "expectedStatus": "VALID"},
+    "C3": {"runId": "20260912T162124009Z-CAL-C3-e45ff3d7", "manifestSha256": "F53A28672A0D0AE9808319E11E89FCC613364D929CA085669F52F29B7DD238D8", "verdictFile": "validity.json", "expectedStatus": "VALID"},
+    "invalidReference": {"runId": "20260912T162713228Z-CAL-REFERENCE-bb86699b", "manifestSha256": "6E5EA7023F1815BCDBB3FD141D9B157061C0432310DAA758FB67901E03237A21", "verdictFile": "validity.json", "expectedStatus": "INVALID"}
+  },
+  "limits": {"meanDifferencePercentagePoints": 2, "p95DifferencePercentagePoints": 2, "maximumSampleGapSeconds": 15},
+  "maximumConsecutiveFailedReferences": 3,
+  "cooldownSeconds": 60,
+  "nextRequiredPhase": "C1-repeat",
+  "c1RepeatCompleted": false,
+  "c2RepeatCompleted": false,
+  "finalCalibrationVerdict": "PENDING"
+}

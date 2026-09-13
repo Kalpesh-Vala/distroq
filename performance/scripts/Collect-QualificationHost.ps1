@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][string]$Output,
     [ValidateRange(10,1800)][int]$Seconds = 300,
-    [int]$OrchestratorPid = 0
+    [int]$OrchestratorPid = 0,
+    [switch]$CalibrationIdle
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -44,6 +45,7 @@ try {
         $known = @($processes | Where-Object { $_.classification -eq 'non-benchmark' })
         $raw = [double](($known | Measure-Object rawCpuPercent -Sum).Sum)
         $row = [pscustomobject]@{utc=[DateTime]::UtcNow.ToString('o');utcMs=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();
+          hostTotalCpu=($hardware.CounterSamples | Where-Object {$_.Path -like '*\processor(_total)\% processor time'} | Select-Object -First 1).CookedValue;
           normalizedNonBenchmarkCpuPercent=$raw/$logical;rawNonBenchmarkCpuPercent=$raw;processes=$processes;
           hardware=@($hardware.CounterSamples | Select-Object Path,CookedValue,Status)}
         $rows.Add($row)
@@ -52,8 +54,9 @@ try {
         if ($rows.Count % 12 -eq 0) { Check-Power; Write-Output "Host window: $($rows.Count)/$expected samples" }
     }
     Check-Power
-    $mean = ($rows | Measure-Object normalizedNonBenchmarkCpuPercent -Average).Average
-    $spikes = @($rows | Where-Object { $_.normalizedNonBenchmarkCpuPercent -gt 20 }).Count
+    $gateField=if($CalibrationIdle){'hostTotalCpu'}else{'normalizedNonBenchmarkCpuPercent'}
+    $mean = ($rows | Measure-Object $gateField -Average).Average
+    $spikes = @($rows | Where-Object { $_.$gateField -gt 20 }).Count
     if ($mean -gt 10 -or $spikes/$rows.Count -gt 0.1) { $failures.Add('Normalized host contention threshold exceeded.') }
     $span = ($rows[-1].utcMs-$rows[0].utcMs)/1000
     if ($span -lt $Seconds -or $rows.Count -ne $expected) { $failures.Add('Required host sample window incomplete.') }
@@ -66,7 +69,7 @@ try {
     $events=wevtutil qe System "/q:$query" /f:xml | Out-String
     $events | Set-Content (Join-Path $Output 'power-events.xml') -Encoding UTF8
     if ($LASTEXITCODE -ne 0 -or $events.Trim()) { $failures.Add('Power event audit failed or sleep/resume occurred.') }
-    Write-Json 'summary.json' @{samples=$rows.Count;spanSeconds=$span;maximumGapSeconds=$gap;meanNormalizedCpuPercent=$mean;
+    Write-Json 'summary.json' @{samples=$rows.Count;spanSeconds=$span;maximumGapSeconds=$gap;meanNormalizedCpuPercent=$mean;gateField=$gateField;
       samplesOver20Percent=$spikes;fractionOver20Percent=$spikes/$rows.Count;limitedSamples=$limited.Count;
       caveat='Formatted CIM process counters have integer precision; frequency counters do not prove absence of thermal throttling. Mixed VM attribution relies on operator attestation.'}
 } catch { $failures.Add($_.Exception.Message) } finally {
