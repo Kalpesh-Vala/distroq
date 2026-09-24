@@ -1,16 +1,201 @@
-# DistroQ v1.1
+# DistroQ: Durable Distributed Job Queue
 
-v1.1 adds a read-only operations dashboard over the queue, worker, outbox, reconciliation, job,
-DLQ, analytics, and runtime state that DistroQ already owns. The UI is served at `/dashboard/`;
-its backend-for-frontend is under `/api/dashboard/**` and requires the same administrative bearer
-token as `/api/admin/**`.
+DistroQ is a Java background-job processing system built around durable delivery intent,
+recoverable workers, and explicit at-least-once semantics. PostgreSQL owns business state and
+delivery intent; Redis supplies delivery and scheduling state. The project explores how jobs
+remain inspectable and recoverable when requests repeat, workers stop, or dependencies fail.
 
-The dashboard is deliberately not an administrative console. Its API has GET routes only, a
-servlet filter rejects every other HTTP method with `405 Method Not Allowed`, and its browser
-bundle contains no retry, replay, repair, cleanup, or other mutation call. Those actions remain on
-the audited administrative API, where `X-Admin-Reason` and `reliability_actions` still apply.
+## Current project status
 
-## Dashboard
+Verification snapshot: **2026-09-24**, against repository revision `6cdbf95` on
+`benchmark-v1.1`. The application baseline is `4f31ada`; subsequent commits on this branch concern
+benchmark tooling. This section describes that snapshot, not a continuously updated certification.
+
+| Area | Verified status |
+|---|---|
+| Latest tagged release | `v1.0.0`, pointing to application commit `c309bef`. Its changelog heading still says unreleased; the Git tag exists. |
+| Dashboard | Implemented in `4c8b91d`, merged in `4f31ada`; **v1.1 is unreleased**, with known defects and incomplete browser acceptance. |
+| Core qualification | Preserved local Docker evidence supports the limited correctness and low-load observations below. |
+| Performance campaign | Incomplete. The latest preserved correction is `P1_BLOCKED_UNSTABLE_HOST`; P2 capacity results do not exist. |
+| Production usage | No production traffic, customers, reliability SLA, or production-proven deployment is demonstrated by this repository. |
+
+For project summaries, portfolio reviews, and hiring automation, use this current-status section
+and its linked implementation evidence before the historical reference later in this file.
+Do not interpret a version heading, example response, acceptance procedure, configured worker
+count, or planned experiment as a completed release or measured result. Git attribution does not
+independently establish a contributor's sole authorship; confirm individual ownership separately.
+
+## Architecture and guarantees
+
+```text
+Client submission / Idempotency-Key
+    -> PostgreSQL transaction: job + submission identity + outbox intent
+    -> Outbox relay
+    -> Redis publication deduplication
+    -> Priority Streams, or retry / scheduled sorted sets
+    -> Consumer group delivery and PostgreSQL execution lease
+    -> Handler execution and durable attempt/outcome finalization
+    -> XACK
+
+Pending deliveries -> XAUTOCLAIM -> execution-ownership checks
+Durable state      -> reconciliation -> constrained, audited repairs
+PostgreSQL         -> separate read-only PySpark exports -> Parquet facts / reports
+Operational state  -> read-only dashboard API -> React views
+```
+
+- **Delivery and execution are at least once, not exactly once.** A crash can lead to redelivery
+  and repeated execution. Arbitrary external side effects can happen more than once.
+- **The outbox addresses dual writes.** Job state and delivery intent commit in PostgreSQL before
+  asynchronous publication to Redis. It does not create a distributed transaction across stores.
+- **Execution ownership is explicit.** Database leases, heartbeats, and conditional finalization
+  constrain which attempt can update a job. They do not fence an arbitrary external service.
+- **Idempotency has separate boundaries.** Submission keys identify repeated requests; Redis
+  markers deduplicate publication within their retention window; the effect ledger protects
+  cooperating handlers. The built-in counter and its ledger update share a database transaction.
+- **Recovery is observable, not unconditional.** Attempts and reliability actions preserve history;
+  reconciliation reports inconsistent state and makes only permitted repairs. Redis loss may
+  require reconciliation and can affect pending-delivery recovery.
+- **Observers do not become control planes.** Analytics is a separate read-only batch process.
+  The dashboard reads operational state and completed reports, not mutation APIs.
+
+## Implemented engineering scope
+
+| Area | Implementation and purpose | Source evidence |
+|---|---|---|
+| Durable submission | Transactional job/outbox writes, request hashing, and submission-key serialization address cross-store failure windows and repeated requests. | [JobSubmissionService](src/main/java/com/distroq/api/JobSubmissionService.java), [RedisOutboxPublisher](src/main/java/com/distroq/outbox/RedisOutboxPublisher.java) |
+| Recoverable delivery | Streams, consumer groups, pending entries, acknowledgement after durable finalization, and stale-entry recovery retain delivery ownership. | [Worker](src/main/java/com/distroq/worker/Worker.java), [PendingEntryRecovery](src/main/java/com/distroq/queue/PendingEntryRecovery.java) |
+| Concurrent execution | Configurable workers, database execution leases, heartbeats, and conditional finalization track attempt ownership. | [ExecutionClaimService](src/main/java/com/distroq/worker/ExecutionClaimService.java) |
+| Retry and scheduling | Exponential backoff with jitter, separate retry/scheduled sorted sets, and atomic Redis-local Lua promotion retain due times without sleeping workers. | [BackoffPolicy](src/main/java/com/distroq/worker/BackoffPolicy.java), [DueSetPromoter](src/main/java/com/distroq/queue/DueSetPromoter.java) |
+| Priority and failure history | HIGH, NORMAL, and LOW tiers, a process-local starvation guard, attempt history, dead-letter storage, and replay preserve execution context. | [PriorityStrategy](src/main/java/com/distroq/worker/PriorityStrategy.java), [JobSubmissionService](src/main/java/com/distroq/api/JobSubmissionService.java) |
+| Reconciliation and effects | Bounded reconciliation, reason-bearing audit records, and a cooperative effect ledger make inconsistencies visible and constrain repeated effects. | [ReconciliationService](src/main/java/com/distroq/reliability/ReconciliationService.java), [JobEffectService](src/main/java/com/distroq/effects/JobEffectService.java) |
+| Schema evolution | Flyway migrations and Hibernate validation replace automatic schema mutation; forward migrations separate real changes from the existing-schema baseline. | [Migrations](src/main/resources/db/migration), [Upgrade guide](UPGRADE.md) |
+| Operations | Readiness/liveness separation, ordered shutdown, configuration validation, administrative bearer protection, structured logs, correlation IDs, metrics, and backup/restore tooling. | [Operations](OPERATIONS.md), [Security](SECURITY.md), [ShutdownCoordinator](src/main/java/com/distroq/lifecycle/ShutdownCoordinator.java), [Operational scripts](ops) |
+| Historical analytics | Seven Parquet fact datasets, UTC half-open windows, read-only JDBC configuration, overwrite refusal, reproducible report calculations, and 20 report-only quality checks. | [Pipeline](analytics/src/distroq_analytics/pipeline.py), [Quality checks](analytics/src/distroq_analytics/quality.py), [Analytics guide](analytics/README.md) |
+| Read-only dashboard | React views, 11 GET endpoint mappings, servlet read-method enforcement, bounded table pages, partial-availability states, and polling with stale-data retention. Implemented, not release-complete. | [Controller](src/main/java/com/distroq/dashboard/DashboardController.java), [Read-only filter](src/main/java/com/distroq/dashboard/DashboardReadOnlyFilter.java), [Polling](dashboard/src/hooks/usePolling.ts) |
+
+## Technology stack
+
+| Responsibility | Technologies in the implementation |
+|---|---|
+| Backend | Java 21, Spring Boot 3.5, Spring MVC, Bean Validation, Maven |
+| Persistence | PostgreSQL, Spring Data JPA, Hibernate, Flyway, SQL/JDBC |
+| Delivery and coordination | Redis Streams, consumer groups, sorted sets, Lettuce, Lua, PostgreSQL advisory locks |
+| Frontend | React 18, TypeScript, Vite, browser Fetch API |
+| Analytics | Python, PySpark, Parquet, PostgreSQL JDBC |
+| Observability | Spring Boot Actuator, Micrometer, Prometheus exposition, structured JSON logging |
+| Tests and performance tooling | JUnit, Mockito, AssertJ, pytest, Vitest, React Testing Library, Node test runner, k6 |
+| Deployment and operations | Docker, Docker Compose, PowerShell, shell scripts, PostgreSQL backup/restore tools, Redis AOF |
+
+Dependency versions are defined in [pom.xml](pom.xml), [dashboard/package.json](dashboard/package.json),
+[analytics/requirements.txt](analytics/requirements.txt), and the associated lockfiles/container
+definitions. Prometheus exposition is implemented; a deployed monitoring service is not implied.
+
+## Verified measurements and evidence boundaries
+
+Evidence classifications used here:
+
+- **A - Implementation:** directly inspectable source, migrations, or configuration.
+- **B - Preserved result:** saved execution output or measurement artifacts reviewed for this
+  snapshot. Verification of saved files is not a fresh execution of the application or tests.
+- **C - Historical report:** observations recorded in engineering notes without equivalent raw
+  evidence verified in this review. Label these as historical, not current validation.
+- **D - Incomplete:** plans, unexecuted experiments, or unfinished acceptance. Not completed work.
+
+### Local W1 qualification (B)
+
+Run: `20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52`. Controlled Docker Desktop environment,
+one application worker, synthetic `sleep 0 ms` handler, one arrival per second for 300 seconds,
+with a preceding warm-up. This measures low-rate dispatch behavior, **not useful-work capacity**.
+Existing terminal history remained in the database; reconciliation is scoped to the run's cohort.
+
+| Observation | Recorded value | Local evidence |
+|---|---:|---|
+| Accepted responses / distinct durable jobs / successful jobs / execution attempts | 300 / 300 / 300 / 300 | [Reconciliation](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/reconciliation.json) |
+| Unmatched accepted/durable identities, unexpected retries, and dead letters | 0 each | [Reconciliation](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/reconciliation.json), [final state](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/final-state/state.json) |
+| HTTP error rate / dropped arrivals | 0 / 0 | [Client summary](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/client-summary.json) |
+| Final group lag, pending entries, retry members, scheduled members, unpublished events | 0 each | [Final state](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/final-state/state.json) |
+| Submission p95 / execution p95 | 26.084 ms / 13 ms | [Client summary](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/client-summary.json) |
+| End-to-end p95 / p99 | 515 ms / 544 ms | [Client summary](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/client-summary.json) |
+| Outbox publication p95 | 500 ms | [Client summary](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/client-summary.json) |
+
+The qualification's [manifest](performance/results/20260912T144704349Z-QUALIFICATION-W1-n1-r1-814b3d52/manifest.json)
+matched its saved files during this review. Counts and nearest-rank latency percentiles were
+independently recalculated from saved request and cohort data; no workload was rerun. End-to-end
+latencies use a recorded clock-offset estimate with +/-2 ms uncertainty. The recorded validity
+verdict retains a host-telemetry caveat. Stream length is retained history, not executable backlog.
+
+**Evidence availability:** these links refer to locally preserved, Git-ignored result artifacts.
+They may be absent in a fresh clone or unavailable on the repository website. The table is not a
+substitute for publishing the supporting artifacts. External reviewers should treat these numbers
+as reported local results until they receive and verify the evidence bundle. Do not commit raw
+artifacts without a separate credential/privacy review.
+
+### Capacity and test status
+
+The newest local [classification correction](performance/results/20260913T080339721Z-CLASSIFICATION-CORRECTION-3a770267/correction.json)
+preserves `P1_BLOCKED_UNSTABLE_HOST`: telemetry was complete, but the host contention gate failed.
+It does not invalidate the earlier qualification's scoped observations or establish capacity.
+Older status documents under `performance/reports` describe earlier checkpoints and can be stale.
+The [performance workbench](performance/README.md) and [continuation protocol](performance/CONTINUATION.md)
+describe the tooling, not proof that every planned experiment ran.
+
+There is no verified sustainable or maximum jobs-per-second result, multi-instance scaling curve,
+recovery-time SLA, scheduling-tail result, dashboard-overhead result, soak duration, or optimization
+speedup. These remain **D** until their corresponding experiments produce valid evidence.
+
+Tests are implemented under [src/test](src/test), [dashboard/src/__tests__](dashboard/src/__tests__),
+[analytics/tests](analytics/tests), and [performance/scripts](performance/scripts). Historical test
+totals later in this README are release-specific, not a current passing-test count. The snapshot
+review did not rerun suites. A disabled application-context test and opt-in live database tests mean
+that a passing default Java suite does not establish complete integration coverage.
+
+## Limitations and release blockers
+
+- No exactly-once execution or universal external-effect deduplication.
+- No demonstrated production traffic, production-scale capacity, horizontal scalability, or
+  multi-region deployment. Multi-worker code and historical recovery examples are not scaling data.
+- Redis publication markers expire; loss of Redis state can affect recovery. Scheduling is
+  polling-based, and the priority starvation guard is not a global fairness guarantee.
+- Administrative authentication uses a shared role token, not verified per-operator identity.
+  Production requires configured credentials; local mode can leave the guard inactive. SSO,
+  identity-aware proxies, TLS termination, and network isolation are deployment responsibilities,
+  not identity features implemented here. See [SECURITY.md](SECURITY.md).
+- Dashboard acceptance recorded root-route failures. The production Dockerfile does not build or
+  copy the frontend bundle. Default Jobs/Outbox queries still call immutable sort allowlists with
+  a null sort, resulting in unavailable sections; an explicit `sort=createdAt` avoids that path.
+- Dashboard browser outage rendering and nonempty-pending browser behavior remain unverified.
+  API-only observations do not establish browser acceptance or safe polling overhead.
+- Analytics does not repair state or run inside workers. Read-only extraction still consumes
+  database resources and does not promise one transactionally consistent snapshot across tables.
+
+Dashboard blockers are documented in [NOTES.md](NOTES.md) and the
+[baseline review](performance/reports/BASELINE_STATUS.md). This README update does not fix them.
+
+## Documentation and version history
+
+Use [OPERATIONS.md](OPERATIONS.md) for operational procedures, [SECURITY.md](SECURITY.md) for trust
+boundaries, [UPGRADE.md](UPGRADE.md) for migration/deployment guidance, and [NOTES.md](NOTES.md) for
+design discoveries. Validate procedures against the actual source and configuration of the revision
+being deployed; historical examples are not new acceptance results.
+
+The implemented progression was `v0.1` durable job records and Redis List dispatch; `v0.2` retries
+and attempt history; `v0.2.1` Flyway; `v0.3` DLQ/replay; `v0.4` priority; `v0.5` Streams recovery;
+`v0.6` user scheduling; `v0.7` outbox, submission idempotency, concurrency, and leases; `v0.8`
+reconciliation, auditability, and cooperative effects; `v0.9` batch analytics; and `v1.0.0`
+operational hardening. The merged v1.1 dashboard and benchmark tooling follow those tagged releases,
+but do not establish a completed v1.1 release or performance campaign.
+
+## Dashboard implementation (v1.1 unreleased)
+
+v1.1 adds read-only views over queue, worker, outbox, reconciliation, job, DLQ, analytics, and runtime
+state. `/dashboard/` is the intended UI entry point, subject to the release blockers above; its
+backend-for-frontend is under `/api/dashboard/**`. With administrative authentication configured,
+it uses the same bearer token as `/api/admin/**`.
+
+The dashboard is deliberately not an administrative console. Its controller maps GET endpoints;
+the servlet filter permits GET, HEAD, and OPTIONS and rejects other methods with
+`405 Method Not Allowed`. Its browser client contains no retry, replay, repair, or cleanup calls.
+It does not expose a second mutation control plane.
 
 The available views are Overview, Queues, Workers, Outbox, Reconciliation, Jobs, Job Detail, DLQ,
 Analytics, and System. Each independently loaded section reports one of `AVAILABLE`,
@@ -41,8 +226,9 @@ cd ..
 java -jar target\distroq-1.1.0.jar
 ```
 
-By default Spring serves `dashboard/dist` at `/dashboard/`, including SPA fallbacks such as
-`/dashboard/jobs`. For a deployment that keeps the bundle elsewhere, set
+Spring is configured to serve `dashboard/dist` under `/dashboard/`, including SPA fallbacks such as
+`/dashboard/jobs`; this configuration does not resolve the recorded root-route defect or package
+the bundle into the production image. For a deployment that keeps the bundle elsewhere, set
 `DISTROQ_DASHBOARD_STATIC_PATH` to the directory containing `index.html`. To ship the UI inside the
 fat jar, copy the built files to `src/main/resources/static/dashboard/` before running Maven.
 
@@ -67,6 +253,12 @@ under `distroq.dashboard` in `application.yml`. Requested table pages are capped
 `max-page-size`.
 
 ## Historical: v0.9 analytics
+
+**Historical reference boundary:** the remainder of this README preserves version-by-version
+design explanations, examples, commands, acceptance procedures, and reported observations.
+Descriptions of what a version added are not declarations that it is the current release.
+Commands and example outputs are not evidence that those checks ran at the current revision.
+Use the current-status, source-evidence, and limitation sections above for present-day claims.
 
 v0.9 is the analytics release. Everything through v0.8 was about making the *present* correct and
 legible: what is queued, what is running, what failed, what an operator did about it. v0.9 asks a
